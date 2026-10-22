@@ -66,8 +66,11 @@ for (const name of served)
 if (!["to_trial_start", "none"].includes(timeShift(clock))) fail(`time_shift ${JSON.stringify(clock.time_shift)} is neither "to_trial_start" nor "none"`);
 const anchorMs = Date.parse(clock.anchor);
 if (Number.isNaN(anchorMs)) fail(`the seed's anchor ${JSON.stringify(clock.anchor)} is not a timestamp`);
-const startMs = Number(env.START_MS ?? Date.now());
+const launchedAtMs = Date.now();
+const startMs = Number(env.START_MS ?? launchedAtMs);
 const shiftMs = timeShift(clock) === "none" ? 0 : startMs - anchorMs;
+// The trial's present, which "now" means in a query: the start, advanced by the wall clock since.
+const trialNowMs = () => startMs + (Date.now() - launchedAtMs);
 const REAL_HOST = { slack: "slack.com", linear: "api.linear.app" };
 const REAL = { slack: "https://slack.com", linear: "https://api.linear.app" };
 // What an error answer points its reader at. Nothing a caller is sent names what is serving it.
@@ -442,6 +445,10 @@ function connection(items, args, format) {
     pageInfo: { hasNextPage: start + first < items.length, hasPreviousPage: start > 0, startCursor: slice.length ? cursor(0) : null, endCursor: slice.length ? cursor(slice.length - 1) : null },
   };
 }
+function isActiveCycle(c) {
+  const now = trialNowMs();
+  return Boolean(c.starts_at && c.ends_at && Date.parse(c.starts_at) <= now && now < Date.parse(c.ends_at));
+}
 function linearRoot(me) {
   const by = (coll, id) => (id ? coll.findOneBy("linear_id", id) : undefined);
   const order = (items, orderBy) => {
@@ -473,7 +480,7 @@ function linearRoot(me) {
     labels: (a) => connection(ls.issueLabels.all().filter((x) => !x.team_id || x.team_id === t.linear_id), a, fLabel),
     cycles: (a) => connection(ls.cycles.findBy("team_id", t.linear_id).filter((c) => matches(cycleView(c), a.filter)), a, fCycle),
     projects: (a) => connection(ls.projects.all().filter((p) => ls.issues.all().some((i) => i.project_id === p.linear_id && i.team_id === t.linear_id)), a, fProject),
-    activeCycle: () => fCycle(ls.cycles.findBy("team_id", t.linear_id).find((c) => c.starts_at && c.ends_at && Date.parse(c.starts_at) <= Date.now() && Date.now() < Date.parse(c.ends_at))),
+    activeCycle: () => fCycle(ls.cycles.findBy("team_id", t.linear_id).find(isActiveCycle)),
     issues: (a) => issues(a, (i) => i.team_id === t.linear_id),
   };
   const fComment = (c) => ({ id: c.linear_id, body: c.body, createdAt: c.created_at, updatedAt: c.updated_at, url: `${linearUrl}/issue/${by(ls.issues, c.issue_id).identifier}#comment-${c.linear_id.slice(0, 8)}`, user: () => fUser(by(ls.users, c.user_id)), issue: () => fIssue(by(ls.issues, c.issue_id)) });
@@ -492,7 +499,7 @@ function linearRoot(me) {
   };
   const userView = (u) => (u ? { id: u.linear_id, name: u.name, displayName: u.display_name, email: u.email, active: u.active, admin: u.admin, isMe: u.linear_id === me?.linear_id } : null);
   const teamView = (t) => (t ? { id: t.linear_id, key: t.key, name: t.name, private: t.private } : null);
-  const cycleView = (c) => (c ? { id: c.linear_id, number: c.number, name: c.name, startsAt: c.starts_at, endsAt: c.ends_at, team: teamView(by(ls.teams, c.team_id)), isActive: Boolean(c.starts_at && c.ends_at && Date.parse(c.starts_at) <= Date.now() && Date.now() < Date.parse(c.ends_at)) } : null);
+  const cycleView = (c) => (c ? { id: c.linear_id, number: c.number, name: c.name, startsAt: c.starts_at, endsAt: c.ends_at, team: teamView(by(ls.teams, c.team_id)), isActive: isActiveCycle(c) } : null);
   const commentView = (c) => ({ id: c.linear_id, body: c.body, createdAt: c.created_at, updatedAt: c.updated_at, user: userView(by(ls.users, c.user_id)) });
   const issueView = (i, deep = true) => {
     const st = by(ls.workflowStates, i.state_id);

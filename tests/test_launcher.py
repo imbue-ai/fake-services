@@ -171,6 +171,39 @@ def test_linear_answers_a_nested_filter_ordered_by_update(external_services: Run
     ]
 
 
+def test_the_active_cycle_is_the_one_spanning_the_trials_present(external_services: RunningExternalServices) -> None:
+    """The launcher is told the trial started 200 days after the anchor, so the cycle spanning the
+    anchor is active, whatever day the wall clock reads."""
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "cycles": [
+                    {
+                        "team": "ENG",
+                        "name": "2026-W12",
+                        "number": 12,
+                        "starts_at": "2026-03-20T00:00:00.000Z",
+                        "ends_at": "2026-03-27T00:00:00.000Z",
+                    }
+                ]
+            }
+        ),
+    )
+
+    answer = _linear(
+        external_services,
+        '{ team(id: "ENG") { activeCycle { name } } cycles(filter: {isActive: {eq: true}}) { nodes { name } } }',
+    )
+
+    assert added.status_code == 200, added.text
+    assert answer.json()["data"] == {
+        "team": {"activeCycle": {"name": "2026-W12"}},
+        "cycles": {"nodes": [{"name": "2026-W12"}]},
+    }
+
+
 def test_only_a_seeded_token_authenticates(external_services: RunningExternalServices) -> None:
     slack_answer = httpx.get(
         "{}/api/conversations.list".format(external_services.slack_url), headers={"Authorization": "Bearer xoxb-other"}
