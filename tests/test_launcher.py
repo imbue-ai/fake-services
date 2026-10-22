@@ -171,6 +171,26 @@ def test_linear_answers_a_nested_filter_ordered_by_update(external_services: Run
     ]
 
 
+def test_a_date_filter_takes_a_duration_from_the_trials_present(external_services: RunningExternalServices) -> None:
+    """ENG-1 was created 18 days and 15 hours before the anchor and ENG-2 a day and 15 hours before,
+    and the anchor is shifted to the trial's start."""
+
+    def created_within(duration: str) -> list[str]:
+        answer = _linear(
+            external_services,
+            '{ issues(filter: {createdAt: {gt: "%s"}}) { nodes { identifier } } }' % duration,
+        )
+        return sorted(issue["identifier"] for issue in answer.json()["data"]["issues"]["nodes"])
+
+    assert created_within("-P1W") == ["ENG-2"]
+    assert created_within("-P2W4DT12H") == ["ENG-2"]
+    assert created_within("-P2W4DT16H") == ["ENG-1", "ENG-2"]
+    assert created_within("-P3W") == ["ENG-1", "ENG-2"]
+    assert created_within("-P1M") == ["ENG-1", "ENG-2"]
+    assert created_within("P1D") == []
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
 def test_the_active_cycle_is_the_one_spanning_the_trials_present(external_services: RunningExternalServices) -> None:
     """The launcher is told the trial started 200 days after the anchor, so the cycle spanning the
     anchor is active, whatever day the wall clock reads."""
@@ -744,7 +764,7 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
     answers = [
         _linear(external_services, "{ issues(filter: {slaStatus: {eq: Breached}}) { nodes { id } } }"),
         _linear(external_services, '{ issues(filter: {title: {regex: "x"}}) { nodes { id } } }'),
-        _linear(external_services, '{ issues(filter: {createdAt: {gt: "-P2W"}}) { nodes { id } } }'),
+        _linear(external_services, '{ issues(filter: {createdAt: {gt: "last week"}}) { nodes { id } } }'),
         _linear(external_services, "{ noSuchField }"),
         _linear(external_services, "{ viewer { name }", token="lin_api_other"),
         _linear(external_services, 'mutation { issueCreate(input: {teamId: "NOPE", title: "x"}) { success } }'),

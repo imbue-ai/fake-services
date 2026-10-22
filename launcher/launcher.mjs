@@ -400,11 +400,23 @@ const COMPARATORS = {
 };
 // Shaped as Linear shapes a query it validated and then refused.
 const inputError = (message) => new GraphQLError(message, { extensions: { code: "GRAPHQL_VALIDATION_FAILED", type: "graphql error", userError: true, userPresentableMessage: message } });
+// Linear's date comparators also take an ISO 8601 duration, added to the present: "-P2W1D" is two
+// weeks and a day ago.
+const DURATION = /^([+-])?P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/;
+function durationFromNowMs(text) {
+  const m = DURATION.exec(text);
+  if (!m || !m.slice(2).some(Boolean)) return NaN;
+  const [sign, years, months, weeks, days, hours, minutes, seconds] = [m[1] === "-" ? -1 : 1, ...m.slice(2).map((part) => Number(part ?? 0))];
+  const at = new Date(trialNowMs());
+  at.setUTCFullYear(at.getUTCFullYear() + sign * years, at.getUTCMonth() + sign * months);
+  return at.getTime() + sign * (((weeks * 7 + days) * 24 + hours) * 3600000 + minutes * 60000 + seconds * 1000);
+}
 function cmp(v, x) {
   if (typeof v === "number") return v - Number(x);
   const a = Date.parse(v);
-  const b = Date.parse(x);
-  if (Number.isNaN(a) || Number.isNaN(b)) throw inputError(`Expected a valid ISO 8601 date or number, got ${JSON.stringify(x)}`);
+  const parsed = Date.parse(x);
+  const b = Number.isNaN(parsed) ? durationFromNowMs(String(x)) : parsed;
+  if (Number.isNaN(a) || Number.isNaN(b)) throw inputError(`Expected a valid ISO 8601 date, duration or number, got ${JSON.stringify(x)}`);
   return a - b;
 }
 // `view` is a plain object; nested objects are related entities and arrays are collections.
