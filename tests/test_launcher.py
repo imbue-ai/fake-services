@@ -142,6 +142,24 @@ def test_history_takes_oldest_and_latest(external_services: RunningExternalServi
     assert [message["ts"] for message in newer["messages"]] == [_shifted("1774000000.000000")]
     assert len(inclusive["messages"]) == 2
     assert [message["ts"] for message in older["messages"]] == [boundary]
+    first_page = _slack(
+        external_services, "conversations.history", channel=channel_id, oldest=boundary, inclusive="true", limit="1"
+    )
+    second_page = _slack(
+        external_services,
+        "conversations.history",
+        channel=channel_id,
+        oldest=boundary,
+        inclusive="true",
+        limit="1",
+        cursor=first_page["response_metadata"]["next_cursor"],
+    )
+    stale = _slack(external_services, "conversations.history", channel=channel_id, oldest=boundary, cursor="1.000000")
+    assert [message["ts"] for message in first_page["messages"] + second_page["messages"]] == [
+        _shifted("1774000000.000000"),
+        boundary,
+    ]
+    assert (second_page["has_more"], stale) == (False, {"ok": False, "error": "invalid_cursor"})
 
 
 def test_search_finds_messages_by_text_and_channel(external_services: RunningExternalServices) -> None:

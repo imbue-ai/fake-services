@@ -296,7 +296,8 @@ async function slackHistory(req, p) {
   const hi = p.latest ? Number(p.latest) : Infinity;
   const kept = all.filter((m) => (incl ? Number(m.ts) >= lo && Number(m.ts) <= hi : Number(m.ts) > lo && Number(m.ts) < hi));
   const limit = Math.min(Number(p.limit) || 100, 1000);
-  const start = p.cursor ? Math.max(0, kept.findIndex((m) => m.ts === p.cursor)) : 0;
+  const start = p.cursor ? kept.findIndex((m) => m.ts === p.cursor) : 0;
+  if (start < 0) return Response.json({ ok: false, error: "invalid_cursor" });
   const more = start + limit < kept.length;
   return Response.json({ ok: true, messages: kept.slice(start, start + limit), has_more: more, pin_count: 0, response_metadata: { next_cursor: more ? kept[start + limit].ts : "" } });
 }
