@@ -25,7 +25,7 @@ fi
 if [ -z "$router" ] || [ ! -x "$router" ]; then
   router="curl"
 fi
-routes="${MINDS_EVALS_EXTERNAL_SERVICES_ROUTES:-$here/curl_routes}"
+routes="$here/curl_routes"
 if [ ! -r "$routes" ]; then
   exec "$router" "$@"
 fi
