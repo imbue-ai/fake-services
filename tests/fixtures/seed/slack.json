@@ -1,0 +1,74 @@
+{
+  "anchor": "2026-03-21T00:00:00Z",
+  "tokens": [
+    {
+      "token": "xoxb-fake-redwood-slack-token",
+      "user": "morgan.reyes"
+    }
+  ],
+  "team": {
+    "name": "Redwood Inference",
+    "domain": "redwood"
+  },
+  "users": [
+    {
+      "name": "morgan.reyes",
+      "real_name": "Morgan Reyes",
+      "title": "",
+      "is_bot": false,
+      "id": "U0WLQRXH5FM",
+      "email": "morgan.reyes@redwood.example"
+    },
+    {
+      "name": "claire",
+      "real_name": "Claire Dubois",
+      "title": "VP Engineering",
+      "is_bot": false
+    },
+    {
+      "name": "pagerbot",
+      "real_name": "Pager Bot",
+      "title": "",
+      "is_bot": true
+    }
+  ],
+  "channels": [
+    {
+      "name": "announcements",
+      "id": "C0Z2IPZAXKN"
+    },
+    {
+      "name": "eng-oncall"
+    }
+  ],
+  "messages": [
+    {
+      "channel": "announcements",
+      "user": "claire",
+      "ts": "1769123456.000000",
+      "thread_ts": null,
+      "text": "Weekly note: usage insights ships this quarter."
+    },
+    {
+      "channel": "eng-oncall",
+      "user": "pagerbot",
+      "ts": "1773900000.000000",
+      "thread_ts": null,
+      "text": "ALERT gateway p99 latency above threshold"
+    },
+    {
+      "channel": "eng-oncall",
+      "user": "claire",
+      "ts": "1773900600.000000",
+      "thread_ts": "1773900000.000000",
+      "text": "Looking at it, likely the route normalization rollout."
+    },
+    {
+      "channel": "eng-oncall",
+      "user": "morgan.reyes",
+      "ts": "1774000000.000000",
+      "thread_ts": null,
+      "text": "Is the latency fix tracked anywhere?"
+    }
+  ]
+}

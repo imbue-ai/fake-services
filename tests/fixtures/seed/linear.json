@@ -1,0 +1,121 @@
+{
+  "anchor": "2026-03-21T00:00:00Z",
+  "tokens": [
+    {
+      "token": "lin_api_fakeredwoodlineartoken",
+      "user": "morgan.reyes@redwood.example"
+    }
+  ],
+  "organization": {
+    "name": "Redwood Inference",
+    "url_key": "redwood"
+  },
+  "teams": [
+    {
+      "key": "ENG",
+      "name": "Engineering",
+      "states": [
+        {
+          "name": "Planned",
+          "type": "unstarted",
+          "position": 1
+        },
+        {
+          "name": "In Progress",
+          "type": "started",
+          "position": 2
+        },
+        {
+          "name": "Done",
+          "type": "completed",
+          "position": 3
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "name": "Morgan Reyes",
+      "email": "morgan.reyes@redwood.example",
+      "admin": true,
+      "id": "5485bf92-2976-5129-9b07-bd4c79ca0790"
+    },
+    {
+      "name": "Thomas Baird",
+      "email": "thomas.baird@redwood.example"
+    }
+  ],
+  "labels": [
+    {
+      "name": "telemetry"
+    }
+  ],
+  "projects": [
+    {
+      "name": "Usage insights",
+      "state": "started"
+    }
+  ],
+  "cycles": [
+    {
+      "team": "ENG",
+      "name": "2026-W11",
+      "number": 11,
+      "starts_at": "2026-03-09T00:00:00.000Z",
+      "ends_at": "2026-03-16T00:00:00.000Z"
+    }
+  ],
+  "issues": [
+    {
+      "identifier": "ENG-1",
+      "team": "ENG",
+      "title": "Route normalization library",
+      "description": "Shared templating of route ids.",
+      "priority": 1,
+      "state": "Done",
+      "assignee": "Thomas Baird",
+      "creator": "Morgan Reyes",
+      "project": "Usage insights",
+      "cycle": "2026-W11",
+      "labels": [
+        "telemetry"
+      ],
+      "due_date": "2026-03-13",
+      "estimate": 8,
+      "created_at": "2026-03-02T09:00:00.000Z",
+      "updated_at": "2026-03-12T17:00:00.000Z",
+      "relations": []
+    },
+    {
+      "identifier": "ENG-2",
+      "team": "ENG",
+      "title": "Gateway latency regression",
+      "description": "p99 rose after the rollout.",
+      "priority": 2,
+      "state": "In Progress",
+      "assignee": "Thomas Baird",
+      "creator": "Morgan Reyes",
+      "project": "Usage insights",
+      "cycle": null,
+      "labels": [],
+      "due_date": null,
+      "estimate": 3,
+      "created_at": "2026-03-19T09:00:00.000Z",
+      "updated_at": "2026-03-20T12:00:00.000Z",
+      "relations": [
+        {
+          "type": "blocked_by",
+          "issue": "ENG-1"
+        }
+      ]
+    }
+  ],
+  "comments": [
+    {
+      "issue": "ENG-2",
+      "user": "Thomas Baird",
+      "body": "Bisected to the normalization cache.",
+      "created_at": "2026-03-20T12:00:00.000Z"
+    }
+  ]
+}

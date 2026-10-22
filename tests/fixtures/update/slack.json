@@ -1,0 +1,20 @@
+{
+  "users": [
+    {
+      "name": "olivia_chen",
+      "real_name": "Olivia Chen",
+      "title": "",
+      "is_bot": false
+    }
+  ],
+  "channels": [],
+  "messages": [
+    {
+      "channel": "eng-oncall",
+      "user": "olivia_chen",
+      "ts": "1774050000.000000",
+      "thread_ts": null,
+      "text": "Customer note drafted for the latency incident."
+    }
+  ]
+}

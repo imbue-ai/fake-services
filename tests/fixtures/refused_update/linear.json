@@ -1,0 +1,20 @@
+{
+  "issues": [
+    {
+      "identifier": "ENG-4",
+      "team": "ENG",
+      "title": "Placeable until the next one is refused",
+      "state": "Planned",
+      "created_at": "2026-03-20T20:30:00.000Z",
+      "relations": []
+    },
+    {
+      "identifier": "ENG-5",
+      "team": "ENG",
+      "title": "Unplaceable",
+      "state": "No Such State",
+      "created_at": "2026-03-20T21:00:00.000Z",
+      "relations": []
+    }
+  ]
+}

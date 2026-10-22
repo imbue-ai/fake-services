@@ -1,0 +1,33 @@
+{
+  "users": [],
+  "projects": [],
+  "cycles": [],
+  "labels": [
+    {
+      "name": "billing"
+    }
+  ],
+  "issues": [
+    {
+      "identifier": "ENG-3",
+      "team": "ENG",
+      "title": "Invoice line alignment",
+      "description": "Mid-cycle quota changes.",
+      "priority": 2,
+      "state": "Planned",
+      "assignee": null,
+      "creator": "Morgan Reyes",
+      "project": null,
+      "cycle": null,
+      "labels": [
+        "billing"
+      ],
+      "due_date": null,
+      "estimate": 5,
+      "created_at": "2026-03-20T18:00:00.000Z",
+      "updated_at": "2026-03-20T20:00:00.000Z",
+      "relations": []
+    }
+  ],
+  "comments": []
+}
