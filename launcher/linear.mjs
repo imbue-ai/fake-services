@@ -434,7 +434,9 @@ export function create(seed, clock) {
     const me = ls.users.findOneBy("linear_id", record.user_id);
     const result = await execute({ schema, document: doc, rootValue: root(me), contextValue: { unsupported }, fieldResolver, variableValues: body.variables, operationName: body.operationName });
     unsupportedOf.set(req, [...unsupported]);
-    return Response.json(result);
+    // A request execute() refuses before running it (a variable missing or of the wrong type, an
+    // operation it cannot pick) has no data, and is a 400 as an invalid query is.
+    return Response.json(result, { status: "data" in result ? 200 : 400 });
   }
 
   return {

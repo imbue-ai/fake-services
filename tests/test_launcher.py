@@ -599,11 +599,19 @@ def test_a_write_is_refused_only_when_it_is_the_operation_that_would_run(
     read = post("Read")
     write = post("Write")
 
-    assert unknown.status_code != 403
+    assert unknown.status_code == 400
     assert unknown.json()["errors"][0]["message"] == 'Unknown operation named "Nope".'
     assert read.json()["data"]["viewer"]["name"] == "Morgan Reyes"
     assert write.status_code == 403
     assert _control(external_services, "health")["unsupported_calls"] == {"linear:mutation:issueCreate": 1}
+
+
+def test_a_query_missing_its_required_variable_is_refused_with_400(external_services: RunningExternalServices) -> None:
+    answer = _linear(external_services, "query One($id: String!) { issue(id: $id) { identifier } }")
+
+    assert answer.status_code == 400
+    assert "data" not in answer.json()
+    assert answer.json()["errors"][0]["message"].startswith('Variable "$id" has invalid value')
 
 
 def test_a_slack_method_the_fake_does_not_have_is_answered_as_slack_does_and_counted(
