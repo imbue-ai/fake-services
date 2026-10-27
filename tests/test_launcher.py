@@ -602,8 +602,17 @@ def test_a_write_is_refused_only_when_it_is_the_operation_that_would_run(
     assert unknown.status_code == 400
     assert unknown.json()["errors"][0]["message"] == 'Unknown operation named "Nope".'
     assert read.json()["data"]["viewer"]["name"] == "Morgan Reyes"
+    through_fragment = _linear(
+        external_services,
+        'mutation { ...Archive } fragment Archive on Mutation { issueArchive(id: "ENG-1") { success } }',
+    )
+
     assert write.status_code == 403
-    assert _control(external_services, "health")["unsupported_calls"] == {"linear:mutation:issueCreate": 1}
+    assert through_fragment.status_code == 403
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "linear:mutation:issueCreate": 1,
+        "linear:mutation:issueArchive": 1,
+    }
 
 
 def test_a_query_missing_its_required_variable_is_refused_with_400(external_services: RunningExternalServices) -> None:

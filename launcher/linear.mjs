@@ -431,7 +431,16 @@ export function create(seed, clock) {
     const op = getOperationAST(doc, body.operationName);
     const unsupported = new Set();
     if (op && op.operation !== "query") {
-      for (const selection of op.selectionSet.selections) if (selection.kind === "Field") unsupported.add(`linear:${op.operation}:${selection.name.value}`);
+      // The operation's root fields, including those a fragment selects.
+      const fragments = new Map(doc.definitions.filter((d) => d.kind === "FragmentDefinition").map((d) => [d.name.value, d]));
+      const addRootFields = (selectionSet) => {
+        for (const selection of selectionSet.selections) {
+          if (selection.kind === "Field") unsupported.add(`linear:${op.operation}:${selection.name.value}`);
+          else if (selection.kind === "InlineFragment") addRootFields(selection.selectionSet);
+          else addRootFields(fragments.get(selection.name.value).selectionSet);
+        }
+      };
+      addRootFields(op.selectionSet);
       unsupportedOf.set(req, [...unsupported]);
       return forbidden(op.operation);
     }
