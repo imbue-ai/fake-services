@@ -614,6 +614,21 @@ def test_a_query_missing_its_required_variable_is_refused_with_400(external_serv
     assert answer.json()["errors"][0]["message"].startswith('Variable "$id" has invalid value')
 
 
+def test_a_get_carries_its_variables_as_json_in_the_url(external_services: RunningExternalServices) -> None:
+    def get(variables: str) -> httpx.Response:
+        return httpx.get(
+            "{}/graphql".format(external_services.linear_url),
+            params={"query": "query One($id: String!) { issue(id: $id) { identifier } }", "variables": variables},
+            headers={"Authorization": _LINEAR_TOKEN},
+        )
+
+    found = get('{"id": "ENG-1"}')
+    malformed = get("id=ENG-1")
+
+    assert (found.status_code, found.json()["data"]["issue"]["identifier"]) == (200, "ENG-1")
+    assert (malformed.status_code, malformed.json()["errors"][0]["message"]) == (400, "Variables are invalid JSON.")
+
+
 def test_a_slack_method_the_fake_does_not_have_is_answered_as_slack_does_and_counted(
     external_services: RunningExternalServices,
 ) -> None:

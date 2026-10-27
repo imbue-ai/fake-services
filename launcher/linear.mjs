@@ -411,8 +411,12 @@ export function create(seed, clock) {
     if (!record) return authFailure();
     if (url.pathname !== "/graphql") return Response.json({ message: "Not Found", documentation_url: DOCS }, { status: 404 });
     let body;
-    if (req.method === "GET") body = { query: url.searchParams.get("query") ?? "", variables: jsonOf(url.searchParams.get("variables")) ?? undefined, operationName: url.searchParams.get("operationName") ?? undefined };
-    else body = jsonOf(await req.clone().text());
+    if (req.method === "GET") {
+      const variablesText = url.searchParams.get("variables");
+      const variables = variablesText === null ? null : jsonOf(variablesText);
+      if (variables === undefined || typeof variables !== "object") return Response.json({ errors: [{ message: "Variables are invalid JSON." }] }, { status: 400 });
+      body = { query: url.searchParams.get("query") ?? "", variables, operationName: url.searchParams.get("operationName") ?? undefined };
+    } else body = jsonOf(await req.clone().text());
     if (!body || typeof body !== "object") return Response.json({ errors: [{ message: "POST body missing, invalid Content-Type, or JSON object has no keys." }] }, { status: 400 });
     let doc;
     try {
