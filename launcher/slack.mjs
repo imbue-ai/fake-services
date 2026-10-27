@@ -1,0 +1,212 @@
+// The fake Slack: @emulators/slack's app and store, with what a trial needs on top. Messages, threads
+// and ids are inserted straight into the store, so they read the same in every trial; Slack methods
+// answer GET; conversations.history takes oldest/latest/inclusive; a basic search.messages. See
+// launcher.mjs for the interface this module exports.
+import crypto from "node:crypto";
+import { Hono, Store, WebhookDispatcher, authMiddleware, cors, createApiErrorHandler, createErrorHandler } from "@emulators/core";
+import { getSlackStore, seedFromConfig, slackPlugin } from "@emulators/slack";
+
+export const name = "slack";
+export const host = "slack.com";
+const REAL_URL = `https://${host}`;
+// What an error answer points its reader at. Nothing a caller is sent names what is serving it.
+const DOCS = "https://api.slack.com/methods";
+
+const unknownMethod = (status) => Response.json({ ok: false, error: "unknown_method" }, { status });
+// Stable ids: an id derived from the name survives a re-seed and reads the same in every trial.
+const slackId = (prefix, text) => prefix + crypto.createHash("sha1").update(text).digest("hex").slice(0, 10).toUpperCase();
+const isPage = (res) => (res.headers.get("content-type") ?? "").includes("text/html");
+async function answerOf(res) {
+  try {
+    return await res.clone().json();
+  } catch {
+    return null;
+  }
+}
+
+export function create(seed, clock) {
+  const app = new Hono();
+  const store = new Store();
+  app.onError(createApiErrorHandler(DOCS));
+  app.use("*", cors());
+  app.use("*", createErrorHandler(DOCS));
+  // No fallback user: a token the seed does not name is anonymous.
+  app.use("*", authMiddleware(new Map(), undefined, undefined));
+  slackPlugin.register(app, store, new WebhookDispatcher(), REAL_URL, new Map());
+  app.notFound((c) => c.json({ message: "Not Found", documentation_url: DOCS }, 404));
+  const ss = getSlackStore(store);
+  const domain = seed.team?.domain ?? "workspace";
+  const tokenUsers = new Map((seed.tokens ?? []).map((entry) => [entry.token, entry.user]));
+
+  function add(cfg) {
+    // The emulator only renames a team it already has, and answers for a missing one under its own name.
+    if (!ss.teams.all()[0]) ss.teams.insert({ team_id: "T" + slackId("", domain), name: cfg.team?.name ?? domain, domain });
+    seedFromConfig(store, REAL_URL, {
+      team: cfg.team,
+      users: (cfg.users ?? []).map((u) => ({ name: u.name, real_name: u.real_name, email: u.email ?? `${u.name}@${domain}.example`, profile: { title: u.title ?? "" } })),
+      channels: (cfg.channels ?? []).map((c) => ({ name: c.name, topic: c.topic, is_private: c.is_private })),
+      tokens: cfg.tokens,
+    });
+    for (const u of cfg.users ?? []) {
+      const rec = ss.users.all().find((x) => x.name === u.name);
+      const id = u.id ?? slackId("U", u.name);
+      if (rec.user_id === id) continue;
+      const old = rec.user_id;
+      ss.users.update(rec.id, { user_id: id, is_bot: Boolean(u.is_bot) });
+      for (const ch of ss.channels.all())
+        if (ch.members.includes(old) || ch.creator === old)
+          ss.channels.update(ch.id, { members: ch.members.map((m) => (m === old ? id : m)), creator: ch.creator === old ? id : ch.creator });
+      for (const t of ss.tokens.all()) if (t.user_id === old) ss.tokens.update(t.id, { user_id: id });
+    }
+    for (const c of cfg.channels ?? []) {
+      const rec = ss.channels.findOneBy("name", c.name);
+      const id = c.id ?? slackId("C", c.name);
+      if (rec.channel_id !== id) ss.channels.update(rec.id, { channel_id: id });
+    }
+    // Every seeded user is a member of every public channel.
+    const members = ss.users.all().map((u) => u.user_id);
+    for (const ch of ss.channels.all()) if (!ch.is_private) ss.channels.update(ch.id, { members, num_members: members.length });
+    const chan = (ref) => (ss.channels.findOneBy("name", ref) ?? ss.channels.findOneBy("channel_id", ref))?.channel_id;
+    const user = (ref) => (ss.users.all().find((x) => x.name === ref) ?? ss.users.findOneBy("user_id", ref))?.user_id;
+    let n = 0;
+    for (const m of cfg.messages ?? []) {
+      const channel_id = chan(m.channel);
+      const uid = user(m.user);
+      if (!channel_id || !uid) throw new Error(`slack message refers to unknown channel/user: ${m.channel}/${m.user}`);
+      const ts = clock.slackTs(m.ts);
+      const thread_ts = clock.slackTs(m.thread_ts) ?? undefined;
+      ss.messages.insert({ ts, channel_id, user: uid, text: m.text, type: "message", thread_ts, reply_count: 0, reply_users: [], reactions: [] });
+      if (thread_ts && thread_ts !== ts) {
+        const p = ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === thread_ts);
+        if (!p) throw new Error(`thread parent missing for ${m.channel}/${m.ts}`);
+        ss.messages.update(p.id, {
+          thread_ts: p.ts,
+          reply_count: p.reply_count + 1,
+          reply_users: p.reply_users.includes(uid) ? p.reply_users : [...p.reply_users, uid],
+          latest_reply: ts,
+        });
+      }
+      n++;
+    }
+    return { slack_messages: n };
+  }
+
+  async function params(req) {
+    const url = new URL(req.url);
+    const out = Object.fromEntries(url.searchParams);
+    if (req.method !== "GET") {
+      const text = await req.clone().text();
+      if ((req.headers.get("content-type") ?? "").includes("json")) {
+        try {
+          Object.assign(out, JSON.parse(text));
+        } catch {}
+      } else Object.assign(out, Object.fromEntries(new URLSearchParams(text)));
+    }
+    return out;
+  }
+  const asPost = (req, method, body) =>
+    app.fetch(
+      new Request(new URL(`/api/${method}`, req.url), {
+        method: "POST",
+        headers: { authorization: req.headers.get("authorization") ?? "", "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body).toString(),
+      }),
+    );
+  async function history(req, p) {
+    const all = [];
+    let cursor = "";
+    do {
+      const page = await (await asPost(req, "conversations.history", { channel: p.channel, limit: "1000", cursor })).json();
+      if (!page.ok) return Response.json(page);
+      all.push(...page.messages);
+      cursor = page.response_metadata?.next_cursor;
+    } while (cursor);
+    const incl = ["true", "1", true].includes(p.inclusive);
+    const lo = p.oldest ? Number(p.oldest) : -Infinity;
+    const hi = p.latest ? Number(p.latest) : Infinity;
+    const kept = all.filter((m) => (incl ? Number(m.ts) >= lo && Number(m.ts) <= hi : Number(m.ts) > lo && Number(m.ts) < hi));
+    const limit = Math.min(Number(p.limit) || 100, 1000);
+    const start = p.cursor ? kept.findIndex((m) => m.ts === p.cursor) : 0;
+    if (start < 0) return Response.json({ ok: false, error: "invalid_cursor" });
+    const more = start + limit < kept.length;
+    return Response.json({ ok: true, messages: kept.slice(start, start + limit), has_more: more, pin_count: 0, response_metadata: { next_cursor: more ? kept[start + limit].ts : "" } });
+  }
+  async function search(req, p) {
+    const auth = await (await asPost(req, "auth.test", {})).json();
+    if (!auth.ok) return Response.json(auth);
+    const preds = [];
+    for (const raw of String(p.query ?? "").match(/"[^"]+"|\S+/g) ?? []) {
+      const term = raw.replace(/^"|"$/g, "");
+      const lower = term.toLowerCase();
+      if (lower.startsWith("in:")) {
+        const ch = ss.channels.findOneBy("name", term.slice(3).replace(/^#/, ""));
+        preds.push((m) => m.channel_id === ch?.channel_id);
+      } else if (lower.startsWith("from:")) {
+        const who = term.slice(5).replace(/^[<@]+|>$/g, "");
+        const u = ss.users.all().find((x) => x.name === who) ?? ss.users.findOneBy("user_id", who);
+        preds.push((m) => m.user === u?.user_id);
+      } else if (lower.startsWith("after:")) preds.push((m) => Number(m.ts) > Date.parse(term.slice(6) + "T23:59:59Z") / 1000);
+      else if (lower.startsWith("before:")) preds.push((m) => Number(m.ts) < Date.parse(term.slice(7) + "T00:00:00Z") / 1000);
+      else preds.push((m) => m.text.toLowerCase().includes(lower));
+    }
+    const visible = new Map(ss.channels.all().filter((c) => !c.is_private || c.members.includes(auth.user_id)).map((c) => [c.channel_id, c]));
+    const dir = p.sort_dir === "asc" ? 1 : -1;
+    const hits = ss.messages.all().filter((m) => visible.has(m.channel_id) && preds.every((f) => f(m))).sort((a, b) => dir * (Number(a.ts) - Number(b.ts)));
+    const count = Math.min(Number(p.count) || 20, 100);
+    const page = Math.max(Number(p.page) || 1, 1);
+    const slice = hits.slice((page - 1) * count, page * count);
+    return Response.json({
+      ok: true,
+      query: p.query ?? "",
+      messages: {
+        total: hits.length,
+        paging: { count, total: hits.length, page, pages: Math.ceil(hits.length / count) },
+        matches: slice.map((m) => {
+          const ch = visible.get(m.channel_id);
+          return { type: "message", channel: { id: ch.channel_id, name: ch.name }, user: m.user, username: ss.users.findOneBy("user_id", m.user)?.name ?? "", ts: m.ts, text: m.text, permalink: `https://${domain}.slack.com/archives/${ch.channel_id}/p${m.ts.replace(".", "")}` };
+        }),
+      },
+    });
+  }
+  async function apiRoute(req, url) {
+    const method = url.pathname.slice(5);
+    const p = await params(req);
+    if (method === "search.messages") return search(req, p);
+    if (method === "conversations.history" && (p.oldest || p.latest)) return history(req, p);
+    if (req.method === "GET") return asPost(req, method, Object.fromEntries(url.searchParams));
+    return app.fetch(req);
+  }
+  async function route(req, url) {
+    const isMethod = url.pathname.startsWith("/api/");
+    const res = await (isMethod ? apiRoute(req, url) : app.fetch(req));
+    // The package underneath serves pages of its own (an inspector, sign-in screens) that say what
+    // they are. Real Slack serves no page at an API path, so a page becomes a 404.
+    if (isPage(res)) return unknownMethod(404);
+    // Slack answers a method it does not have with a 200 that says so, where the package underneath
+    // answers a path it does not route with a 404 of its own.
+    if (isMethod && res.status === 404 && (await answerOf(res))?.ok === undefined) return unknownMethod(200);
+    return res;
+  }
+
+  return {
+    name,
+    host,
+    store,
+    tokenUsers,
+    add,
+    route,
+    notFound: () => unknownMethod(404),
+    counts: () => ({ users: ss.users.all().length, channels: ss.channels.all().length, messages: ss.messages.all().length }),
+    outcome: (json) => ({ ok: json?.ok ?? null, error: json?.error ?? null, result_count: resultCount(json) }),
+    unsupportedKeys: (url, json) => (json?.error === "unknown_method" ? [`slack:${url.pathname.replace(/^\/api\//, "")}`] : []),
+  };
+}
+
+function resultCount(json) {
+  if (json == null || typeof json !== "object") return null;
+  for (const k of ["messages", "channels", "members", "files", "items"]) {
+    if (Array.isArray(json[k])) return json[k].length;
+    if (Array.isArray(json[k]?.matches)) return json[k].matches.length;
+  }
+  return null;
+}

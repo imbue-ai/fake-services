@@ -1,8 +1,9 @@
 # External services launcher: third-party material
 
 What the eval box image bakes under `/opt/eval_external_services/` for the fake Slack and Linear a
-trial can run (`resources/external_services/launcher.mjs`, uploaded per trial into that directory),
-and what `just minds-evals-external-services-install` installs for the launcher's tests.
+trial can run (`resources/external_services/launcher/`, uploaded per trial as a `launcher/`
+directory under it), and what `just minds-evals-external-services-install` installs for the
+launcher's tests.
 
 - `package.json`, `package-lock.json`: the npm packages the launcher imports, pinned by the lockfile.
 - `linear_schema.graphql.gz`: Linear's public GraphQL schema, which the launcher validates every query

@@ -365,7 +365,7 @@ def test_a_directory_holding_one_seed_serves_that_service_alone(
     assert health["services"] == ["slack"]
     assert sorted(health["counts"]) == ["requests", "slack"]
     assert health["counts"]["requests"] == {"slack": 0}
-    assert "linear" not in dump and "linear_relations" not in dump
+    assert "linear" not in dump
     assert (refused.status_code, refused.json()["error"]) == (
         400,
         "the linear service was not seeded, so it takes no update",
@@ -466,7 +466,7 @@ def test_a_public_linear_field_or_argument_the_fake_lacks_is_answered_empty_and_
     assert root.json() == {"data": {"initiatives": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}
     assert argument.status_code == 200 and argument.json()["data"]["issues"]["nodes"]
     assert filtered.json()["data"] is None
-    assert filtered.json()["errors"][0]["message"] == 'Field "slaStatus" is not defined by type "filter".'
+    assert filtered.json()["errors"][0]["message"] == 'Field "slaStatus" is not defined by type "IssueFilter".'
     assert no_such_field.status_code == 400
     assert no_such_field.json()["errors"][0]["message"].startswith('Cannot query field "noSuchField" on type "User"')
     assert no_such_argument.status_code == 400
@@ -477,7 +477,7 @@ def test_a_public_linear_field_or_argument_the_fake_lacks_is_answered_empty_and_
         "linear:field:Project.slugId": 1,
         "linear:field:Query.initiatives": 1,
         "linear:argument:Query.issues.sort": 1,
-        "linear:filter:filter.slaStatus": 1,
+        "linear:filter:IssueFilter.slaStatus": 1,
     }
     assert [line["unsupported"] for line in _control(external_services, "log")] == [
         "linear:field:User.timezone",
@@ -485,8 +485,81 @@ def test_a_public_linear_field_or_argument_the_fake_lacks_is_answered_empty_and_
         "linear:field:User.guest",
         "linear:field:Query.initiatives",
         "linear:argument:Query.issues.sort",
-        "linear:filter:filter.slaStatus",
+        "linear:filter:IssueFilter.slaStatus",
         None,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_an_argument_is_counted_by_the_field_that_ignores_it_and_a_schema_default_is_not(
+    external_services: RunningExternalServices,
+) -> None:
+    """`includeDisabled` is read by no resolver; `includeArchived` is read where issues are listed
+    and nowhere else; `includeSubTeams: false` is what the schema gives a caller who says nothing."""
+    answer = _linear(
+        external_services,
+        '{ team(id: "ENG") { members(includeDisabled: true) { nodes { name } } '
+        "issues(includeArchived: true, includeSubTeams: false) { nodes { identifier } } "
+        "projects(includeArchived: true) { nodes { name } } } }",
+    )
+
+    assert answer.status_code == 200 and "errors" not in answer.json()
+    assert len(answer.json()["data"]["team"]["issues"]["nodes"]) == 2
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "linear:argument:Team.members.includeDisabled": 1,
+        "linear:argument:Team.projects.includeArchived": 1,
+    }
+
+
+def test_a_nested_filter_names_the_type_linear_names(external_services: RunningExternalServices) -> None:
+    refused = _linear(
+        external_services,
+        '{ issues(filter: {assignee: {createdAt: {lt: "P1D"}}, labels: {some: {isGroup: {eq: true}}}}) { nodes { id } } }',
+    )
+
+    assert refused.status_code == 200 and refused.json()["data"] is None
+    assert refused.json()["errors"][0]["message"] == 'Field "createdAt" is not defined by type "NullableUserFilter".'
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "linear:filter:NullableUserFilter.createdAt": 1,
+    }
+
+
+def test_every_graphql_request_goes_through_the_public_schema(external_services: RunningExternalServices) -> None:
+    """A mutation is refused as Linear's SDK reads a 403 and counted; a GET carries its document in
+    the URL and is validated like a POST. Neither reaches the emulator's own schema."""
+    before = _control(external_services, "health")["counts"]["linear"]
+
+    refused = _linear(
+        external_services,
+        'mutation { issueCreate(input: {teamId: "ENG", title: "x"}) { success } commentCreate(input: {body: "y"}) { success } }',
+    )
+    got = httpx.get(
+        "{}/graphql".format(external_services.linear_url),
+        params={"query": "{ viewer { name } }"},
+        headers={"Authorization": _LINEAR_TOKEN},
+    )
+    invalid_get = httpx.get(
+        "{}/graphql".format(external_services.linear_url),
+        params={"query": "{ viewer { noSuchField } }"},
+        headers={"Authorization": _LINEAR_TOKEN},
+    )
+    unvalidated_write = _linear(external_services, "mutation { noSuchMutation { success } }")
+
+    assert refused.status_code == 403
+    assert refused.json()["errors"][0]["extensions"]["type"] == "forbidden"
+    assert "data" not in refused.json()
+    assert (got.status_code, got.json()["data"]["viewer"]["name"]) == (200, "Morgan Reyes")
+    assert invalid_get.status_code == 400
+    assert unvalidated_write.status_code == 400
+    assert _control(external_services, "health")["counts"]["linear"] == before
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "linear:mutation:issueCreate": 1,
+        "linear:mutation:commentCreate": 1,
+    }
+    assert [line["unsupported"] for line in _control(external_services, "log")] == [
+        "linear:mutation:issueCreate",
         None,
         None,
         None,
@@ -773,7 +846,9 @@ def test_the_state_dump_redacts_every_token(external_services: RunningExternalSe
     assert dump["counts"]["linear"]["issues"] == len(
         external_services_document(EXTERNAL_SERVICES_SEED_FIXTURE, "linear")["issues"]
     )
-    assert [relation["type"] for relation in dump["linear_relations"]] == ["blocks"]
+    # Relations are a collection of the Linear store's own, dumped and restored with the rest.
+    relations = dump["linear"]["collections"]["linear.issue_relations"]["items"]
+    assert [relation["type"] for relation in relations] == ["blocks"]
 
 
 def test_no_answer_says_what_is_serving_it(external_services: RunningExternalServices) -> None:
@@ -810,6 +885,6 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
             assert word not in visible, (word, answer.request.url, answer.text[:300])
     # An unsupported filter reads as a query Linear validated and refused.
     refused = answers[0].json()["errors"][0]
-    assert refused["message"] == 'Field "slaStatus" is not defined by type "filter".'
+    assert refused["message"] == 'Field "slaStatus" is not defined by type "IssueFilter".'
     assert refused["extensions"]["code"] == "GRAPHQL_VALIDATION_FAILED"
     assert "html" not in answers[7].headers["content-type"]

@@ -1,0 +1,462 @@
+// The fake Linear: one GraphQL endpoint served from Linear's public schema by the resolvers here, on
+// a store that @emulators/linear seeds and resolves references in. Issues keep the seed's
+// identifiers and timestamps, with estimate, parent/children and relations; queries take nested
+// filters, date/number comparators, orderBy and searchIssues; a public field or argument the fake
+// does not hold is answered empty and counted; a mutation or subscription is refused. See
+// launcher.mjs for the interface this module exports.
+import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
+import { Store } from "@emulators/core";
+import * as emulator from "@emulators/linear";
+import { GraphQLError, buildSchema, execute, getNamedType, isAbstractType, isEnumType, isListType, isNonNullType, isScalarType, parse, validate, valueFromAST } from "graphql";
+
+export const name = "linear";
+export const host = "api.linear.app";
+// What an error answer points its reader at. Nothing a caller is sent names what is serving it.
+const DOCS = "https://linear.app/developers/graphql";
+
+// Linear's public schema as its SDK publishes it (linear_schema.graphql.gz in the directory above,
+// see templates/environment/external_services/), so a query validates as the real API validates it:
+// introspection shows Linear's own types, and a field, argument or type Linear does not have is the
+// caller's mistake, refused with 400 as Linear refuses it. The resolvers in root() serve what the
+// fake holds; fieldResolver answers the rest of the public schema.
+const schema = buildSchema(gunzipSync(readFileSync(new URL("../linear_schema.graphql.gz", import.meta.url))).toString("utf-8"));
+
+// What a public field the fake does not hold answers with: null where the schema allows it, else its
+// type's empty value, so the query still gets everything the fake has. The field is counted under its
+// public name; the fields of an empty object are not counted again. An abstract type has no empty
+// value, so a non-null one errors as a missing field does.
+const EMPTY = Symbol("empty");
+function emptyValue(type) {
+  if (!isNonNullType(type)) return null;
+  const named = getNamedType(type);
+  if (isListType(type.ofType)) return [];
+  if (isEnumType(named)) return named.getValues()[0].value;
+  if (isScalarType(named)) return named.name === "Boolean" ? false : named.name === "Int" || named.name === "Float" ? 0 : "";
+  return isAbstractType(named) ? null : { [EMPTY]: true };
+}
+// An argument's default as the schema states it: the SDL gives it as a literal.
+const defaultOf = (arg) => (arg.default == null ? undefined : "literal" in arg.default ? valueFromAST(arg.default.literal, arg.type) : arg.default.value);
+// A resolver is handed its arguments through a proxy that notes which it read. An argument the
+// schema has and the resolver never read is ignored, and counted, unless it holds the schema's own
+// default, which the caller did not ask for. The counting is per field: a resolver that reads
+// `includeArchived` says nothing about another that does not.
+function fieldResolver(source, args, context, info) {
+  const fieldName = `${info.parentType.name}.${info.fieldName}`;
+  if (source != null && typeof source === "object" && info.fieldName in source) {
+    const property = source[info.fieldName];
+    if (typeof property !== "function") return property;
+    const read = new Set();
+    const noted = new Proxy(args, {
+      get(target, key) {
+        if (typeof key === "string") read.add(key);
+        return target[key];
+      },
+    });
+    const result = property(noted, context, info);
+    for (const arg of info.parentType.getFields()[info.fieldName].args)
+      if (arg.name in args && !read.has(arg.name) && JSON.stringify(args[arg.name]) !== JSON.stringify(defaultOf(arg))) context.unsupported.add(`linear:argument:${fieldName}.${arg.name}`);
+    return result;
+  }
+  if (!source?.[EMPTY]) context.unsupported.add(`linear:field:${fieldName}`);
+  return emptyValue(info.returnType);
+}
+
+const PRIORITY_LABELS = ["No priority", "Urgent", "High", "Medium", "Low"];
+// Shaped as Linear shapes a query it validated and then refused.
+const inputError = (message) => new GraphQLError(message, { extensions: { code: "GRAPHQL_VALIDATION_FAILED", type: "graphql error", userError: true, userPresentableMessage: message } });
+const notFoundError = (what) => new GraphQLError("Entity not found: " + what, { extensions: { code: "INPUT_ERROR", type: "invalid input", userError: true, userPresentableMessage: `Could not find referenced ${what}.` } });
+const authFailure = () =>
+  Response.json({ errors: [{ message: "Authentication required, not authenticated", extensions: { type: "authentication error", code: "AUTHENTICATION_ERROR", userError: true, userPresentableMessage: "You need to authenticate to access this operation." } }] }, { status: 401 });
+// A write is refused as Linear's SDK reads a 403: its `forbidden` error type.
+const forbidden = (operation) => {
+  const message = `You do not have the permissions to perform this ${operation}.`;
+  return Response.json({ errors: [{ message, extensions: { type: "forbidden", code: "FORBIDDEN", userError: true, userPresentableMessage: message } }] }, { status: 403 });
+};
+// Linear's date comparators also take an ISO 8601 duration, added to the present: "-P2W1D" is two
+// weeks and a day ago.
+const DURATION = /^([+-])?P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/;
+// The filter argument's input type of the field being resolved, which names the filter's keys as
+// Linear names them in an error.
+const filterTypes = new WeakMap();
+function filterTypeOf(info) {
+  const field = info.parentType.getFields()[info.fieldName];
+  if (!filterTypes.has(field)) filterTypes.set(field, getNamedType(field.args.find((arg) => arg.name === "filter").type));
+  return filterTypes.get(field);
+}
+
+export function create(seed, clock) {
+  const store = new Store();
+  const ls = emulator.getLinearStore(store);
+  // Relations are the launcher's own collection in the emulator's store, so a snapshot of the store
+  // holds them and a restore brings them back with everything else.
+  const relations = store.collection("linear.issue_relations", ["issue_id", "related_issue_id"]);
+  const orgUrl = `https://linear.app/${seed.organization?.url_key ?? "workspace"}`;
+  const tokenUsers = new Map((seed.tokens ?? []).map((entry) => [entry.token, entry.user]));
+
+  function durationFromNowMs(text) {
+    const m = DURATION.exec(text);
+    if (!m || !m.slice(2).some(Boolean)) return NaN;
+    const [sign, years, months, weeks, days, hours, minutes, seconds] = [m[1] === "-" ? -1 : 1, ...m.slice(2).map((part) => Number(part ?? 0))];
+    const at = new Date(clock.now());
+    at.setUTCFullYear(at.getUTCFullYear() + sign * years, at.getUTCMonth() + sign * months);
+    return at.getTime() + sign * (((weeks * 7 + days) * 24 + hours) * 3600000 + minutes * 60000 + seconds * 1000);
+  }
+  function cmp(v, x) {
+    if (typeof v === "number") return v - Number(x);
+    const a = Date.parse(v);
+    const parsed = Date.parse(x);
+    const b = Number.isNaN(parsed) ? durationFromNowMs(String(x)) : parsed;
+    if (Number.isNaN(a) || Number.isNaN(b)) throw inputError(`Expected a valid ISO 8601 date, duration or number, got ${JSON.stringify(x)}`);
+    return a - b;
+  }
+  const COMPARATORS = {
+    eq: (v, x) => v === x,
+    neq: (v, x) => v !== x,
+    in: (v, x) => x.includes(v),
+    nin: (v, x) => !x.includes(v),
+    eqIgnoreCase: (v, x) => String(v ?? "").toLowerCase() === String(x).toLowerCase(),
+    neqIgnoreCase: (v, x) => String(v ?? "").toLowerCase() !== String(x).toLowerCase(),
+    contains: (v, x) => String(v ?? "").includes(x),
+    containsIgnoreCase: (v, x) => String(v ?? "").toLowerCase().includes(String(x).toLowerCase()),
+    notContains: (v, x) => !String(v ?? "").includes(x),
+    startsWith: (v, x) => String(v ?? "").startsWith(x),
+    endsWith: (v, x) => String(v ?? "").endsWith(x),
+    null: (v, x) => (v == null) === x,
+    gt: (v, x) => v != null && cmp(v, x) > 0,
+    gte: (v, x) => v != null && cmp(v, x) >= 0,
+    lt: (v, x) => v != null && cmp(v, x) < 0,
+    lte: (v, x) => v != null && cmp(v, x) <= 0,
+  };
+  // `view` is a plain object whose keys are the filter type's fields; nested objects are related
+  // entities and arrays are collections. `type` is the schema's input type for `filter`, which
+  // validation has already held the keys to, so a key the view lacks is one Linear filters by and
+  // the fake does not.
+  function matches(view, filter, type) {
+    if (filter == null) return true;
+    return Object.entries(filter).every(([key, want]) => {
+      if (key === "and") return want.every((f) => matches(view, f, type));
+      if (key === "or") return want.some((f) => matches(view, f, type));
+      const unsupported = () => inputError(`Field "${key}" is not defined by type "${type.name}".`);
+      if (view !== null && typeof view === "object" && !Array.isArray(view)) {
+        if (!(key in view)) throw unsupported();
+        const v = view[key];
+        const inner = getNamedType(type.getFields()[key].type);
+        if (Array.isArray(v)) {
+          const of = (field) => getNamedType(inner.getFields()[field].type);
+          if (want.some) return v.some((x) => matches(x, want.some, of("some")));
+          if (want.every) return v.every((x) => matches(x, want.every, of("every")));
+          if ("length" in want) return matches(v.length, want.length, of("length"));
+          return v.some((x) => matches(x, want, inner));
+        }
+        const relationNull = want !== null && typeof want === "object" && Object.keys(want).length === 1 && "null" in want;
+        if (relationNull && (v === null || typeof v === "object")) return (v === null) === want.null;
+        if (v !== null && typeof v === "object") return matches(v, want, inner);
+        if (v === null && want !== null && typeof want === "object" && !Object.keys(want).some((k) => k in COMPARATORS)) return "null" in want ? want.null === true : false;
+        return matches(v, want, inner);
+      }
+      const op = COMPARATORS[key];
+      if (!op) throw unsupported();
+      return op(view, want);
+    });
+  }
+  function connection(items, args, format) {
+    const first = Math.min(args.first ?? 50, 250);
+    const start = args.after ? Number(Buffer.from(args.after, "base64url").toString().split(":")[1]) + 1 : 0;
+    const slice = items.slice(start, start + first);
+    const cursor = (i) => Buffer.from(`linear:${start + i}`).toString("base64url");
+    const nodes = slice.map(format);
+    return {
+      nodes,
+      edges: nodes.map((node, i) => ({ node, cursor: cursor(i) })),
+      pageInfo: { hasNextPage: start + first < items.length, hasPreviousPage: start > 0, startCursor: slice.length ? cursor(0) : null, endCursor: slice.length ? cursor(slice.length - 1) : null },
+    };
+  }
+  function isActiveCycle(c) {
+    const now = clock.now();
+    return Boolean(c.starts_at && c.ends_at && Date.parse(c.starts_at) <= now && now < Date.parse(c.ends_at));
+  }
+
+  function add(cfg) {
+    emulator.seedFromConfig(store, orgUrl, {
+      organization: cfg.organization,
+      users: cfg.users,
+      teams: cfg.teams,
+      labels: cfg.labels,
+      projects: cfg.projects,
+      cycles: (cfg.cycles ?? []).map((c) => ({ ...c, starts_at: clock.iso(c.starts_at) ?? undefined, ends_at: clock.iso(c.ends_at) ?? undefined })),
+      tokens: cfg.tokens,
+    });
+    const need = (what, ref, rec) => {
+      if (ref && !rec) throw new Error(`linear ${what} not found: ${ref}`);
+      return rec?.linear_id ?? null;
+    };
+    let issues = 0;
+    for (const i of cfg.issues ?? []) {
+      const team = emulator.resolveTeam(store, i.team);
+      if (!team) throw new Error(`linear team not found: ${i.team}`);
+      if (ls.issues.findOneBy("identifier", i.identifier)) throw new Error(`duplicate issue ${i.identifier}`);
+      const state = emulator.resolveState(store, i.state, team.linear_id);
+      if (!state) throw new Error(`linear state not found: ${i.state}`);
+      const number = Number(i.identifier.split("-")[1]);
+      const created = clock.iso(i.created_at);
+      const updated = clock.iso(i.updated_at ?? i.created_at);
+      const rec = ls.issues.insert({
+        linear_id: i.id ?? crypto.createHash("sha1").update(i.identifier).digest("hex").replace(/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/, "$1-$2-$3-$4-$5"),
+        identifier: i.identifier,
+        number,
+        team_id: team.linear_id,
+        title: i.title,
+        description: i.description ?? null,
+        priority: i.priority ?? 0,
+        state_id: state.linear_id,
+        assignee_id: need("user", i.assignee, emulator.resolveUser(store, i.assignee)),
+        creator_id: need("user", i.creator, emulator.resolveUser(store, i.creator)),
+        delegate_id: null,
+        project_id: need("project", i.project, emulator.resolveProject(store, i.project)),
+        cycle_id: need("cycle", i.cycle, emulator.resolveCycle(store, i.cycle, team.linear_id)),
+        label_ids: (i.labels ?? []).map((x) => need("label", x, emulator.resolveLabel(store, x, team.linear_id))),
+        url: `${orgUrl}/issue/${i.identifier}`,
+        archived_at: null,
+        canceled_at: null,
+        completed_at: state.type === "completed" ? updated : null,
+        started_at: state.type === "started" || state.type === "completed" ? created : null,
+        due_date: clock.date(i.due_date),
+        create_as_user: null,
+        display_icon_url: null,
+        estimate: i.estimate ?? null,
+        parent_ref: null,
+      });
+      // The store's insert and update stamp these with the wall clock, so the seed's own are written
+      // on the record itself; neither field is indexed.
+      rec.created_at = created;
+      rec.updated_at = updated;
+      if (number > team.issue_sequence) ls.teams.update(team.id, { issue_sequence: number });
+      issues++;
+    }
+    for (const i of cfg.issues ?? []) {
+      const self = ls.issues.findOneBy("identifier", i.identifier);
+      for (const r of i.relations ?? []) {
+        const other = ls.issues.findOneBy("identifier", r.issue);
+        if (!other) throw new Error(`relation of ${i.identifier} names an unknown issue ${r.issue}`);
+        if (r.type === "parent") self.parent_ref = other.linear_id;
+        else if (r.type === "child") other.parent_ref = self.linear_id;
+        else if (r.type === "blocked_by") relations.insert({ linear_id: crypto.randomUUID(), type: "blocks", issue_id: other.linear_id, related_issue_id: self.linear_id });
+        else relations.insert({ linear_id: crypto.randomUUID(), type: r.type, issue_id: self.linear_id, related_issue_id: other.linear_id });
+      }
+    }
+    let comments = 0;
+    for (const c of cfg.comments ?? []) {
+      const issue = ls.issues.findOneBy("identifier", c.issue);
+      if (!issue) throw new Error(`comment names an unknown issue ${c.issue}`);
+      const rec = ls.comments.insert({
+        linear_id: crypto.randomUUID(),
+        issue_id: issue.linear_id,
+        user_id: c.user ? need("user", c.user, emulator.resolveUser(store, c.user)) : null,
+        body: c.body,
+        create_as_user: null,
+        display_icon_url: null,
+      });
+      rec.created_at = rec.updated_at = clock.iso(c.created_at);
+      comments++;
+    }
+    return { linear_issues: issues, linear_comments: comments };
+  }
+
+  function root(me) {
+    const by = (coll, id) => (id ? coll.findOneBy("linear_id", id) : undefined);
+    const order = (items, orderBy) => {
+      const key = orderBy === "updatedAt" ? "updated_at" : "created_at";
+      return [...items].sort((a, b) => b[key].localeCompare(a[key]) || b.id - a.id);
+    };
+    // The views a filter is matched against. Related records and collections are read only when
+    // the filter asks for them.
+    const userView = (u) => (u ? { id: u.linear_id, name: u.name, displayName: u.display_name, email: u.email, active: u.active, admin: u.admin, isMe: u.linear_id === me?.linear_id } : null);
+    const teamView = (t) => (t ? { id: t.linear_id, key: t.key, name: t.name, private: t.private } : null);
+    const stateView = (x) => (x ? { id: x.linear_id, name: x.name, type: x.type, team: teamView(by(ls.teams, x.team_id)) } : null);
+    const labelView = (x) => ({ id: x.linear_id, name: x.name, team: teamView(by(ls.teams, x.team_id)) });
+    const projectView = (p) => (p ? { id: p.linear_id, name: p.name, state: p.state } : null);
+    const cycleView = (c) => (c ? { id: c.linear_id, number: c.number, name: c.name, startsAt: c.starts_at, endsAt: c.ends_at, team: teamView(by(ls.teams, c.team_id)), isActive: isActiveCycle(c) } : null);
+    const commentView = (c) => ({ id: c.linear_id, body: c.body, createdAt: c.created_at, updatedAt: c.updated_at, user: userView(by(ls.users, c.user_id)) });
+    const issueView = (i, deep = true) => ({
+      id: i.linear_id, identifier: i.identifier, number: i.number, title: i.title, description: i.description, priority: i.priority, estimate: i.estimate ?? null,
+      createdAt: i.created_at, updatedAt: i.updated_at, completedAt: i.completed_at, startedAt: i.started_at, canceledAt: i.canceled_at, archivedAt: i.archived_at, dueDate: i.due_date,
+      get team() { return teamView(by(ls.teams, i.team_id)); },
+      get state() { return stateView(by(ls.workflowStates, i.state_id)); },
+      get assignee() { return userView(by(ls.users, i.assignee_id)); },
+      get creator() { return userView(by(ls.users, i.creator_id)); },
+      get project() { return projectView(by(ls.projects, i.project_id)); },
+      get cycle() { return cycleView(by(ls.cycles, i.cycle_id)); },
+      get labels() { return i.label_ids.map((id) => by(ls.issueLabels, id)).filter(Boolean).map(labelView); },
+      get parent() { return deep && i.parent_ref ? issueView(by(ls.issues, i.parent_ref), false) : null; },
+      get children() { return deep ? ls.issues.all().filter((x) => x.parent_ref === i.linear_id).map((x) => issueView(x, false)) : []; },
+      get comments() { return deep ? ls.comments.findBy("issue_id", i.linear_id).map(commentView) : []; },
+      get hasBlockedByRelations() { return relations.findBy("related_issue_id", i.linear_id).some((r) => r.type === "blocks"); },
+      get hasBlockingRelations() { return relations.findBy("issue_id", i.linear_id).some((r) => r.type === "blocks"); },
+    });
+    // What a query is answered with. A field that is a function is resolved on demand with the
+    // query's arguments, so a record's relations are read only when asked for.
+    const fUser = (u) => u && {
+      id: u.linear_id, name: u.name, displayName: u.display_name, email: u.email, active: u.active, admin: u.admin, isMe: u.linear_id === me?.linear_id,
+      createdAt: u.created_at, updatedAt: u.updated_at, url: `${orgUrl}/profiles/${u.display_name}`,
+      assignedIssues: issuesOf((i) => i.assignee_id === u.linear_id),
+      createdIssues: issuesOf((i) => i.creator_id === u.linear_id),
+    };
+    const fState = (x) => x && { id: x.linear_id, name: x.name, type: x.type, position: x.position, color: "#95a2b3", team: () => fTeam(by(ls.teams, x.team_id)), createdAt: x.created_at, updatedAt: x.updated_at };
+    const fLabel = (x) => x && { id: x.linear_id, name: x.name, color: x.color, description: x.description, team: () => fTeam(by(ls.teams, x.team_id)), createdAt: x.created_at, updatedAt: x.updated_at };
+    const fCycle = (x) => x && { id: x.linear_id, number: x.number, name: x.name, startsAt: x.starts_at, endsAt: x.ends_at, createdAt: x.created_at, updatedAt: x.updated_at, team: () => fTeam(by(ls.teams, x.team_id)), issues: issuesOf((i) => i.cycle_id === x.linear_id) };
+    const fProject = (x) => x && {
+      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at, startDate: null, targetDate: null,
+      progress: () => {
+        const mine = ls.issues.all().filter((i) => i.project_id === x.linear_id);
+        return mine.length ? mine.filter((i) => i.completed_at).length / mine.length : 0;
+      },
+      teams: (a, _context, info) => connection(ls.teams.all().filter((t) => ls.issues.all().some((i) => i.project_id === x.linear_id && i.team_id === t.linear_id) && matches(teamView(t), a.filter, filterTypeOf(info))), a, fTeam),
+      issues: issuesOf((i) => i.project_id === x.linear_id),
+    };
+    const fTeam = (t) => t && {
+      id: t.linear_id, key: t.key, name: t.name, description: t.description, private: t.private, createdAt: t.created_at, updatedAt: t.updated_at,
+      states: (a, _context, info) => connection(ls.workflowStates.findBy("team_id", t.linear_id).filter((x) => matches(stateView(x), a.filter, filterTypeOf(info))).sort((x, y) => x.position - y.position), a, fState),
+      members: (a, _context, info) => connection(ls.users.all().filter((u) => matches(userView(u), a.filter, filterTypeOf(info))), a, fUser),
+      labels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => (!x.team_id || x.team_id === t.linear_id) && matches(labelView(x), a.filter, filterTypeOf(info))), a, fLabel),
+      cycles: (a, _context, info) => connection(ls.cycles.findBy("team_id", t.linear_id).filter((c) => matches(cycleView(c), a.filter, filterTypeOf(info))), a, fCycle),
+      projects: (a, _context, info) => connection(ls.projects.all().filter((p) => ls.issues.all().some((i) => i.project_id === p.linear_id && i.team_id === t.linear_id) && matches(projectView(p), a.filter, filterTypeOf(info))), a, fProject),
+      activeCycle: () => fCycle(ls.cycles.findBy("team_id", t.linear_id).find(isActiveCycle)),
+      issues: issuesOf((i) => i.team_id === t.linear_id),
+    };
+    const fComment = (c) => ({ id: c.linear_id, body: c.body, createdAt: c.created_at, updatedAt: c.updated_at, url: `${orgUrl}/issue/${by(ls.issues, c.issue_id).identifier}#comment-${c.linear_id.slice(0, 8)}`, user: () => fUser(by(ls.users, c.user_id)), issue: () => fIssue(by(ls.issues, c.issue_id)) });
+    const fRelation = (r) => ({ id: r.linear_id, type: r.type, createdAt: by(ls.issues, r.issue_id).created_at, issue: () => fIssue(by(ls.issues, r.issue_id)), relatedIssue: () => fIssue(by(ls.issues, r.related_issue_id)) });
+    const fIssue = (i) => i && {
+      id: i.linear_id, identifier: i.identifier, number: i.number, title: i.title, description: i.description, priority: i.priority, priorityLabel: PRIORITY_LABELS[i.priority],
+      estimate: i.estimate ?? null, url: i.url, branchName: `${i.identifier.toLowerCase()}-${i.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}`,
+      createdAt: i.created_at, updatedAt: i.updated_at, archivedAt: i.archived_at, canceledAt: i.canceled_at, completedAt: i.completed_at, startedAt: i.started_at, dueDate: i.due_date, trashed: null,
+      team: () => fTeam(by(ls.teams, i.team_id)), state: () => fState(by(ls.workflowStates, i.state_id)), assignee: () => fUser(by(ls.users, i.assignee_id)), creator: () => fUser(by(ls.users, i.creator_id)),
+      project: () => fProject(by(ls.projects, i.project_id)), cycle: () => fCycle(by(ls.cycles, i.cycle_id)), parent: () => fIssue(by(ls.issues, i.parent_ref)),
+      children: issuesOf((x) => x.parent_ref === i.linear_id),
+      labels: (a, _context, info) => connection(i.label_ids.map((id) => by(ls.issueLabels, id)).filter((x) => x && matches(labelView(x), a.filter, filterTypeOf(info))), a, fLabel),
+      comments: (a, _context, info) => connection(ls.comments.findBy("issue_id", i.linear_id).filter((c) => matches(commentView(c), a.filter, filterTypeOf(info))).sort((x, y) => x.created_at.localeCompare(y.created_at)), a, fComment),
+      relations: (a) => connection(relations.findBy("issue_id", i.linear_id), a, fRelation),
+      inverseRelations: (a) => connection(relations.findBy("related_issue_id", i.linear_id), a, fRelation),
+    };
+    const issues = (a, info, pred = () => true) => connection(order(ls.issues.all().filter((i) => (a.includeArchived || !i.archived_at) && pred(i) && matches(issueView(i), a.filter, filterTypeOf(info))), a.orderBy), a, fIssue);
+    function issuesOf(pred) {
+      return (a, _context, info) => issues(a, info, pred);
+    }
+    const one = (what, rec, format) => {
+      if (!rec) throw notFoundError(what);
+      return format(rec);
+    };
+    const text = (i) => `${i.identifier} ${i.title} ${i.description ?? ""}`.toLowerCase();
+    return {
+      viewer: () => fUser(me),
+      organization: () => {
+        const o = ls.organizations.all()[0];
+        return { id: o.linear_id, name: o.name, urlKey: o.url_key, createdAt: o.created_at };
+      },
+      teams: (a, _context, info) => connection(ls.teams.all().filter((t) => matches(teamView(t), a.filter, filterTypeOf(info))), a, fTeam),
+      team: ({ id }) => one("Team", emulator.resolveTeam(store, id), fTeam),
+      users: (a, _context, info) => connection(ls.users.all().filter((u) => matches(userView(u), a.filter, filterTypeOf(info))), a, fUser),
+      user: ({ id }) => one("User", by(ls.users, id), fUser),
+      issues: issuesOf(),
+      issue: ({ id }) => one("Issue", emulator.resolveIssue(store, id), fIssue),
+      issueSearch: (a, _context, info) => issues(a, info, (i) => text(i).includes((a.query ?? "").toLowerCase())),
+      searchIssues: (a, _context, info) => issues(a, info, (i) => a.term.toLowerCase().split(/\s+/).every((w) => text(i).includes(w))),
+      projects: (a, _context, info) => connection(order(ls.projects.all().filter((p) => matches(projectView(p), a.filter, filterTypeOf(info))), a.orderBy), a, fProject),
+      project: ({ id }) => one("Project", emulator.resolveProject(store, id), fProject),
+      cycles: (a, _context, info) => connection(ls.cycles.all().filter((c) => matches(cycleView(c), a.filter, filterTypeOf(info))), a, fCycle),
+      cycle: ({ id }) => one("Cycle", by(ls.cycles, id), fCycle),
+      issueLabels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => matches(labelView(x), a.filter, filterTypeOf(info))), a, fLabel),
+      workflowStates: (a, _context, info) => connection(ls.workflowStates.all().filter((x) => matches(stateView(x), a.filter, filterTypeOf(info))), a, fState),
+      comments: (a, _context, info) => connection(order(ls.comments.all().filter((c) => matches({ ...commentView(c), issue: issueView(by(ls.issues, c.issue_id), false) }, a.filter, filterTypeOf(info))), a.orderBy), a, fComment),
+    };
+  }
+
+  // Each request's unsupported keys, by the request, for the access log and the counts.
+  const unsupportedOf = new WeakMap();
+  const jsonOf = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return undefined;
+    }
+  };
+  // Every request for /graphql, GET with the document in the URL or POST with it in the body, goes
+  // through the public schema: validated, then a query is answered by root() and a mutation or
+  // subscription refused and counted. No request reaches the emulator's own schema.
+  async function route(req, url) {
+    const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+    const record = token ? ls.tokens.findOneBy("token", token) : undefined;
+    if (!record) return authFailure();
+    if (url.pathname !== "/graphql") return Response.json({ message: "Not Found", documentation_url: DOCS }, { status: 404 });
+    let body;
+    if (req.method === "GET") body = { query: url.searchParams.get("query") ?? "", variables: jsonOf(url.searchParams.get("variables")) ?? undefined, operationName: url.searchParams.get("operationName") ?? undefined };
+    else body = jsonOf(await req.clone().text());
+    if (!body || typeof body !== "object") return Response.json({ errors: [{ message: "POST body missing, invalid Content-Type, or JSON object has no keys." }] }, { status: 400 });
+    let doc;
+    try {
+      doc = parse(body.query ?? "");
+    } catch (e) {
+      return Response.json({ errors: [{ message: e.message, extensions: { code: "GRAPHQL_PARSE_FAILED" } }] }, { status: 400 });
+    }
+    // Real Linear answers a query it cannot validate with 400 and a partially failed one with 200.
+    const invalid = validate(schema, doc);
+    if (invalid.length) return Response.json({ errors: invalid }, { status: 400 });
+    const ops = doc.definitions.filter((d) => d.kind === "OperationDefinition");
+    const op = ops.find((d) => !body.operationName || d.name?.value === body.operationName) ?? ops[0];
+    const unsupported = new Set();
+    if (op && op.operation !== "query") {
+      for (const selection of op.selectionSet.selections) if (selection.kind === "Field") unsupported.add(`linear:${op.operation}:${selection.name.value}`);
+      unsupportedOf.set(req, [...unsupported]);
+      return forbidden(op.operation);
+    }
+    const me = ls.users.findOneBy("linear_id", record.user_id);
+    const result = await execute({ schema, document: doc, rootValue: root(me), contextValue: { unsupported }, fieldResolver, variableValues: body.variables, operationName: body.operationName });
+    unsupportedOf.set(req, [...unsupported]);
+    return Response.json(result);
+  }
+
+  return {
+    name,
+    host,
+    store,
+    tokenUsers,
+    add,
+    route,
+    notFound: () => Response.json({ errors: [{ message: "Not Found" }] }, { status: 404 }),
+    counts: () => ({
+      users: ls.users.all().length,
+      teams: ls.teams.all().length,
+      projects: ls.projects.all().length,
+      cycles: ls.cycles.all().length,
+      labels: ls.issueLabels.all().length,
+      issues: ls.issues.all().length,
+      comments: ls.comments.all().length,
+      relations: relations.all().length,
+    }),
+    outcome: (json) => ({ ok: json ? !json.errors : null, error: json?.errors?.[0]?.message ?? null, result_count: resultCount(json) }),
+    unsupportedKeys: (url, json, req) => {
+      const keys = unsupportedOf.get(req) ?? [];
+      // A filter key the evaluator refuses after validation passed is one Linear has and the fake
+      // lacks; the same message before execution (no data) is Linear's own refusal of a key it does
+      // not have.
+      if (json && "data" in json)
+        for (const { message = "" } of json.errors ?? []) {
+          const filter = message.match(/^Field "([^"]+)" is not defined by type "([^"]+)"/);
+          if (filter) keys.push(`linear:filter:${filter[2]}.${filter[1]}`);
+        }
+      return keys;
+    },
+  };
+}
+
+function resultCount(json) {
+  if (json == null || typeof json !== "object") return null;
+  let n = null;
+  const walk = (v) => {
+    if (Array.isArray(v?.nodes)) n = (n ?? 0) + v.nodes.length;
+    if (v && typeof v === "object") for (const x of Object.values(v)) walk(x);
+  };
+  walk(json.data);
+  return n;
+}
