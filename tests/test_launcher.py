@@ -581,6 +581,31 @@ def test_every_graphql_request_goes_through_the_public_schema(external_services:
     ]
 
 
+def test_a_write_is_refused_only_when_it_is_the_operation_that_would_run(
+    external_services: RunningExternalServices,
+) -> None:
+    document = (
+        'mutation Write { issueCreate(input: {teamId: "ENG", title: "x"}) { success } } query Read { viewer { name } }'
+    )
+
+    def post(operation_name: str) -> httpx.Response:
+        return httpx.post(
+            "{}/graphql".format(external_services.linear_url),
+            json={"query": document, "operationName": operation_name},
+            headers={"Authorization": _LINEAR_TOKEN},
+        )
+
+    unknown = post("Nope")
+    read = post("Read")
+    write = post("Write")
+
+    assert unknown.status_code != 403
+    assert unknown.json()["errors"][0]["message"] == 'Unknown operation named "Nope".'
+    assert read.json()["data"]["viewer"]["name"] == "Morgan Reyes"
+    assert write.status_code == 403
+    assert _control(external_services, "health")["unsupported_calls"] == {"linear:mutation:issueCreate": 1}
+
+
 def test_a_slack_method_the_fake_does_not_have_is_answered_as_slack_does_and_counted(
     external_services: RunningExternalServices,
 ) -> None:

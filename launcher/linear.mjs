@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { Store } from "@emulators/core";
 import * as emulator from "@emulators/linear";
-import { GraphQLError, buildSchema, execute, getNamedType, isAbstractType, isEnumType, isListType, isNonNullType, isScalarType, parse, validate, valueFromAST } from "graphql";
+import { GraphQLError, buildSchema, execute, getNamedType, getOperationAST, isAbstractType, isEnumType, isListType, isNonNullType, isScalarType, parse, validate, valueFromAST } from "graphql";
 
 export const name = "linear";
 export const host = "api.linear.app";
@@ -423,8 +423,8 @@ export function create(seed, clock) {
     // Real Linear answers a query it cannot validate with 400 and a partially failed one with 200.
     const invalid = validate(schema, doc);
     if (invalid.length) return Response.json({ errors: invalid }, { status: 400 });
-    const ops = doc.definitions.filter((d) => d.kind === "OperationDefinition");
-    const op = ops.find((d) => !body.operationName || d.name?.value === body.operationName) ?? ops[0];
+    // The operation execute() would run; none when it would refuse the request, which it then does.
+    const op = getOperationAST(doc, body.operationName);
     const unsupported = new Set();
     if (op && op.operation !== "query") {
       for (const selection of op.selectionSet.selections) if (selection.kind === "Field") unsupported.add(`linear:${op.operation}:${selection.name.value}`);
