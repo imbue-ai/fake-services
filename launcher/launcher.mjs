@@ -8,7 +8,8 @@
 //   host              the API host the fake answers for: a request for any other host of the
 //                     service is answered as not found
 //   create(seed, clock) -> {
-//     store           the @emulators/core Store its records live in; an update is applied inside a
+//     name, host      the module's own
+//     store          the @emulators/core Store its records live in; an update is applied inside a
 //                     snapshot of it, so one that fails leaves the store as it was
 //     tokenUsers      Map of each token the seed names to the user it belongs to
 //     add(records)    places a seed's or an update's records, throws on one it cannot place, and
