@@ -513,6 +513,21 @@ def test_an_argument_is_counted_by_the_field_that_ignores_it_and_a_schema_defaul
     }
 
 
+def test_an_argument_the_fake_serves_is_not_counted_when_no_record_is_listed(
+    external_services: RunningExternalServices,
+) -> None:
+    """The viewer is assigned no issue, so nothing is filtered: the arguments are served all the same."""
+    answer = _linear(
+        external_services,
+        '{ viewer { assignedIssues(filter: {title: {contains: "x"}}, includeArchived: true, orderBy: updatedAt) '
+        "{ nodes { id } } } }",
+    )
+
+    assert answer.status_code == 200 and "errors" not in answer.json()
+    assert answer.json()["data"]["viewer"]["assignedIssues"]["nodes"] == []
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
 def test_a_nested_filter_names_the_type_linear_names(external_services: RunningExternalServices) -> None:
     refused = _linear(
         external_services,

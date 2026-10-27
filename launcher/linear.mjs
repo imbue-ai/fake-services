@@ -41,7 +41,9 @@ const defaultOf = (arg) => (arg.default == null ? undefined : "literal" in arg.d
 // A resolver is handed its arguments through a proxy that notes which it read. An argument the
 // schema has and the resolver never read is ignored, and counted, unless it holds the schema's own
 // default, which the caller did not ask for. The counting is per field: a resolver that reads
-// `includeArchived` says nothing about another that does not.
+// `includeArchived` says nothing about another that does not. A resolver therefore reads every
+// argument it serves before it returns, not inside a per-record callback: with no records to visit,
+// an argument read there is never read, and counted as ignored.
 function fieldResolver(source, args, context, info) {
   const fieldName = `${info.parentType.name}.${info.fieldName}`;
   if (source != null && typeof source === "object" && info.fieldName in source) {
@@ -295,6 +297,12 @@ export function create(seed, clock) {
       get hasBlockedByRelations() { return relations.findBy("related_issue_id", i.linear_id).some((r) => r.type === "blocks"); },
       get hasBlockingRelations() { return relations.findBy("issue_id", i.linear_id).some((r) => r.type === "blocks"); },
     });
+    // The predicate a field's `filter` argument makes of a view.
+    const where = (a, info, view) => {
+      const { filter } = a;
+      const type = filterTypeOf(info);
+      return (x) => matches(view(x), filter, type);
+    };
     // What a query is answered with. A field that is a function is resolved on demand with the
     // query's arguments, so a record's relations are read only when asked for.
     const fUser = (u) => u && {
@@ -312,16 +320,19 @@ export function create(seed, clock) {
         const mine = ls.issues.all().filter((i) => i.project_id === x.linear_id);
         return mine.length ? mine.filter((i) => i.completed_at).length / mine.length : 0;
       },
-      teams: (a, _context, info) => connection(ls.teams.all().filter((t) => ls.issues.all().some((i) => i.project_id === x.linear_id && i.team_id === t.linear_id) && matches(teamView(t), a.filter, filterTypeOf(info))), a, fTeam),
+      teams: (a, _context, info) => {
+        const wanted = where(a, info, teamView);
+        return connection(ls.teams.all().filter((t) => ls.issues.all().some((i) => i.project_id === x.linear_id && i.team_id === t.linear_id) && wanted(t)), a, fTeam);
+      },
       issues: issuesOf((i) => i.project_id === x.linear_id),
     };
     const fTeam = (t) => t && {
       id: t.linear_id, key: t.key, name: t.name, description: t.description, private: t.private, createdAt: t.created_at, updatedAt: t.updated_at,
-      states: (a, _context, info) => connection(ls.workflowStates.findBy("team_id", t.linear_id).filter((x) => matches(stateView(x), a.filter, filterTypeOf(info))).sort((x, y) => x.position - y.position), a, fState),
-      members: (a, _context, info) => connection(ls.users.all().filter((u) => matches(userView(u), a.filter, filterTypeOf(info))), a, fUser),
-      labels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => (!x.team_id || x.team_id === t.linear_id) && matches(labelView(x), a.filter, filterTypeOf(info))), a, fLabel),
-      cycles: (a, _context, info) => connection(ls.cycles.findBy("team_id", t.linear_id).filter((c) => matches(cycleView(c), a.filter, filterTypeOf(info))), a, fCycle),
-      projects: (a, _context, info) => connection(ls.projects.all().filter((p) => ls.issues.all().some((i) => i.project_id === p.linear_id && i.team_id === t.linear_id) && matches(projectView(p), a.filter, filterTypeOf(info))), a, fProject),
+      states: (a, _context, info) => connection(ls.workflowStates.findBy("team_id", t.linear_id).filter(where(a, info, stateView)).sort((x, y) => x.position - y.position), a, fState),
+      members: (a, _context, info) => connection(ls.users.all().filter(where(a, info, userView)), a, fUser),
+      labels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => !x.team_id || x.team_id === t.linear_id).filter(where(a, info, labelView)), a, fLabel),
+      cycles: (a, _context, info) => connection(ls.cycles.findBy("team_id", t.linear_id).filter(where(a, info, cycleView)), a, fCycle),
+      projects: (a, _context, info) => connection(ls.projects.all().filter((p) => ls.issues.all().some((i) => i.project_id === p.linear_id && i.team_id === t.linear_id)).filter(where(a, info, projectView)), a, fProject),
       activeCycle: () => fCycle(ls.cycles.findBy("team_id", t.linear_id).find(isActiveCycle)),
       issues: issuesOf((i) => i.team_id === t.linear_id),
     };
@@ -334,12 +345,16 @@ export function create(seed, clock) {
       team: () => fTeam(by(ls.teams, i.team_id)), state: () => fState(by(ls.workflowStates, i.state_id)), assignee: () => fUser(by(ls.users, i.assignee_id)), creator: () => fUser(by(ls.users, i.creator_id)),
       project: () => fProject(by(ls.projects, i.project_id)), cycle: () => fCycle(by(ls.cycles, i.cycle_id)), parent: () => fIssue(by(ls.issues, i.parent_ref)),
       children: issuesOf((x) => x.parent_ref === i.linear_id),
-      labels: (a, _context, info) => connection(i.label_ids.map((id) => by(ls.issueLabels, id)).filter((x) => x && matches(labelView(x), a.filter, filterTypeOf(info))), a, fLabel),
-      comments: (a, _context, info) => connection(ls.comments.findBy("issue_id", i.linear_id).filter((c) => matches(commentView(c), a.filter, filterTypeOf(info))).sort((x, y) => x.created_at.localeCompare(y.created_at)), a, fComment),
+      labels: (a, _context, info) => connection(i.label_ids.map((id) => by(ls.issueLabels, id)).filter(Boolean).filter(where(a, info, labelView)), a, fLabel),
+      comments: (a, _context, info) => connection(ls.comments.findBy("issue_id", i.linear_id).filter(where(a, info, commentView)).sort((x, y) => x.created_at.localeCompare(y.created_at)), a, fComment),
       relations: (a) => connection(relations.findBy("issue_id", i.linear_id), a, fRelation),
       inverseRelations: (a) => connection(relations.findBy("related_issue_id", i.linear_id), a, fRelation),
     };
-    const issues = (a, info, pred = () => true) => connection(order(ls.issues.all().filter((i) => (a.includeArchived || !i.archived_at) && pred(i) && matches(issueView(i), a.filter, filterTypeOf(info))), a.orderBy), a, fIssue);
+    const issues = (a, info, pred = () => true) => {
+      const { includeArchived, orderBy } = a;
+      const wanted = where(a, info, issueView);
+      return connection(order(ls.issues.all().filter((i) => (includeArchived || !i.archived_at) && pred(i) && wanted(i)), orderBy), a, fIssue);
+    };
     function issuesOf(pred) {
       return (a, _context, info) => issues(a, info, pred);
     }
@@ -354,21 +369,27 @@ export function create(seed, clock) {
         const o = ls.organizations.all()[0];
         return { id: o.linear_id, name: o.name, urlKey: o.url_key, createdAt: o.created_at };
       },
-      teams: (a, _context, info) => connection(ls.teams.all().filter((t) => matches(teamView(t), a.filter, filterTypeOf(info))), a, fTeam),
+      teams: (a, _context, info) => connection(ls.teams.all().filter(where(a, info, teamView)), a, fTeam),
       team: ({ id }) => one("Team", emulator.resolveTeam(store, id), fTeam),
-      users: (a, _context, info) => connection(ls.users.all().filter((u) => matches(userView(u), a.filter, filterTypeOf(info))), a, fUser),
+      users: (a, _context, info) => connection(ls.users.all().filter(where(a, info, userView)), a, fUser),
       user: ({ id }) => one("User", by(ls.users, id), fUser),
       issues: issuesOf(),
       issue: ({ id }) => one("Issue", emulator.resolveIssue(store, id), fIssue),
-      issueSearch: (a, _context, info) => issues(a, info, (i) => text(i).includes((a.query ?? "").toLowerCase())),
-      searchIssues: (a, _context, info) => issues(a, info, (i) => a.term.toLowerCase().split(/\s+/).every((w) => text(i).includes(w))),
-      projects: (a, _context, info) => connection(order(ls.projects.all().filter((p) => matches(projectView(p), a.filter, filterTypeOf(info))), a.orderBy), a, fProject),
+      issueSearch: (a, _context, info) => {
+        const query = (a.query ?? "").toLowerCase();
+        return issues(a, info, (i) => text(i).includes(query));
+      },
+      searchIssues: (a, _context, info) => {
+        const words = a.term.toLowerCase().split(/\s+/);
+        return issues(a, info, (i) => words.every((w) => text(i).includes(w)));
+      },
+      projects: (a, _context, info) => connection(order(ls.projects.all().filter(where(a, info, projectView)), a.orderBy), a, fProject),
       project: ({ id }) => one("Project", emulator.resolveProject(store, id), fProject),
-      cycles: (a, _context, info) => connection(ls.cycles.all().filter((c) => matches(cycleView(c), a.filter, filterTypeOf(info))), a, fCycle),
+      cycles: (a, _context, info) => connection(ls.cycles.all().filter(where(a, info, cycleView)), a, fCycle),
       cycle: ({ id }) => one("Cycle", by(ls.cycles, id), fCycle),
-      issueLabels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => matches(labelView(x), a.filter, filterTypeOf(info))), a, fLabel),
-      workflowStates: (a, _context, info) => connection(ls.workflowStates.all().filter((x) => matches(stateView(x), a.filter, filterTypeOf(info))), a, fState),
-      comments: (a, _context, info) => connection(order(ls.comments.all().filter((c) => matches({ ...commentView(c), issue: issueView(by(ls.issues, c.issue_id), false) }, a.filter, filterTypeOf(info))), a.orderBy), a, fComment),
+      issueLabels: (a, _context, info) => connection(ls.issueLabels.all().filter(where(a, info, labelView)), a, fLabel),
+      workflowStates: (a, _context, info) => connection(ls.workflowStates.all().filter(where(a, info, stateView)), a, fState),
+      comments: (a, _context, info) => connection(order(ls.comments.all().filter(where(a, info, (c) => ({ ...commentView(c), issue: issueView(by(ls.issues, c.issue_id), false) }))), a.orderBy), a, fComment),
     };
   }
 
