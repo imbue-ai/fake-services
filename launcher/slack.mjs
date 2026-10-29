@@ -13,6 +13,52 @@ const REAL_URL = `https://${host}`;
 // What an error answer points its reader at. Nothing a caller is sent names what is serving it.
 const DOCS = "https://api.slack.com/methods";
 
+// Slack's limits, per method and per workspace and app, as its documentation states them
+// (docs.slack.dev/apis/web-api/rate-limits and each method's page, read 2026-10-29): Tier 1 "1+ per
+// minute", Tier 2 "20+", Tier 3 "50+", Tier 4 "100+". A tier allows its number within any minute plus
+// a burst, which Slack does not publish; BURST is the share added for it. The method pages state:
+// conversations.history, conversations.replies, conversations.info and users.lookupByEmail Tier 3;
+// conversations.list, users.list and search.messages Tier 2; users.info and conversations.members
+// Tier 4; auth.test "special" ("hundreds of requests per minute"), held to Tier 4 here. Since
+// 2025-05-29 conversations.history and conversations.replies are Tier 1 for a commercially
+// distributed app outside the Slack Marketplace; an internal customer-built app keeps Tier 3, and a
+// task's integration is one. Any other method is held to Tier 3.
+const PER_MINUTE = { 1: 1, 2: 20, 3: 50, 4: 100 };
+const BURST = 0.2;
+const METHOD_TIERS = {
+  "conversations.history": 3,
+  "conversations.replies": 3,
+  "conversations.list": 2,
+  "conversations.info": 3,
+  "conversations.members": 4,
+  "users.list": 2,
+  "users.info": 4,
+  "users.lookupByEmail": 3,
+  "search.messages": 2,
+  "auth.test": 4,
+};
+const tier = (n) => ({ limit: PER_MINUTE[n] + Math.ceil(PER_MINUTE[n] * BURST), windowSeconds: 60, algorithm: "window" });
+// A request's token, from the header or, as Slack also takes it, a query or form parameter.
+async function tokenOf(req, url) {
+  const header = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+  if (header) return header;
+  if (url.searchParams.get("token")) return url.searchParams.get("token");
+  if (req.method === "GET" || (req.headers.get("content-type") ?? "").includes("json")) return "";
+  return new URLSearchParams(await req.clone().text()).get("token") ?? "";
+}
+// See rate_limits.mjs for what a policy holds. One fake is one workspace, so a method's window is
+// shared by every token the seed names. A request with no seeded token is refused by authentication,
+// not counted.
+export const limits = {
+  buckets: { ...Object.fromEntries(Object.entries(METHOD_TIERS).map(([method, n]) => [method, tier(n)])), other: tier(3) },
+  async bucketOf(req, url, service) {
+    if (!url.pathname.startsWith("/api/") || !service.tokenUsers.has(await tokenOf(req, url))) return [];
+    const method = url.pathname.slice(5);
+    return [{ bucket: method in METHOD_TIERS ? method : "other", scope: method, cost: 1 }];
+  },
+  refuse: () => Response.json({ ok: false, error: "ratelimited" }, { status: 429 }),
+};
+
 const unknownMethod = (status) => Response.json({ ok: false, error: "unknown_method" }, { status });
 // Stable ids: an id derived from the name survives a re-seed and reads the same in every trial.
 const slackId = (prefix, text) => prefix + crypto.createHash("sha1").update(text).digest("hex").slice(0, 10).toUpperCase();

@@ -1,5 +1,6 @@
 // The access log: one line per request that reaches a fake, and the count of every call a fake does
-// not support. See launcher.mjs for the service interface this wraps.
+// not support. See launcher.mjs for the service interface this wraps, and rate_limits.mjs for the
+// rateLimitedBucket(req) its guard adds to every service.
 import crypto from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 
@@ -56,6 +57,8 @@ export function createAccessLog(path, services) {
         error: outcome.error,
         // The first of a request's unsupported keys; the counts carry every one.
         unsupported: unsupported[0] ?? null,
+        // "<service>:<bucket>" of the rate limit that refused the request, else null.
+        rate_limited: service.rateLimitedBucket(req),
         result_count: outcome.result_count,
         response_bytes: Buffer.byteLength(text),
         duration_ms: Date.now() - began,

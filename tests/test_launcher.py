@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
 from imbue.minds_evals.conftest import RunningExternalServices
 from imbue.minds_evals.errors import TaskAuthoringError
@@ -23,6 +24,7 @@ from imbue.minds_evals.testing import EXTERNAL_SERVICES_SEED_FIXTURE
 from imbue.minds_evals.testing import EXTERNAL_SERVICES_UPDATE_FIXTURE
 from imbue.minds_evals.testing import external_services_document
 from imbue.minds_evals.testing import external_services_fixture_text
+from imbue.mngr.utils.polling import wait_for
 
 _SLACK_TOKEN = "xoxb-fake-redwood-slack-token"
 _LINEAR_TOKEN = "lin_api_fakeredwoodlineartoken"
@@ -1236,7 +1238,7 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
     assert _SLACK_TOKEN not in log_text and _LINEAR_TOKEN not in log_text
     assert " ".join(slack_line) == (
         "ts seq service method url body content_type token_user token_sha256_8 user_agent caller "
-        "status ok error unsupported result_count response_bytes duration_ms"
+        "status ok error unsupported rate_limited result_count response_bytes duration_ms"
     )
     assert slack_line["url"] == "https://slack.com/api/conversations.list?limit=1&token=[redacted]"
     assert (slack_line["seq"], slack_line["service"], slack_line["method"]) == (1, "slack", "GET")
@@ -1247,6 +1249,7 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
     )
     assert (slack_line["status"], slack_line["ok"], slack_line["result_count"]) == (200, True, 1)
     assert slack_line["response_bytes"] > 0
+    assert (slack_line["rate_limited"], linear_line["rate_limited"]) == (None, None)
     assert (linear_line["url"], linear_line["result_count"]) == ("https://api.linear.app/graphql", 1)
     assert json.loads(linear_line["body"]) == {"query": "{ teams { nodes { key } } }"}
     assert (refused_line["status"], refused_line["ok"], refused_line["token_user"]) == (401, False, None)
@@ -1305,3 +1308,195 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
     assert refused["message"] == 'Field "slaStatus" is not defined by type "IssueFilter".'
     assert refused["extensions"]["code"] == "GRAPHQL_VALIDATION_FAILED"
     assert "html" not in answers[7].headers["content-type"]
+
+
+# What a burst of requests is sent through: one connection, so the burst is as quick as the fake.
+def _slack_burst(services: RunningExternalServices, method: str, count: int, **params: str) -> list[httpx.Response]:
+    with httpx.Client(headers=_SLACK_HEADERS) as client:
+        return [client.get("{}/api/{}".format(services.slack_url, method), params=params) for _ in range(count)]
+
+
+def _replies_params(services: RunningExternalServices) -> dict[str, str]:
+    return {"channel": _channel_id(services, "eng-oncall"), "ts": _shifted("1773900000.000000")}
+
+
+# Tier 3, 50 a minute, and the burst allowance of a fifth more.
+_TIER_3_LIMIT = 60
+
+
+def test_a_burst_past_a_slack_methods_tier_is_refused_as_slack_refuses_it(
+    external_services: RunningExternalServices,
+) -> None:
+    burst = _slack_burst(
+        external_services, "conversations.replies", _TIER_3_LIMIT + 2, **_replies_params(external_services)
+    )
+    history = _slack(external_services, "conversations.history", channel=_channel_id(external_services, "eng-oncall"))
+
+    assert [answer.json()["ok"] for answer in burst[:_TIER_3_LIMIT]] == [True] * _TIER_3_LIMIT
+    for refused in burst[_TIER_3_LIMIT:]:
+        assert refused.status_code == 429
+        assert refused.json() == {"ok": False, "error": "ratelimited"}
+        assert 1 <= int(refused.headers["retry-after"]) <= 60
+    assert "retry-after" not in burst[0].headers
+    # Slack limits each method on its own: the methods around the burst still answer.
+    assert history["ok"] is True
+    expected = {"slack:conversations.replies": 2}
+    assert _control(external_services, "health")["rate_limited"] == expected
+    assert _control(external_services, "state")["rate_limited"] == expected
+    assert _control(external_services, "health")["rate_limits"] == "real"
+    log = _control(external_services, "log")
+    replies_lines = [line for line in log if "conversations.replies" in line["url"]]
+    assert [(line["status"], line["error"], line["rate_limited"]) for line in replies_lines[-3:]] == [
+        (200, None, None),
+        (429, "ratelimited", "slack:conversations.replies"),
+        (429, "ratelimited", "slack:conversations.replies"),
+    ]
+
+
+def test_a_slack_method_answers_again_once_its_retry_after_has_passed(
+    external_services_with_short_rate_limit_windows: RunningExternalServices,
+) -> None:
+    services = external_services_with_short_rate_limit_windows
+    # users.list is Tier 2: 20 a minute and 4 more.
+    burst = _slack_burst(services, "users.list", 25)
+    retry_after = int(burst[-1].headers["retry-after"])
+    # A refused request draws on nothing, so asking until one is answered waits the window out.
+    wait_for(
+        lambda: httpx.get("{}/api/users.list".format(services.slack_url), headers=_SLACK_HEADERS).status_code == 200,
+        timeout=EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS + 3,
+        poll_interval=0.1,
+        error_message="users.list was still refused after its window",
+    )
+
+    assert [answer.status_code for answer in burst] == [200] * 24 + [429]
+    assert 1 <= retry_after <= EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS
+
+
+def test_a_seed_that_asks_for_no_rate_limits_serves_an_unlimited_burst(
+    unlimited_external_services: RunningExternalServices,
+) -> None:
+    burst = _slack_burst(
+        unlimited_external_services,
+        "conversations.replies",
+        3 * _TIER_3_LIMIT,
+        **_replies_params(unlimited_external_services),
+    )
+    linear_answer = _linear(unlimited_external_services, "{ viewer { id } }")
+
+    assert {answer.status_code for answer in burst} == {200}
+    assert "x-complexity" not in linear_answer.headers
+    health = _control(unlimited_external_services, "health")
+    assert (health["rate_limits"], health["rate_limited"]) == ("none", {})
+
+
+def _launcher_started_ms() -> float:
+    anchor = external_services_document(EXTERNAL_SERVICES_SEED_FIXTURE, "linear")["anchor"]
+    return (
+        datetime.fromisoformat(anchor.replace("Z", "+00:00")).timestamp() + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+    ) * 1000
+
+
+def test_every_linear_answer_carries_linears_rate_limit_headers(external_services: RunningExternalServices) -> None:
+    answer = _linear(external_services, "{ viewer { name } }")
+    # Linear's own examples: a user and three fields of its created issues, 50 by default, is 66
+    # points, and 14 with `first: 10`.
+    default_page = _linear(external_services, "{ viewer { createdIssues { nodes { id title createdAt } } } }")
+    ten = _linear(external_services, "{ viewer { createdIssues(first: 10) { nodes { id title createdAt } } } }")
+    by_variable = httpx.post(
+        "{}/graphql".format(external_services.linear_url),
+        json={
+            "query": "query Q($n: Int) { viewer { createdIssues(first: $n) { nodes { id title createdAt } } } }",
+            "variables": {"n": 10},
+        },
+        headers={"Authorization": _LINEAR_TOKEN},
+    )
+
+    headers = answer.headers
+    assert answer.status_code == 200
+    # Linear's own example: a user with one property is 1.1 points, rounded up.
+    assert headers["x-complexity"] == "2"
+    assert (headers["x-ratelimit-requests-limit"], headers["x-ratelimit-requests-remaining"]) == ("2500", "2499")
+    assert (headers["x-ratelimit-complexity-limit"], headers["x-ratelimit-complexity-remaining"]) == (
+        "3000000",
+        "2999998",
+    )
+    # Each reset is when the bucket is whole again, in epoch milliseconds on the trial's clock: a
+    # request drains away in an hour's 2,500th, two points in an hour's 1,500,000th.
+    started_ms = _launcher_started_ms()
+    requests_reset = int(headers["x-ratelimit-requests-reset"])
+    complexity_reset = int(headers["x-ratelimit-complexity-reset"])
+    assert started_ms < complexity_reset < requests_reset < started_ms + 120_000
+    assert 1400 <= requests_reset - complexity_reset <= 1440
+    assert "retry-after" not in headers
+    assert [
+        default_page.headers["x-complexity"],
+        ten.headers["x-complexity"],
+        by_variable.headers["x-complexity"],
+    ] == [
+        "66",
+        "14",
+        "14",
+    ]
+    assert default_page.headers["x-ratelimit-requests-remaining"] == "2498"
+
+
+# A query of exactly the per-query maximum: 100 teams, each 1 point for itself and 90 issues of 1.1.
+_MAX_COMPLEXITY_QUERY = "{ teams(first: 100) { nodes { issues(first: 90) { nodes { id } } } } }"
+
+
+def test_a_linear_query_past_the_per_query_maximum_is_refused_and_costs_nothing(
+    external_services: RunningExternalServices,
+) -> None:
+    at_maximum = _linear(external_services, _MAX_COMPLEXITY_QUERY)
+    past_maximum = _linear(
+        external_services, "{ teams(first: 100) { nodes { issues(first: 90) { nodes { id title } } } } }"
+    )
+    after = _linear(external_services, "{ viewer { id } }")
+
+    assert (at_maximum.status_code, at_maximum.headers["x-complexity"]) == (200, "10000")
+    assert (past_maximum.status_code, past_maximum.headers["x-complexity"]) == (429, "10900")
+    error = past_maximum.json()["errors"][0]
+    assert error["extensions"]["code"] == "RATELIMITED"
+    assert "10000" in error["message"]
+    # Waiting never admits it, so no wait is named.
+    assert "retry-after" not in past_maximum.headers
+    assert after.headers["x-ratelimit-requests-remaining"] == "2498"
+    assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
+
+
+def _linear_until_refused(services: RunningExternalServices, query: str, at_most: int) -> list[httpx.Response]:
+    answers: list[httpx.Response] = []
+    with httpx.Client(headers={"Authorization": _LINEAR_TOKEN}) as client:
+        while len(answers) < at_most and (not answers or answers[-1].status_code == 200):
+            answers.append(client.post("{}/graphql".format(services.linear_url), json={"query": query}))
+    return answers
+
+
+def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: RunningExternalServices) -> None:
+    answers = _linear_until_refused(external_services, _MAX_COMPLEXITY_QUERY, 320)
+    refused = answers[-1]
+
+    # 3,000,000 points an hour hold 300 queries of 10,000, and a little more drains away meanwhile.
+    assert 300 <= len(answers) - 1 <= 302
+    assert refused.status_code == 429
+    assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
+    assert "complexity" in refused.json()["errors"][0]["message"]
+    # The bucket drains at 3,000,000 points an hour, so room for one more query takes seconds.
+    assert 1 <= int(refused.headers["retry-after"]) <= 13
+    assert int(refused.headers["x-ratelimit-complexity-remaining"]) < 10000
+    assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
+    assert _control(external_services, "log")[-1]["rate_limited"] == "linear:complexity"
+
+
+def test_linear_refuses_a_user_past_its_hourly_requests(external_services: RunningExternalServices) -> None:
+    answers = _linear_until_refused(external_services, "{ viewer { id } }", 2600)
+    refused = answers[-1]
+
+    # 2,500 requests an hour, and the few that drain away while they are sent.
+    assert 2500 <= len(answers) - 1 <= 2530
+    assert refused.status_code == 429
+    assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
+    assert refused.headers["x-ratelimit-requests-remaining"] == "0"
+    # One request drains away every 1.44 seconds.
+    assert 1 <= int(refused.headers["retry-after"]) <= 2
+    assert _control(external_services, "health")["rate_limited"] == {"linear:requests": 1}

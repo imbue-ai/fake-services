@@ -22,8 +22,10 @@
 //     unsupportedKeys(url, json, req)
 //                     what a request asked for that the real service has and the fake lacks
 //   }
-// This file settles the one clock every service keeps, seeds and serves the services, logs every
-// request (access_log.mjs) and answers the control endpoints.
+//   limits            the rate limits the real service enforces: its buckets, which of them a request
+//                     draws on, and the service's own refusal and headers (see rate_limits.mjs)
+// This file settles the one clock every service keeps, seeds and serves the services, rate-limits
+// them (rate_limits.mjs), logs every request (access_log.mjs) and answers the control endpoints.
 //
 // What a trial gets on top of the @emulators packages:
 //   - a seed's records carry absolute timestamps. With `"time_shift": "none"` (the default) they are
@@ -33,17 +35,23 @@
 //     written for
 //   - no record carries the box's clock: a date the seed does not state is derived from the seed's
 //     own records (each module's settle step)
-//   - only the seed's tokens authenticate, nothing is rate limited, and the stores start empty: the
-//     emulators' own default workspace is never loaded
+//   - only the seed's tokens authenticate, and the stores start empty: the emulators' own default
+//     workspace is never loaded
+//   - with `"rate_limits": "real"` (the default) each service refuses a caller who outruns the limits
+//     the real service documents, as the real service refuses it, and adds the real service's rate
+//     limit headers to its answers; with `"rate_limits": "none"` nothing is limited
 //   - an access log (JSONL, one line per request that reaches a fake), which marks every call the
 //     fake does not support, and control endpoints on a port of their own
 //
 // env: SEED_DIR=<directory of <service>.json> CONTROL_PORT=<port> SLACK_PORT=<port> LINEAR_PORT=<port>
 //      (0 takes a free port) [ACCESS_LOG=<jsonl path>] [START_MS=<epoch ms; the process's own clock
-//      when unset>]
+//      when unset>] [RATE_LIMIT_WINDOW_SECONDS=<seconds every rate limit bucket's window lasts; each
+//      bucket's own when unset; for a test that waits a window out>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
-//   GET  /_control/health             {ok, shift_ms, services, counts, unsupported_calls}
+//   GET  /_control/health             {ok, shift_ms, rate_limits, services, counts, unsupported_calls,
+//                                     rate_limited}; rate_limited counts refused requests by
+//                                     "<service>:<bucket>"
 //   GET  /_control/state              the stores of the served services, tokens redacted
 //   POST /_control/records/<service>  add an update to a served service (its seed's record collections,
 //                                     same time shift); all of it lands or none does
@@ -53,6 +61,7 @@ import { join } from "node:path";
 import { serve } from "@emulators/core";
 import { createAccessLog } from "./access_log.mjs";
 import * as linear from "./linear.mjs";
+import { createRateLimits } from "./rate_limits.mjs";
 import * as slack from "./slack.mjs";
 
 const MODULES = [slack, linear];
@@ -71,12 +80,18 @@ for (const { name } of MODULES) {
 const served = Object.keys(seeds);
 if (!served.length) fail(`${env.SEED_DIR} holds no service seed`);
 
-// One clock for every service: records of one refer to dates in another.
+// One clock for every service, since records of one refer to dates in another, and one rate limit
+// setting, since a task is written for limits or for none.
 const timeShift = (seed) => seed.time_shift ?? "none";
+const rateLimitsOf = (seed) => seed.rate_limits ?? "real";
 const first = seeds[served[0]];
 for (const name of served)
-  if (seeds[name].anchor !== first.anchor || timeShift(seeds[name]) !== timeShift(first)) fail(`the ${name} seed's anchor and time_shift differ from the ${served[0]} seed's`);
+  if (seeds[name].anchor !== first.anchor || timeShift(seeds[name]) !== timeShift(first) || rateLimitsOf(seeds[name]) !== rateLimitsOf(first))
+    fail(`the ${name} seed's anchor, time_shift and rate_limits differ from the ${served[0]} seed's`);
 if (!["to_trial_start", "none"].includes(timeShift(first))) fail(`time_shift ${JSON.stringify(first.time_shift)} is neither "to_trial_start" nor "none"`);
+if (!["real", "none"].includes(rateLimitsOf(first))) fail(`rate_limits ${JSON.stringify(first.rate_limits)} is neither "real" nor "none"`);
+const rateLimitWindowSeconds = env.RATE_LIMIT_WINDOW_SECONDS ? Number(env.RATE_LIMIT_WINDOW_SECONDS) : undefined;
+if (Number.isNaN(rateLimitWindowSeconds) || rateLimitWindowSeconds <= 0) fail(`RATE_LIMIT_WINDOW_SECONDS ${JSON.stringify(env.RATE_LIMIT_WINDOW_SECONDS)} is not a positive number`);
 const anchorMs = Date.parse(first.anchor);
 if (Number.isNaN(anchorMs)) fail(`the seed's anchor ${JSON.stringify(first.anchor)} is not a timestamp`);
 const launchedAtMs = Date.now();
@@ -108,6 +123,8 @@ for (const module of MODULES) {
   Object.assign(seeded, service.add(seeds[module.name]));
 }
 const log = createAccessLog(env.ACCESS_LOG, Object.values(services));
+const limiter = createRateLimits({ enabled: rateLimitsOf(first) === "real", now: clock.now, windowSeconds: rateLimitWindowSeconds });
+const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name]).map((m) => [m.name, limiter.guard(services[m.name], m.limits)]));
 
 const counts = () => ({
   ...Object.fromEntries(served.map((name) => [name, services[name].counts()])),
@@ -115,15 +132,18 @@ const counts = () => ({
 });
 async function control(req) {
   const url = new URL(req.url);
-  if (url.pathname === "/_control/health") return Response.json({ ok: true, shift_ms: shiftMs, services: served, counts: counts(), unsupported_calls: log.unsupportedCalls });
+  if (url.pathname === "/_control/health")
+    return Response.json({ ok: true, shift_ms: shiftMs, rate_limits: rateLimitsOf(first), services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, rate_limited: limiter.rateLimited });
   if (url.pathname === "/_control/log") return Response.json(log.lines);
   if (url.pathname === "/_control/state") {
     const redact = (snap) => JSON.parse(JSON.stringify(snap, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
     return Response.json({
       dumped_at: new Date().toISOString(),
       shift_ms: shiftMs,
+      rate_limits: rateLimitsOf(first),
       counts: counts(),
       unsupported_calls: log.unsupportedCalls,
+      rate_limited: limiter.rateLimited,
       ...Object.fromEntries(served.map((name) => [name, redact(services[name].store.snapshot())])),
     });
   }
@@ -160,5 +180,5 @@ function listen(fetch, port) {
   });
 }
 const ports = { control: await listen(control, env.CONTROL_PORT) };
-for (const name of served) ports[name] = await listen(log.logged(services[name]), env[`${name.toUpperCase()}_PORT`]);
+for (const name of served) ports[name] = await listen(log.logged(limitedServices[name]), env[`${name.toUpperCase()}_PORT`]);
 console.log(JSON.stringify({ ready: true, ports, shift_ms: shiftMs, seed_ms: Math.round(performance.now() - t0), seeded, counts: counts() }));

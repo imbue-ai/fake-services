@@ -66,6 +66,121 @@ function fieldResolver(source, args, context, info) {
   return emptyValue(info.returnType);
 }
 
+// Linear's limits for an API key, as its documentation states them (linear.app/developers/
+// rate-limiting, read 2026-10-29): 2,500 requests and 3,000,000 complexity points per hour per user,
+// both leaky buckets refilling at limit/hour, and no single query above 10,000 points. An
+// unauthenticated request is refused by authentication here, so Linear's per-address limits for
+// those are not kept.
+const MAX_QUERY_COMPLEXITY = 10000;
+// A query's complexity as Linear scores it: each property 0.1 point, each object 1, and a connection
+// multiplies its children's points by its pagination argument (`first` or `last`), else 50; the sum
+// is rounded up. Counted in tenths, so the sum is exact. A document that does not parse, or names no
+// operation to run, costs nothing: Linear refuses it before it runs.
+function complexityOf(body) {
+  let doc;
+  try {
+    doc = parse(body.query ?? "");
+  } catch {
+    return 0;
+  }
+  const op = getOperationAST(doc, body.operationName);
+  if (!op) return 0;
+  const fragments = new Map(doc.definitions.filter((d) => d.kind === "FragmentDefinition").map((d) => [d.name.value, d]));
+  const variables = body.variables ?? {};
+  const pageSize = (field) => {
+    for (const arg of field.arguments ?? [])
+      if (arg.name.value === "first" || arg.name.value === "last") {
+        const value = arg.value.kind === "Variable" ? variables[arg.value.name.value] : arg.value.kind === "IntValue" ? Number(arg.value.value) : undefined;
+        if (Number.isInteger(value)) return value;
+      }
+    return 50;
+  };
+  // The fragments being expanded, so a cycle (which validation refuses anyway) ends.
+  const expanding = new Set();
+  const tenths = (selectionSet, type) => {
+    let sum = 0;
+    for (const sel of selectionSet.selections) {
+      if (sel.kind === "InlineFragment") sum += tenths(sel.selectionSet, sel.typeCondition ? schema.getType(sel.typeCondition.name.value) : type);
+      else if (sel.kind === "FragmentSpread") {
+        const fragment = fragments.get(sel.name.value);
+        if (!fragment || expanding.has(sel.name.value)) continue;
+        expanding.add(sel.name.value);
+        sum += tenths(fragment.selectionSet, schema.getType(fragment.typeCondition.name.value));
+        expanding.delete(sel.name.value);
+      } else {
+        const def = type?.getFields?.()[sel.name.value];
+        if (!def || !sel.selectionSet) sum += 1;
+        else {
+          const named = getNamedType(def.type);
+          const children = tenths(sel.selectionSet, named);
+          sum += named.name.endsWith("Connection") ? pageSize(sel) * children : 10 + children;
+        }
+      }
+    }
+    return sum;
+  };
+  return Math.ceil(tenths(op.selectionSet, schema.getRootType(op.operation)) / 10);
+}
+// A /graphql request's document, variables and operation, from the URL for a GET and the body
+// otherwise: {body}, or {error}, what Linear answers a request it cannot read with.
+async function graphqlBody(req, url) {
+  if (req.method !== "GET") {
+    const body = jsonOf(await req.clone().text());
+    return body && typeof body === "object" ? { body } : { error: "POST body missing, invalid Content-Type, or JSON object has no keys." };
+  }
+  const variablesText = url.searchParams.get("variables");
+  const variables = variablesText === null ? null : jsonOf(variablesText);
+  if (variables === undefined || typeof variables !== "object") return { error: "Variables are invalid JSON." };
+  return { body: { query: url.searchParams.get("query") ?? "", variables, operationName: url.searchParams.get("operationName") ?? undefined } };
+}
+function jsonOf(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+const tokenOf = (req) => (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+const rateLimited = (message) => ({ errors: [{ message, extensions: { type: "ratelimited", code: "RATELIMITED", userError: true, userPresentableMessage: message } }] });
+// See rate_limits.mjs for what a policy holds.
+export const limits = {
+  buckets: {
+    requests: { limit: 2500, windowSeconds: 3600, algorithm: "leaky" },
+    complexity: { limit: 3000000, windowSeconds: 3600, algorithm: "leaky", maxCost: MAX_QUERY_COMPLEXITY },
+  },
+  async bucketOf(req, url, service) {
+    const user = service.tokenUsers.get(tokenOf(req));
+    if (!user || url.pathname !== "/graphql") return [];
+    const { body } = await graphqlBody(req, url);
+    return [
+      { bucket: "requests", scope: user, cost: 1 },
+      { bucket: "complexity", scope: user, cost: body ? complexityOf(body) : 0 },
+    ];
+  },
+  // A query above the per-query maximum is refused as a rate limit with no time to wait, since
+  // waiting never admits it.
+  refuse: (req, retryAfterSeconds, bucket) =>
+    Response.json(
+      rateLimited(
+        retryAfterSeconds === null
+          ? `Query too complex: a single query may cost at most ${MAX_QUERY_COMPLEXITY} complexity points.`
+          : bucket === "complexity"
+            ? "Rate limit exceeded: too much query complexity in the last hour."
+            : "Rate limit exceeded: too many requests in the last hour.",
+      ),
+      { status: 429 },
+    ),
+  headers: ({ requests, complexity }) => ({
+    "X-RateLimit-Requests-Limit": requests.limit,
+    "X-RateLimit-Requests-Remaining": requests.remaining,
+    "X-RateLimit-Requests-Reset": requests.resetMs,
+    "X-Complexity": complexity.cost,
+    "X-RateLimit-Complexity-Limit": complexity.limit,
+    "X-RateLimit-Complexity-Remaining": complexity.remaining,
+    "X-RateLimit-Complexity-Reset": complexity.resetMs,
+  }),
+};
+
 const PRIORITY_LABELS = ["No priority", "Urgent", "High", "Medium", "Low"];
 // Shaped as Linear shapes a query it validated and then refused.
 const inputError = (message) => new GraphQLError(message, { extensions: { code: "GRAPHQL_VALIDATION_FAILED", type: "graphql error", userError: true, userPresentableMessage: message } });
@@ -497,29 +612,16 @@ export function create(seed, clock) {
 
   // Each request's unsupported keys, by the request, for the access log and the counts.
   const unsupportedOf = new WeakMap();
-  const jsonOf = (text) => {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return undefined;
-    }
-  };
   // Every request for /graphql, GET with the document in the URL or POST with it in the body, goes
   // through the public schema: validated, then a query is answered by root() and a mutation or
   // subscription refused and counted. No request reaches the emulator's own schema.
   async function route(req, url) {
-    const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+    const token = tokenOf(req);
     const record = token ? ls.tokens.findOneBy("token", token) : undefined;
     if (!record) return authFailure();
     if (url.pathname !== "/graphql") return Response.json({ message: "Not Found", documentation_url: DOCS }, { status: 404 });
-    let body;
-    if (req.method === "GET") {
-      const variablesText = url.searchParams.get("variables");
-      const variables = variablesText === null ? null : jsonOf(variablesText);
-      if (variables === undefined || typeof variables !== "object") return Response.json({ errors: [{ message: "Variables are invalid JSON." }] }, { status: 400 });
-      body = { query: url.searchParams.get("query") ?? "", variables, operationName: url.searchParams.get("operationName") ?? undefined };
-    } else body = jsonOf(await req.clone().text());
-    if (!body || typeof body !== "object") return Response.json({ errors: [{ message: "POST body missing, invalid Content-Type, or JSON object has no keys." }] }, { status: 400 });
+    const { body, error } = await graphqlBody(req, url);
+    if (error) return Response.json({ errors: [{ message: error }] }, { status: 400 });
     let doc;
     try {
       doc = parse(body.query ?? "");
