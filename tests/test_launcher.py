@@ -310,7 +310,8 @@ def test_an_update_moves_a_linear_records_update_forward_and_never_its_creation_
 def test_a_record_an_update_adds_takes_the_dates_its_file_states(
     external_services: RunningExternalServices,
 ) -> None:
-    """A team keeps its stated dates though placing an issue on it advances its issue sequence."""
+    """A team keeps its stated dates though placing an issue on it advances its issue sequence, and a
+    stated last update earlier than the creation is served as the creation."""
     added = _add(
         external_services,
         "linear",
@@ -323,6 +324,13 @@ def test_a_record_an_update_adds_takes_the_dates_its_file_states(
                         "states": [{"name": "Todo", "type": "unstarted", "position": 1}],
                         "created_at": "2025-11-03T09:00:00.000Z",
                         "updated_at": "2026-02-14T09:00:00.000Z",
+                    }
+                ],
+                "labels": [
+                    {
+                        "name": "billing",
+                        "created_at": "2025-12-01T10:00:00.000Z",
+                        "updated_at": "2025-11-01T10:00:00.000Z",
                     }
                 ],
                 "issues": [
@@ -344,6 +352,7 @@ def test_a_record_an_update_adds_takes_the_dates_its_file_states(
         _shifted_iso("2025-11-03T09:00:00.000Z"),
         _shifted_iso("2026-02-14T09:00:00.000Z"),
     )
+    assert _by(data["issueLabels"]["nodes"], "name")["billing"] == (_shifted_iso("2025-12-01T10:00:00.000Z"),) * 2
 
 
 def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(

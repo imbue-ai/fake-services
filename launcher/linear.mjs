@@ -235,7 +235,7 @@ export function create(seed, clock) {
       }
       const own = stated.get(`${kind}:${rec.id}`) ?? {};
       rec.created_at = own.created ?? derived.created ?? floor;
-      rec.updated_at = own.updated ?? latest([rec.created_at, derived.updated]);
+      rec.updated_at = latest([rec.created_at, own.updated ?? derived.updated]);
     };
     for (const [kind, coll] of Object.entries(DATED)) if (kind !== "organizations") for (const rec of coll.all()) date(kind, rec, derive[kind](rec));
     const first = earliest([...Object.entries(DATED).filter(([kind]) => kind !== "organizations").flatMap(([, coll]) => coll.all().map((rec) => rec.created_at)), floor]);
