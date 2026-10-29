@@ -68,7 +68,7 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
     return {
       fits,
       retryMs,
-      standing: { limit: spec.limit, remaining: Math.max(0, spec.limit - used - (fits ? cost : 0)), resetMs: (kept[0]?.at ?? t) + windowMs, cost },
+      standing: { limit: spec.limit, remaining: Math.max(0, spec.limit - used - (fits ? cost : 0)), resetMs: kept.length ? kept[kept.length - 1].at + windowMs : t, cost },
       commit: () => spent.set(key, kept),
     };
   }
