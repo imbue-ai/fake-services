@@ -1538,20 +1538,24 @@ def test_a_linear_query_past_the_per_query_maximum_is_refused_and_costs_nothing(
     assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
 
 
-def _linear_until_refused(services: RunningExternalServices, query: str, at_most: int) -> list[httpx.Response]:
+# The answers up to the first refusal, and how many seconds sending them took.
+def _linear_until_refused(
+    services: RunningExternalServices, query: str, at_most: int
+) -> tuple[list[httpx.Response], float]:
     answers: list[httpx.Response] = []
+    began = time.monotonic()
     with httpx.Client(headers={"Authorization": _LINEAR_TOKEN}) as client:
         while len(answers) < at_most and (not answers or answers[-1].status_code == 200):
             answers.append(client.post("{}/graphql".format(services.linear_url), json={"query": query}))
-    return answers
+    return answers, time.monotonic() - began
 
 
 def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: RunningExternalServices) -> None:
-    answers = _linear_until_refused(external_services, _MAX_COMPLEXITY_QUERY, 320)
+    answers, elapsed_seconds = _linear_until_refused(external_services, _MAX_COMPLEXITY_QUERY, 400)
     refused = answers[-1]
 
-    # 3,000,000 points an hour hold 300 queries of 10,000, and a little more drains away meanwhile.
-    assert 300 <= len(answers) - 1 <= 302
+    # 3,000,000 points an hour hold 300 queries of 10,000, and one more drains away every 12 seconds.
+    assert 300 <= len(answers) - 1 <= 300 + elapsed_seconds / 12 + 1
     assert refused.status_code == 429
     assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
     assert "complexity" in refused.json()["errors"][0]["message"]
@@ -1563,11 +1567,11 @@ def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: Run
 
 
 def test_linear_refuses_a_user_past_its_hourly_requests(external_services: RunningExternalServices) -> None:
-    answers = _linear_until_refused(external_services, "{ viewer { id } }", 2600)
+    answers, elapsed_seconds = _linear_until_refused(external_services, "{ viewer { id } }", 3000)
     refused = answers[-1]
 
-    # 2,500 requests an hour, and the few that drain away while they are sent.
-    assert 2500 <= len(answers) - 1 <= 2530
+    # 2,500 requests an hour, and one more for each 1.44 seconds the burst took to send.
+    assert 2500 <= len(answers) - 1 <= 2500 + elapsed_seconds / 1.44 + 1
     assert refused.status_code == 429
     assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
     assert refused.headers["x-ratelimit-requests-remaining"] == "0"
