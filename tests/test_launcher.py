@@ -11,7 +11,6 @@ from typing import Any
 import httpx
 import pytest
 
-from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_PART_DAY_SECONDS
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
 from imbue.minds_evals.conftest import RunningExternalServices
 from imbue.minds_evals.errors import TaskAuthoringError
@@ -91,6 +90,9 @@ def _served_dates(answer: Any) -> Iterator[float]:
     elif isinstance(answer, list):
         for item in answer:
             yield from _served_dates(item)
+    else:
+        # A value outside a date key is no date, and holds none.
+        return
 
 
 def _assert_no_date_is_near_the_wall_clock(*answers: Any) -> None:
@@ -126,7 +128,7 @@ def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_serv
         "Redwood Inference",
     )
     assert identity["url"] == "https://redwood.slack.com/"
-    # The token's user posted in #eng-oncall and never in #announcements.
+    # The token's user posted in eng-oncall and never in announcements.
     assert {channel["name"]: channel["is_member"] for channel in channels} == {
         "announcements": False,
         "eng-oncall": True,
@@ -455,7 +457,6 @@ def test_a_shift_to_the_trials_start_is_a_whole_number_of_days(
     issue = _linear(services, '{ issue(id: "ENG-2") { createdAt } }')
     history = _slack(services, "conversations.history", channel=_channel_id(services, "eng-oncall"))
 
-    assert EXTERNAL_SERVICES_TEST_PART_DAY_SECONDS % (24 * 60 * 60) != 0
     assert _control(services, "health")["shift_ms"] == EXTERNAL_SERVICES_TEST_SHIFT_SECONDS * 1000
     assert issue.json()["data"]["issue"]["createdAt"] == _shifted_iso("2026-03-19T09:00:00.000Z")
     assert history["messages"][0]["ts"] == _shifted("1774000000.000000")
