@@ -1,5 +1,6 @@
 {
   "anchor": "2026-03-21T00:00:00Z",
+  "time_shift": "to_trial_start",
   "tokens": [
     {
       "token": "xoxb-fake-redwood-slack-token",

@@ -25,9 +25,9 @@
 // request (access_log.mjs) and answers the control endpoints.
 //
 // What a trial gets on top of the @emulators packages:
-//   - a seed's records carry absolute timestamps. With `"time_shift": "to_trial_start"` (the default)
-//     every one is shifted by (start - anchor) on load, so the data ends at the trial's start whenever
-//     the trial runs; with `"time_shift": "none"` they are served as written
+//   - a seed's records carry absolute timestamps. With `"time_shift": "none"` (the default) they are
+//     served as written; with `"time_shift": "to_trial_start"` every one is shifted by
+//     (start - anchor) on load, so the data ends at the trial's start whenever the trial runs
 //   - only the seed's tokens authenticate, nothing is rate limited, and the stores start empty: the
 //     emulators' own default workspace is never loaded
 //   - an access log (JSONL, one line per request that reaches a fake), which marks every call the
@@ -67,7 +67,7 @@ const served = Object.keys(seeds);
 if (!served.length) fail(`${env.SEED_DIR} holds no service seed`);
 
 // One clock for every service: records of one refer to dates in another.
-const timeShift = (seed) => seed.time_shift ?? "to_trial_start";
+const timeShift = (seed) => seed.time_shift ?? "none";
 const first = seeds[served[0]];
 for (const name of served)
   if (seeds[name].anchor !== first.anchor || timeShift(seeds[name]) !== timeShift(first)) fail(`the ${name} seed's anchor and time_shift differ from the ${served[0]} seed's`);

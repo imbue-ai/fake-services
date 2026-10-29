@@ -373,7 +373,7 @@ def test_a_directory_holding_one_seed_serves_that_service_alone(
     assert _slack(slack_only_external_services, "auth.test")["user"] == "morgan.reyes"
 
 
-def test_a_seed_that_asks_for_no_time_shift_is_served_as_written(
+def test_a_seed_that_leaves_the_time_shift_out_is_served_as_written(
     slack_only_external_services: RunningExternalServices,
 ) -> None:
     added = _add(
