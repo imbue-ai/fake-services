@@ -348,9 +348,9 @@ export function create(seed, clock) {
         rec.updated_at = latest([prior.updated_at, derived.updated]);
         return;
       }
-      const own = stated.get(rec) ?? {};
+      const own = stated.get(`${kind}:${rec.id}`) ?? {};
       rec.created_at = own.created ?? derived.created ?? floor;
-      rec.updated_at = own.updated ?? latest([rec.created_at, derived.updated]);
+      rec.updated_at = latest([rec.created_at, own.updated ?? derived.updated]);
     };
     for (const [kind, coll] of Object.entries(DATED)) if (kind !== "organizations") for (const rec of coll.all()) date(kind, rec, derive[kind](rec));
     const first = earliest([...Object.entries(DATED).filter(([kind]) => kind !== "organizations").flatMap(([, coll]) => coll.all().map((rec) => rec.created_at)), floor]);
@@ -373,13 +373,16 @@ export function create(seed, clock) {
       return rec?.linear_id ?? null;
     };
     // What the file states of the records this add created, which the emulator does not keep: their
-    // dates for the settle step, and a project's lead and planned dates.
+    // dates for the settle step (by the same key as `before`: the store's update replaces a record's
+    // object, as placing an issue does its team's, and keeps its id), and a project's lead and planned
+    // dates.
     const stated = new Map();
     const isNew = (kind, rec) => rec && !before.has(`${kind}:${rec.id}`);
     const state = (kind, rec, entry) => {
-      if (isNew(kind, rec)) stated.set(rec, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
+      if (isNew(kind, rec)) stated.set(`${kind}:${rec.id}`, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
     };
-    if (cfg.organization) state("organizations", ls.organizations.all()[0], cfg.organization);
+    // The organization may state only its creation; its last update is derived.
+    if (cfg.organization) state("organizations", ls.organizations.all()[0], { created_at: cfg.organization.created_at });
     for (const u of cfg.users ?? []) state("users", ls.users.findOneBy("email", u.email), u);
     for (const t of cfg.teams ?? []) state("teams", ls.teams.findOneBy("key", t.key), t);
     for (const x of cfg.labels ?? []) {
@@ -524,17 +527,16 @@ export function create(seed, clock) {
     };
     // A project's planned dates are the seed's when it states them, else its member issues': it
     // starts when the first of them was started (when none was, when the project was created) and
-    // targets the last due date among them. It is completed when every member issue is, at the last
-    // one's update.
+    // targets the last due date among them. As in Linear, only a project in the completed or canceled
+    // state has a completedAt or canceledAt: a completed one was completed when its last member issue
+    // was (at its own last update with none), a canceled one at its last update.
     const fProject = (x) => x && {
-      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at, canceledAt: null,
+      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at,
       lead: () => fUser(by(ls.users, x.lead_id)),
       startDate: () => x.start_date ?? (earliest(membersOf(x).map((i) => i.started_at)) ?? x.created_at).slice(0, 10),
       targetDate: () => x.target_date ?? latest(membersOf(x).map((i) => i.due_date)),
-      completedAt: () => {
-        const members = membersOf(x);
-        return members.length && members.every((i) => i.completed_at) ? latest(members.map((i) => i.updated_at)) : null;
-      },
+      completedAt: () => (x.state === "completed" ? latest(membersOf(x).map((i) => i.completed_at)) ?? x.updated_at : null),
+      canceledAt: () => (x.state === "canceled" ? x.updated_at : null),
       progress: () => completedShare(membersOf(x)),
       teams: (a, _context, info) => {
         const wanted = where(a, info, teamView);

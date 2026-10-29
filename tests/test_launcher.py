@@ -309,6 +309,54 @@ def test_an_update_moves_a_linear_records_update_forward_and_never_its_creation_
     _assert_no_date_is_near_the_wall_clock(after)
 
 
+def test_a_record_an_update_adds_takes_the_dates_its_file_states(
+    external_services: RunningExternalServices,
+) -> None:
+    """A team keeps its stated dates though placing an issue on it advances its issue sequence, and a
+    stated last update earlier than the creation is served as the creation."""
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "teams": [
+                    {
+                        "key": "OPS",
+                        "name": "Operations",
+                        "states": [{"name": "Todo", "type": "unstarted", "position": 1}],
+                        "created_at": "2025-11-03T09:00:00.000Z",
+                        "updated_at": "2026-02-14T09:00:00.000Z",
+                    }
+                ],
+                "labels": [
+                    {
+                        "name": "billing",
+                        "created_at": "2025-12-01T10:00:00.000Z",
+                        "updated_at": "2025-11-01T10:00:00.000Z",
+                    }
+                ],
+                "issues": [
+                    {
+                        "identifier": "OPS-7",
+                        "team": "OPS",
+                        "title": "Rotate the pager",
+                        "state": "Todo",
+                        "created_at": "2026-03-10T09:00:00.000Z",
+                    }
+                ],
+            }
+        ),
+    )
+    data = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    assert added.status_code == 200, added.text
+    assert _by(data["teams"]["nodes"], "key")["OPS"] == (
+        _shifted_iso("2025-11-03T09:00:00.000Z"),
+        _shifted_iso("2026-02-14T09:00:00.000Z"),
+    )
+    assert _by(data["issueLabels"]["nodes"], "name")["billing"] == (_shifted_iso("2025-12-01T10:00:00.000Z"),) * 2
+
+
 def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
     external_services: RunningExternalServices,
 ) -> None:
@@ -326,9 +374,20 @@ def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
                         "start_date": "2026-03-01",
                         "target_date": "2026-03-31",
                         "created_at": "2026-02-20T09:00:00.000Z",
-                    }
+                    },
+                    {"name": "Legacy exports", "state": "canceled", "created_at": "2026-01-12T09:00:00.000Z"},
+                    {"name": "Usage alerts", "state": "started", "created_at": "2026-02-25T09:00:00.000Z"},
                 ],
                 "issues": [
+                    {
+                        "identifier": "ENG-42",
+                        "team": "ENG",
+                        "title": "Alert on quota",
+                        "state": "Done",
+                        "project": "Usage alerts",
+                        "created_at": "2026-03-05T09:00:00.000Z",
+                        "updated_at": "2026-03-06T15:00:00.000Z",
+                    },
                     {
                         "identifier": "ENG-40",
                         "team": "ENG",
@@ -388,7 +447,14 @@ def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
         "updatedAt": _shifted_iso("2026-03-19T15:00:00.000Z"),
         "progress": 1,
     }
-    assert data["team"] == {"issueCount": 4, "cycles": {"nodes": [{"name": "2026-W11", "progress": 1}]}}
+    # A project has a completedAt or canceledAt only in that state, whatever its issues are.
+    assert (projects["Usage alerts"]["completedAt"], projects["Usage alerts"]["canceledAt"]) == (None, None)
+    assert (projects["Legacy exports"]["completedAt"], projects["Legacy exports"]["canceledAt"]) == (
+        None,
+        projects["Legacy exports"]["updatedAt"],
+    )
+    assert projects["Legacy exports"]["updatedAt"] == _shifted_iso("2026-01-12T09:00:00.000Z")
+    assert data["team"] == {"issueCount": 5, "cycles": {"nodes": [{"name": "2026-W11", "progress": 1}]}}
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
