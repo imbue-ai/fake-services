@@ -841,7 +841,15 @@ _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "17740600
         (
             "linear",
             {
-                "cycles": [{"team": "ENG", "name": "2026-W11", "number": 12}],
+                "cycles": [
+                    {
+                        "team": "ENG",
+                        "name": "2026-W11",
+                        "number": 12,
+                        "starts_at": "2026-03-09T00:00:00Z",
+                        "ends_at": "2026-03-16T00:00:00Z",
+                    }
+                ],
                 "issues": [{**_PLACEABLE_ISSUE, "cycle": "12"}],
             },
         ),
