@@ -1532,6 +1532,8 @@ def test_a_linear_query_past_the_per_query_maximum_is_refused_and_costs_nothing(
     assert "10000" in error["message"]
     # Waiting never admits it, so no wait is named.
     assert "retry-after" not in past_maximum.headers
+    # The refusal reports the user's standing without itself, and the next answer is the second counted.
+    assert past_maximum.headers["x-ratelimit-requests-remaining"] == "2499"
     assert after.headers["x-ratelimit-requests-remaining"] == "2498"
     assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
 

@@ -16,8 +16,9 @@
 //                the vendor's own refusal; retryAfterSeconds is null for a request that never fits
 //   headers(standing) -> {name: value}, optional
 //                the vendor's headers, set on every answer to a limited request, from each bucket's
-//                standing once the request is counted: {bucket: {limit, remaining, resetMs, cost}},
-//                resetMs being when the scope's bucket is next whole (epoch ms)
+//                standing once an admitted request is counted, or as the scope stands for a refused
+//                one: {bucket: {limit, remaining, resetMs, cost}}, resetMs being when the scope's
+//                bucket is next whole (epoch ms)
 // A refusal that waiting cures also carries Retry-After, in whole seconds. A refused request draws on
 // no bucket, so a caller that retries after Retry-After is admitted.
 //
@@ -32,7 +33,7 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
   const spent = new Map();
 
   // Where a request leaves one bucket's scope: whether it fits, how long until it would, and the
-  // standing once it is counted (or, for one that does not fit, as the scope stands). `commit` counts it.
+  // scope's standing both once the request is counted and as it stands without it. `commit` counts it.
   function standingOf(spec, key, cost, t) {
     const windowMs = (windowSeconds ?? spec.windowSeconds) * 1000;
     const fitsEver = cost <= Math.min(spec.limit, spec.maxCost ?? Infinity);
@@ -41,12 +42,13 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
       const prior = spent.get(key) ?? { level: 0, at: t };
       const level = Math.max(0, prior.level - (t - prior.at) * rate);
       const fits = fitsEver && level + cost <= spec.limit;
-      const after = fits ? level + cost : level;
+      const standingAt = (held) => ({ limit: spec.limit, remaining: Math.max(0, Math.floor(spec.limit - held)), resetMs: Math.ceil(t + held / rate), cost });
       return {
         fits,
         retryMs: fitsEver && !fits ? (level + cost - spec.limit) / rate : null,
-        standing: { limit: spec.limit, remaining: Math.max(0, Math.floor(spec.limit - after)), resetMs: Math.ceil(t + after / rate), cost },
-        commit: () => spent.set(key, { level: after, at: t }),
+        counted: standingAt(level + cost),
+        uncounted: standingAt(level),
+        commit: () => spent.set(key, { level: level + cost, at: t }),
       };
     }
     const entries = (spent.get(key) ?? []).filter((e) => e.at > t - windowMs);
@@ -64,13 +66,14 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
         }
       }
     }
-    const kept = fits ? [...entries, { at: t, cost }] : entries;
-    return {
-      fits,
-      retryMs,
-      standing: { limit: spec.limit, remaining: Math.max(0, spec.limit - used - (fits ? cost : 0)), resetMs: kept.length ? kept[kept.length - 1].at + windowMs : t, cost },
-      commit: () => spent.set(key, kept),
-    };
+    const withRequest = [...entries, { at: t, cost }];
+    const standingAt = (kept) => ({
+      limit: spec.limit,
+      remaining: Math.max(0, spec.limit - kept.reduce((sum, e) => sum + e.cost, 0)),
+      resetMs: kept.length ? kept[kept.length - 1].at + windowMs : t,
+      cost,
+    });
+    return { fits, retryMs, counted: standingAt(withRequest), uncounted: standingAt(entries), commit: () => spent.set(key, withRequest) };
   }
 
   function withHeaders(res, extra) {
@@ -88,9 +91,9 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
       if (!draws.length) return service.route(req, url);
       const t = now();
       const assessed = draws.map((d) => ({ ...d, ...standingOf(policy.buckets[d.bucket], `${d.bucket}\u0000${d.scope}`, d.cost, t) }));
-      const standing = Object.fromEntries(assessed.map((a) => [a.bucket, a.standing]));
-      const headers = policy.headers ? policy.headers(standing) : {};
       const refused = assessed.filter((a) => !a.fits);
+      const standing = Object.fromEntries(assessed.map((a) => [a.bucket, refused.length ? a.uncounted : a.counted]));
+      const headers = policy.headers ? policy.headers(standing) : {};
       if (refused.length) {
         // A request that never fits is refused as such; otherwise the longest wait is the one to name.
         const never = refused.find((a) => a.retryMs === null);
