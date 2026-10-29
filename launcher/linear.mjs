@@ -233,7 +233,7 @@ export function create(seed, clock) {
         rec.updated_at = latest([prior.updated_at, derived.updated]);
         return;
       }
-      const own = stated.get(rec) ?? {};
+      const own = stated.get(`${kind}:${rec.id}`) ?? {};
       rec.created_at = own.created ?? derived.created ?? floor;
       rec.updated_at = own.updated ?? latest([rec.created_at, derived.updated]);
     };
@@ -258,11 +258,13 @@ export function create(seed, clock) {
       return rec?.linear_id ?? null;
     };
     // What the file states of the records this add created, which the emulator does not keep: their
-    // dates for the settle step, and a project's lead and planned dates.
+    // dates for the settle step (by the same key as `before`: the store's update replaces a record's
+    // object, as placing an issue does its team's, and keeps its id), and a project's lead and planned
+    // dates.
     const stated = new Map();
     const isNew = (kind, rec) => rec && !before.has(`${kind}:${rec.id}`);
     const state = (kind, rec, entry) => {
-      if (isNew(kind, rec)) stated.set(rec, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
+      if (isNew(kind, rec)) stated.set(`${kind}:${rec.id}`, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
     };
     if (cfg.organization) state("organizations", ls.organizations.all()[0], cfg.organization);
     for (const u of cfg.users ?? []) state("users", ls.users.findOneBy("email", u.email), u);

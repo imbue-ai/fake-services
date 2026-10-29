@@ -307,6 +307,45 @@ def test_an_update_moves_a_linear_records_update_forward_and_never_its_creation_
     _assert_no_date_is_near_the_wall_clock(after)
 
 
+def test_a_record_an_update_adds_takes_the_dates_its_file_states(
+    external_services: RunningExternalServices,
+) -> None:
+    """A team keeps its stated dates though placing an issue on it advances its issue sequence."""
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "teams": [
+                    {
+                        "key": "OPS",
+                        "name": "Operations",
+                        "states": [{"name": "Todo", "type": "unstarted", "position": 1}],
+                        "created_at": "2025-11-03T09:00:00.000Z",
+                        "updated_at": "2026-02-14T09:00:00.000Z",
+                    }
+                ],
+                "issues": [
+                    {
+                        "identifier": "OPS-7",
+                        "team": "OPS",
+                        "title": "Rotate the pager",
+                        "state": "Todo",
+                        "created_at": "2026-03-10T09:00:00.000Z",
+                    }
+                ],
+            }
+        ),
+    )
+    data = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    assert added.status_code == 200, added.text
+    assert _by(data["teams"]["nodes"], "key")["OPS"] == (
+        _shifted_iso("2025-11-03T09:00:00.000Z"),
+        _shifted_iso("2026-02-14T09:00:00.000Z"),
+    )
+
+
 def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
     external_services: RunningExternalServices,
 ) -> None:
