@@ -266,7 +266,8 @@ export function create(seed, clock) {
     const state = (kind, rec, entry) => {
       if (isNew(kind, rec)) stated.set(`${kind}:${rec.id}`, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
     };
-    if (cfg.organization) state("organizations", ls.organizations.all()[0], cfg.organization);
+    // The organization may state only its creation; its last update is derived.
+    if (cfg.organization) state("organizations", ls.organizations.all()[0], { created_at: cfg.organization.created_at });
     for (const u of cfg.users ?? []) state("users", ls.users.findOneBy("email", u.email), u);
     for (const t of cfg.teams ?? []) state("teams", ls.teams.findOneBy("key", t.key), t);
     for (const x of cfg.labels ?? []) {
