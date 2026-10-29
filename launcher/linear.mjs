@@ -409,17 +409,16 @@ export function create(seed, clock) {
     };
     // A project's planned dates are the seed's when it states them, else its member issues': it
     // starts when the first of them was started (when none was, when the project was created) and
-    // targets the last due date among them. It is completed when every member issue is, at the last
-    // one's update.
+    // targets the last due date among them. As in Linear, only a project in the completed or canceled
+    // state has a completedAt or canceledAt: a completed one was completed when its last member issue
+    // was (at its own last update with none), a canceled one at its last update.
     const fProject = (x) => x && {
-      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at, canceledAt: null,
+      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at,
       lead: () => fUser(by(ls.users, x.lead_id)),
       startDate: () => x.start_date ?? (earliest(membersOf(x).map((i) => i.started_at)) ?? x.created_at).slice(0, 10),
       targetDate: () => x.target_date ?? latest(membersOf(x).map((i) => i.due_date)),
-      completedAt: () => {
-        const members = membersOf(x);
-        return members.length && members.every((i) => i.completed_at) ? latest(members.map((i) => i.updated_at)) : null;
-      },
+      completedAt: () => (x.state === "completed" ? latest(membersOf(x).map((i) => i.completed_at)) ?? x.updated_at : null),
+      canceledAt: () => (x.state === "canceled" ? x.updated_at : null),
       progress: () => completedShare(membersOf(x)),
       teams: (a, _context, info) => {
         const wanted = where(a, info, teamView);

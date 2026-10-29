@@ -324,9 +324,20 @@ def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
                         "start_date": "2026-03-01",
                         "target_date": "2026-03-31",
                         "created_at": "2026-02-20T09:00:00.000Z",
-                    }
+                    },
+                    {"name": "Legacy exports", "state": "canceled", "created_at": "2026-01-12T09:00:00.000Z"},
+                    {"name": "Usage alerts", "state": "started", "created_at": "2026-02-25T09:00:00.000Z"},
                 ],
                 "issues": [
+                    {
+                        "identifier": "ENG-42",
+                        "team": "ENG",
+                        "title": "Alert on quota",
+                        "state": "Done",
+                        "project": "Usage alerts",
+                        "created_at": "2026-03-05T09:00:00.000Z",
+                        "updated_at": "2026-03-06T15:00:00.000Z",
+                    },
                     {
                         "identifier": "ENG-40",
                         "team": "ENG",
@@ -386,7 +397,14 @@ def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
         "updatedAt": _shifted_iso("2026-03-19T15:00:00.000Z"),
         "progress": 1,
     }
-    assert data["team"] == {"issueCount": 4, "cycles": {"nodes": [{"name": "2026-W11", "progress": 1}]}}
+    # A project has a completedAt or canceledAt only in that state, whatever its issues are.
+    assert (projects["Usage alerts"]["completedAt"], projects["Usage alerts"]["canceledAt"]) == (None, None)
+    assert (projects["Legacy exports"]["completedAt"], projects["Legacy exports"]["canceledAt"]) == (
+        None,
+        projects["Legacy exports"]["updatedAt"],
+    )
+    assert projects["Legacy exports"]["updatedAt"] == _shifted_iso("2026-01-12T09:00:00.000Z")
+    assert data["team"] == {"issueCount": 5, "cycles": {"nodes": [{"name": "2026-W11", "progress": 1}]}}
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
