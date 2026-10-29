@@ -35,10 +35,14 @@ def _slack(services: RunningExternalServices, method: str, **params: str) -> dic
     return httpx.get("{}/api/{}".format(services.slack_url, method), params=params, headers=_SLACK_HEADERS).json()
 
 
-def _linear(services: RunningExternalServices, query: str, token: str = _LINEAR_TOKEN) -> httpx.Response:
-    return httpx.post(
-        "{}/graphql".format(services.linear_url), json={"query": query}, headers={"Authorization": token}
-    )
+def _linear(
+    services: RunningExternalServices,
+    query: str,
+    token: str = _LINEAR_TOKEN,
+    variables: dict[str, Any] | None = None,
+) -> httpx.Response:
+    body: dict[str, Any] = {"query": query} if variables is None else {"query": query, "variables": variables}
+    return httpx.post("{}/graphql".format(services.linear_url), json=body, headers={"Authorization": token})
 
 
 def _control(services: RunningExternalServices, route: str) -> Any:
@@ -1468,13 +1472,10 @@ def test_every_linear_answer_carries_linears_rate_limit_headers(external_service
     # points, and 14 with `first: 10`.
     default_page = _linear(external_services, "{ viewer { createdIssues { nodes { id title createdAt } } } }")
     ten = _linear(external_services, "{ viewer { createdIssues(first: 10) { nodes { id title createdAt } } } }")
-    by_variable = httpx.post(
-        "{}/graphql".format(external_services.linear_url),
-        json={
-            "query": "query Q($n: Int) { viewer { createdIssues(first: $n) { nodes { id title createdAt } } } }",
-            "variables": {"n": 10},
-        },
-        headers={"Authorization": _LINEAR_TOKEN},
+    by_variable = _linear(
+        external_services,
+        "query Q($n: Int) { viewer { createdIssues(first: $n) { nodes { id title createdAt } } } }",
+        variables={"n": 10},
     )
     by_default = _linear(
         external_services,
