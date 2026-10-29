@@ -1,7 +1,8 @@
 // The fake Slack: @emulators/slack's app and store, with what a trial needs on top. Messages, threads
-// and ids are inserted straight into the store, so they read the same in every trial; Slack methods
-// answer GET; conversations.history takes oldest/latest/inclusive; a basic search.messages. See
-// launcher.mjs for the interface this module exports.
+// and ids are inserted straight into the store, so they read the same in every trial; channels and
+// users are dated, and channels peopled, from the seed's messages (settle()); Slack methods answer
+// GET; conversations.history takes oldest/latest/inclusive; a basic search.messages. See launcher.mjs
+// for the interface this module exports.
 import crypto from "node:crypto";
 import { Hono, Store, WebhookDispatcher, authMiddleware, cors, createApiErrorHandler, createErrorHandler } from "@emulators/core";
 import { getSlackStore, seedFromConfig, slackPlugin } from "@emulators/slack";
@@ -38,7 +39,55 @@ export function create(seed, clock) {
   const domain = seed.team?.domain ?? "workspace";
   const tokenUsers = new Map((seed.tokens ?? []).map((entry) => [entry.token, entry.user]));
 
+  const isoOfTs = (ts) => new Date(Number(ts) * 1000).toISOString();
+  const secondsOf = (iso) => Math.floor(Date.parse(iso) / 1000);
+  const byTs = (a, b) => Number(a.ts) - Number(b.ts);
+
+  // Dates the channels and users, and gives the channels their members, once a seed's or an
+  // update's records are all in: the emulator stamps both with the wall clock and makes every user a
+  // member of every channel.
+  //   A channel's members are the users who posted in it plus those its `members` names, for a public
+  //   channel as for a private one; its creator is its first poster (else the first user it names,
+  //   else the first seeded user). A new channel was created, and its topic and purpose set, at the
+  //   date its file states, else at its first message, else at the earliest message the fake holds,
+  //   else at the anchor.
+  //   A new user was last updated at the date their file states as `created`, else at their first
+  //   message, else at the earliest message; their last activity is their latest message.
+  //   A channel or user that was there before keeps its dates. Reading a public channel needs no
+  //   membership, as with a Slack user token, so membership changes what a channel lists, not who
+  //   may read it.
+  function settle(newChannels, newUsers, statedMembers) {
+    const messages = ss.messages.all().sort(byTs);
+    const floor = messages[0] ? isoOfTs(messages[0].ts) : clock.anchor;
+    for (const m of messages) m.created_at = m.updated_at = isoOfTs(m.ts);
+    for (const ch of ss.channels.all()) {
+      const posted = messages.filter((m) => m.channel_id === ch.channel_id);
+      const named = statedMembers.get(ch.name) ?? [];
+      const members = [...new Set([...ch.members, ...named, ...posted.map((m) => m.user)])];
+      const fresh = newChannels.get(ch.name);
+      const creator = fresh ? posted[0]?.user ?? named[0] ?? ss.users.all()[0]?.user_id ?? null : ch.creator;
+      const created = fresh ? clock.iso(fresh.created) ?? (posted[0] ? isoOfTs(posted[0].ts) : floor) : ch.created_at;
+      Object.assign(ch, {
+        members,
+        num_members: members.length,
+        creator,
+        topic: fresh ? { ...ch.topic, creator, last_set: secondsOf(created) } : ch.topic,
+        purpose: fresh ? { ...ch.purpose, creator, last_set: secondsOf(created) } : ch.purpose,
+        created_at: created,
+        updated_at: created,
+      });
+    }
+    for (const u of ss.users.all()) {
+      const own = messages.filter((m) => m.user === u.user_id);
+      const fresh = newUsers.get(u.name);
+      const updated = fresh ? clock.iso(fresh.created) ?? (own[0] ? isoOfTs(own[0].ts) : floor) : u.created_at;
+      Object.assign(u, { created_at: updated, updated_at: updated, last_activity: own.length ? secondsOf(isoOfTs(own.at(-1).ts)) : secondsOf(updated) });
+    }
+  }
+
   function add(cfg) {
+    const newChannels = new Map((cfg.channels ?? []).filter((c) => !ss.channels.findOneBy("name", c.name)).map((c) => [c.name, c]));
+    const newUsers = new Map((cfg.users ?? []).filter((u) => !ss.users.all().some((x) => x.name === u.name)).map((u) => [u.name, u]));
     // The emulator only renames a team it already has, and answers for a missing one under its own name.
     if (!ss.teams.all()[0]) ss.teams.insert({ team_id: "T" + slackId("", domain), name: cfg.team?.name ?? domain, domain });
     seedFromConfig(store, REAL_URL, {
@@ -63,11 +112,19 @@ export function create(seed, clock) {
       const id = c.id ?? slackId("C", c.name);
       if (rec.channel_id !== id) ss.channels.update(rec.id, { channel_id: id });
     }
-    // Every seeded user is a member of every public channel.
-    const members = ss.users.all().map((u) => u.user_id);
-    for (const ch of ss.channels.all()) if (!ch.is_private) ss.channels.update(ch.id, { members, num_members: members.length });
     const chan = (ref) => (ss.channels.findOneBy("name", ref) ?? ss.channels.findOneBy("channel_id", ref))?.channel_id;
     const user = (ref) => (ss.users.all().find((x) => x.name === ref) ?? ss.users.findOneBy("user_id", ref))?.user_id;
+    // A new channel starts with no members: settle() gives it its posters and the users it names.
+    for (const name of newChannels.keys()) ss.channels.findOneBy("name", name).members = [];
+    const statedMembers = new Map();
+    for (const c of cfg.channels ?? []) {
+      const ids = (c.members ?? []).map((ref) => {
+        const id = user(ref);
+        if (!id) throw new Error(`slack channel ${c.name} names an unknown member ${ref}`);
+        return id;
+      });
+      statedMembers.set(c.name, ids);
+    }
     let n = 0;
     for (const m of cfg.messages ?? []) {
       const channel_id = chan(m.channel);
@@ -88,6 +145,7 @@ export function create(seed, clock) {
       }
       n++;
     }
+    settle(newChannels, newUsers, statedMembers);
     return { slack_messages: n };
   }
 
@@ -168,13 +226,25 @@ export function create(seed, clock) {
       },
     });
   }
+  // The emulator's user objects lack Slack's `updated`, which the answers of these methods gain from
+  // the store (the date settle() gave the user), under the key each answer holds its users in.
+  const USER_ANSWERS = { "users.list": "members", "users.info": "user", "users.lookupByEmail": "user" };
+  async function withUpdated(res, key) {
+    const answer = await answerOf(res);
+    if (!answer?.ok || !answer[key]) return res;
+    const stamped = (u) => ({ ...u, updated: secondsOf(ss.users.findOneBy("user_id", u.id).updated_at) });
+    answer[key] = Array.isArray(answer[key]) ? answer[key].map(stamped) : stamped(answer[key]);
+    const headers = new Headers(res.headers);
+    headers.delete("content-length");
+    return new Response(JSON.stringify(answer), { status: res.status, headers });
+  }
   async function apiRoute(req, url) {
     const method = url.pathname.slice(5);
     const p = await params(req);
     if (method === "search.messages") return search(req, p);
     if (method === "conversations.history" && (p.oldest || p.latest)) return history(req, p);
-    if (req.method === "GET") return asPost(req, method, Object.fromEntries(url.searchParams));
-    return app.fetch(req);
+    const res = await (req.method === "GET" ? asPost(req, method, Object.fromEntries(url.searchParams)) : app.fetch(req));
+    return method in USER_ANSWERS ? withUpdated(res, USER_ANSWERS[method]) : res;
   }
   async function route(req, url) {
     const isMethod = url.pathname.startsWith("/api/");

@@ -12,8 +12,9 @@
 //     store          the @emulators/core Store its records live in; an update is applied inside a
 //                     snapshot of it, so one that fails leaves the store as it was
 //     tokenUsers      Map of each token the seed names to the user it belongs to
-//     add(records)    places a seed's or an update's records, throws on one it cannot place, and
-//                     returns what it added
+//     add(records)    places a seed's or an update's records, throws on one it cannot place, dates
+//                     every record from the seed's own dates (never the box's clock), and returns
+//                     what it added
 //     route(req, url) answers a request for the API host
 //     notFound()      what a request for another host is answered with
 //     counts()        the record counts for health
@@ -27,7 +28,11 @@
 // What a trial gets on top of the @emulators packages:
 //   - a seed's records carry absolute timestamps. With `"time_shift": "none"` (the default) they are
 //     served as written; with `"time_shift": "to_trial_start"` every one is shifted by
-//     (start - anchor) on load, so the data ends at the trial's start whenever the trial runs
+//     (start - anchor) rounded down to whole days on load, so the data ends within the day before
+//     the trial's start whenever the trial runs, on the weekdays and at the times of day it was
+//     written for
+//   - no record carries the box's clock: a date the seed does not state is derived from the seed's
+//     own records (each module's settle step)
 //   - only the seed's tokens authenticate, nothing is rate limited, and the stores start empty: the
 //     emulators' own default workspace is never loaded
 //   - an access log (JSONL, one line per request that reaches a fake), which marks every call the
@@ -76,9 +81,12 @@ const anchorMs = Date.parse(first.anchor);
 if (Number.isNaN(anchorMs)) fail(`the seed's anchor ${JSON.stringify(first.anchor)} is not a timestamp`);
 const launchedAtMs = Date.now();
 const startMs = Number(env.START_MS ?? launchedAtMs);
-const shiftMs = timeShift(first) === "none" ? 0 : startMs - anchorMs;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const shiftMs = timeShift(first) === "none" ? 0 : Math.floor((startMs - anchorMs) / DAY_MS) * DAY_MS;
 const clock = {
   shiftMs,
+  // The seed's anchor, shifted: the date of last resort for a record nothing else in a seed dates.
+  anchor: new Date(anchorMs + shiftMs).toISOString(),
   // The trial's present, which "now" means in a query: the start, advanced by the wall clock since.
   now: () => startMs + (Date.now() - launchedAtMs),
   iso: (v) => (v ? new Date(Date.parse(v) + shiftMs).toISOString() : v ?? null),

@@ -2,11 +2,16 @@
 packages (`just minds-evals-external-services-install`)."""
 
 import json
+import time
+from collections.abc import Iterator
+from datetime import datetime
+from datetime import timedelta
 from typing import Any
 
 import httpx
 import pytest
 
+from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_PART_DAY_SECONDS
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
 from imbue.minds_evals.conftest import RunningExternalServices
 from imbue.minds_evals.errors import TaskAuthoringError
@@ -49,13 +54,62 @@ def _issue_titles(services: RunningExternalServices) -> dict[str, str]:
 
 
 def _channel_id(services: RunningExternalServices, name: str) -> str:
-    channels = _slack(services, "conversations.list")["channels"]
+    channels = _slack(services, "conversations.list", types="public_channel,private_channel")["channels"]
     return next(channel["id"] for channel in channels if channel["name"] == name)
 
 
 def _shifted(ts: str) -> str:
     seconds, fraction = ts.split(".")
     return "{}.{}".format(int(seconds) + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS, fraction)
+
+
+def _shifted_iso(stamp: str) -> str:
+    """A seed's timestamp as the launcher serves it under the test's shift."""
+    moved = datetime.fromisoformat(stamp.replace("Z", "+00:00")) + timedelta(
+        seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+    )
+    return moved.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _shifted_seconds(ts: str) -> int:
+    return int(ts.split(".")[0]) + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+
+
+# Every key under which a fake serves a record's date, and the instant each names in epoch seconds.
+_DATE_KEYS = ("createdAt", "updatedAt", "completedAt", "startDate", "targetDate", "created", "updated", "last_set")
+
+
+def _served_dates(answer: Any) -> Iterator[float]:
+    if isinstance(answer, dict):
+        for key, value in answer.items():
+            if key in _DATE_KEYS and isinstance(value, str):
+                yield datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            elif key in _DATE_KEYS and isinstance(value, int):
+                yield float(value)
+            else:
+                yield from _served_dates(value)
+    elif isinstance(answer, list):
+        for item in answer:
+            yield from _served_dates(item)
+
+
+def _assert_no_date_is_near_the_wall_clock(*answers: Any) -> None:
+    dates = [stamp for answer in answers for stamp in _served_dates(answer)]
+    assert dates
+    for stamp in dates:
+        assert abs(stamp - time.time()) > 24 * 60 * 60, datetime.fromtimestamp(stamp).isoformat()
+
+
+_LINEAR_DATES_QUERY = (
+    "{ organization { createdAt updatedAt } users { nodes { email createdAt updatedAt } } "
+    "teams { nodes { key createdAt updatedAt states { nodes { name createdAt updatedAt } } } } "
+    "issueLabels { nodes { name createdAt updatedAt } } projects { nodes { name createdAt updatedAt } } "
+    "cycles { nodes { name createdAt updatedAt } } }"
+)
+
+
+def _by(nodes: list[dict[str, Any]], key: str) -> dict[str, tuple[str, str]]:
+    return {node[key]: (node["createdAt"], node["updatedAt"]) for node in nodes}
 
 
 def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_services: RunningExternalServices) -> None:
@@ -72,8 +126,9 @@ def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_serv
         "Redwood Inference",
     )
     assert identity["url"] == "https://redwood.slack.com/"
+    # The token's user posted in #eng-oncall and never in #announcements.
     assert {channel["name"]: channel["is_member"] for channel in channels} == {
-        "announcements": True,
+        "announcements": False,
         "eng-oncall": True,
     }
     assert next(channel["id"] for channel in channels if channel["name"] == "announcements") == "C0Z2IPZAXKN"
@@ -95,14 +150,56 @@ def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_serv
         assert "emulate" not in json.dumps(answer).lower()
 
 
-def test_every_seeded_user_is_a_member_of_every_public_channel(external_services: RunningExternalServices) -> None:
-    channel_id = _channel_id(external_services, "eng-oncall")
+def _user_ids(services: RunningExternalServices) -> dict[str, str]:
+    return {member["name"]: member["id"] for member in _slack(services, "users.list")["members"]}
 
-    members = _slack(external_services, "conversations.members", channel=channel_id)["members"]
 
-    user_ids = {member["id"] for member in _slack(external_services, "users.list")["members"]}
-    assert len(user_ids) == 3
-    assert set(members) == user_ids
+def _members(services: RunningExternalServices, channel_name: str) -> set[str]:
+    by_id = {user_id: name for name, user_id in _user_ids(services).items()}
+    answer = _slack(services, "conversations.members", channel=_channel_id(services, channel_name))
+    return {by_id[user_id] for user_id in answer["members"]}
+
+
+def test_a_channels_members_are_the_users_who_posted_in_it_and_those_it_names(
+    external_services: RunningExternalServices,
+) -> None:
+    seeded = {name: _members(external_services, name) for name in ("announcements", "eng-oncall")}
+    added = _add(
+        external_services,
+        "slack",
+        json.dumps(
+            {
+                "users": [{"name": "olivia_chen", "real_name": "Olivia Chen"}],
+                "channels": [
+                    {"name": "leads", "is_private": True, "members": ["claire"]},
+                    {"name": "quiet", "members": ["pagerbot"]},
+                ],
+                "messages": [
+                    {"channel": "eng-oncall", "user": "olivia_chen", "ts": "1774050000.000000", "text": "Drafted."},
+                    {"channel": "leads", "user": "morgan.reyes", "ts": "1774060000.000000", "text": "Sync?"},
+                ],
+            }
+        ),
+    )
+
+    assert added.status_code == 200, added.text
+    assert seeded == {"announcements": {"claire"}, "eng-oncall": {"pagerbot", "claire", "morgan.reyes"}}
+    assert _members(external_services, "eng-oncall") == {"pagerbot", "claire", "morgan.reyes", "olivia_chen"}
+    assert _members(external_services, "leads") == {"claire", "morgan.reyes"}
+    assert _members(external_services, "quiet") == {"pagerbot"}
+    user_ids = _user_ids(external_services)
+    channels = {channel["name"]: channel for channel in _slack(external_services, "conversations.list")["channels"]}
+    assert {name: (channel["creator"], channel["num_members"]) for name, channel in channels.items()} == {
+        "announcements": (user_ids["claire"], 1),
+        "eng-oncall": (user_ids["pagerbot"], 4),
+        "quiet": (user_ids["pagerbot"], 1),
+    }
+    # A public channel reads the same to a token whose user never posted in it, as with a Slack user
+    # token; the private channel is listed only to its members.
+    history = _slack(external_services, "conversations.history", channel=channels["announcements"]["id"])
+    assert [message["user"] for message in history["messages"]] == [user_ids["claire"]]
+    private = _slack(external_services, "conversations.list", types="private_channel")["channels"]
+    assert [channel["name"] for channel in private] == ["leads"]
 
 
 def test_timestamps_are_shifted_by_the_start_minus_the_anchor(external_services: RunningExternalServices) -> None:
@@ -125,6 +222,243 @@ def test_timestamps_are_shifted_by_the_start_minus_the_anchor(external_services:
         "updatedAt": "2026-10-06T12:00:00.000Z",
         "comments": {"nodes": [{"createdAt": "2026-10-06T12:00:00.000Z"}]},
     }
+
+
+def test_every_linear_date_is_the_seeds_or_derived_from_its_records(
+    external_services: RunningExternalServices,
+) -> None:
+    """Only issues and comments state their dates in the fixture seed, besides Morgan's creation: a
+    project, cycle, user, label, team and state is dated from the issues and comments around it, and
+    the organization from the earliest record of all. Morgan was last updated by the first issue
+    they created."""
+    data = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    first_issue = _shifted_iso("2026-03-02T09:00:00.000Z")
+    assert data["organization"] == {"createdAt": _shifted_iso("2026-01-05T09:00:00.000Z")} | {
+        "updatedAt": _shifted_iso("2026-01-05T09:00:00.000Z")
+    }
+    assert _by(data["users"]["nodes"], "email") == {
+        "morgan.reyes@redwood.example": (_shifted_iso("2026-01-05T09:00:00.000Z"), first_issue),
+        "thomas.baird@redwood.example": (first_issue, first_issue),
+    }
+    (team,) = data["teams"]["nodes"]
+    assert (team["createdAt"], team["updatedAt"]) == (first_issue, first_issue)
+    assert set(_by(team["states"]["nodes"], "name").values()) == {(first_issue, first_issue)}
+    assert _by(data["issueLabels"]["nodes"], "name") == {"telemetry": (first_issue, first_issue)}
+    # The project's latest record is ENG-2's update and its comment; the cycle's is ENG-1's update.
+    assert _by(data["projects"]["nodes"], "name") == {
+        "Usage insights": (first_issue, _shifted_iso("2026-03-20T12:00:00.000Z"))
+    }
+    assert _by(data["cycles"]["nodes"], "name") == {
+        "2026-W11": (_shifted_iso("2026-03-09T00:00:00.000Z"), _shifted_iso("2026-03-12T17:00:00.000Z"))
+    }
+    _assert_no_date_is_near_the_wall_clock(data)
+
+
+def test_an_update_moves_a_linear_records_update_forward_and_never_its_creation_back(
+    external_services: RunningExternalServices,
+) -> None:
+    before = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "labels": [{"name": "billing", "created_at": "2025-12-01T10:00:00.000Z"}],
+                "issues": [
+                    {
+                        "identifier": "ENG-30",
+                        "team": "ENG",
+                        "title": "Backdated import",
+                        "state": "In Progress",
+                        "assignee": "Thomas Baird",
+                        "project": "Usage insights",
+                        "cycle": "2026-W11",
+                        "created_at": "2026-02-01T09:00:00.000Z",
+                        "updated_at": "2026-03-20T23:00:00.000Z",
+                    }
+                ],
+            }
+        ),
+    )
+    after = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    assert added.status_code == 200, added.text
+    # The new issue is older than everything the project, the cycle, Thomas and the team were dated
+    # from, and newer than their updates: each keeps its creation and moves its update forward.
+    newest = _shifted_iso("2026-03-20T23:00:00.000Z")
+    assert _by(after["projects"]["nodes"], "name")["Usage insights"] == (
+        _by(before["projects"]["nodes"], "name")["Usage insights"][0],
+        newest,
+    )
+    assert _by(after["cycles"]["nodes"], "name")["2026-W11"] == (
+        _by(before["cycles"]["nodes"], "name")["2026-W11"][0],
+        newest,
+    )
+    assert _by(after["users"]["nodes"], "email") == _by(before["users"]["nodes"], "email")
+    assert (after["teams"]["nodes"][0]["createdAt"], after["organization"]) == (
+        before["teams"]["nodes"][0]["createdAt"],
+        before["organization"],
+    )
+    # A record the update adds takes the date its file states.
+    assert _by(after["issueLabels"]["nodes"], "name")["billing"] == (_shifted_iso("2025-12-01T10:00:00.000Z"),) * 2
+    _assert_no_date_is_near_the_wall_clock(after)
+
+
+def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
+    external_services: RunningExternalServices,
+) -> None:
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "projects": [
+                    {
+                        "name": "Billing cleanup",
+                        "state": "completed",
+                        "description": "Invoices without drift.",
+                        "lead": "thomas.baird@redwood.example",
+                        "start_date": "2026-03-01",
+                        "target_date": "2026-03-31",
+                        "created_at": "2026-02-20T09:00:00.000Z",
+                    }
+                ],
+                "issues": [
+                    {
+                        "identifier": "ENG-40",
+                        "team": "ENG",
+                        "title": "Round line totals",
+                        "state": "Done",
+                        "project": "Billing cleanup",
+                        "created_at": "2026-03-03T09:00:00.000Z",
+                        "updated_at": "2026-03-18T15:00:00.000Z",
+                    },
+                    {
+                        "identifier": "ENG-41",
+                        "team": "ENG",
+                        "title": "Drop the legacy rounding",
+                        "state": "Done",
+                        "project": "Billing cleanup",
+                        "created_at": "2026-03-04T09:00:00.000Z",
+                        "updated_at": "2026-03-19T15:00:00.000Z",
+                    },
+                ],
+            }
+        ),
+    )
+    answer = _linear(
+        external_services,
+        "{ projects { nodes { name description state lead { name } startDate targetDate completedAt canceledAt "
+        "createdAt updatedAt progress } } "
+        'team(id: "ENG") { issueCount cycles { nodes { name progress } } } }',
+    )
+
+    assert added.status_code == 200, added.text
+    assert answer.status_code == 200 and "errors" not in answer.json(), answer.text
+    data = answer.json()["data"]
+    projects = {project.pop("name"): project for project in data["projects"]["nodes"]}
+    # The seed's project states none of these: its dates are its issues', it has no lead, and one of
+    # its two issues is still in progress.
+    assert projects["Usage insights"] == {
+        "description": "",
+        "state": "started",
+        "lead": None,
+        "startDate": _shifted_iso("2026-03-02T09:00:00.000Z")[:10],
+        "targetDate": _shifted_iso("2026-03-13T00:00:00.000Z")[:10],
+        "completedAt": None,
+        "canceledAt": None,
+        "createdAt": _shifted_iso("2026-03-02T09:00:00.000Z"),
+        "updatedAt": _shifted_iso("2026-03-20T12:00:00.000Z"),
+        "progress": 0.5,
+    }
+    assert projects["Billing cleanup"] == {
+        "description": "Invoices without drift.",
+        "state": "completed",
+        "lead": {"name": "Thomas Baird"},
+        "startDate": _shifted_iso("2026-03-01T00:00:00.000Z")[:10],
+        "targetDate": _shifted_iso("2026-03-31T00:00:00.000Z")[:10],
+        "completedAt": _shifted_iso("2026-03-19T15:00:00.000Z"),
+        "canceledAt": None,
+        "createdAt": _shifted_iso("2026-02-20T09:00:00.000Z"),
+        "updatedAt": _shifted_iso("2026-03-19T15:00:00.000Z"),
+        "progress": 1,
+    }
+    assert data["team"] == {"issueCount": 4, "cycles": {"nodes": [{"name": "2026-W11", "progress": 1}]}}
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_every_slack_date_is_the_seeds_or_derived_from_its_messages(
+    external_services: RunningExternalServices,
+) -> None:
+    added = _add(
+        external_services,
+        "slack",
+        json.dumps(
+            {
+                "users": [
+                    {"name": "olivia_chen", "real_name": "Olivia Chen"},
+                    {"name": "sam", "real_name": "Sam Ito", "created": "2026-02-10T08:00:00.000Z"},
+                ],
+                "channels": [
+                    {"name": "planning", "created": "2026-02-02T09:30:00.000Z"},
+                    {"name": "quiet", "members": ["sam"]},
+                ],
+                "messages": [
+                    {"channel": "planning", "user": "olivia_chen", "ts": "1774050000.000000", "text": "Q2 draft."},
+                ],
+            }
+        ),
+    )
+    channels = {
+        channel["name"]: channel
+        for channel in _slack(external_services, "conversations.list", types="public_channel,private_channel")[
+            "channels"
+        ]
+    }
+    users = {member["name"]: member for member in _slack(external_services, "users.list")["members"]}
+
+    assert added.status_code == 200, added.text
+    # A channel is created at its first message unless its file says otherwise, and one with no
+    # message at the earliest message of all; its topic and purpose were set when it was created.
+    planning_created = int(datetime.fromisoformat("2026-02-02T09:30:00+00:00").timestamp())
+    expected_created = {
+        "announcements": _shifted_seconds("1769123456.000000"),
+        "eng-oncall": _shifted_seconds("1773900000.000000"),
+        "planning": planning_created + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS,
+        "quiet": _shifted_seconds("1769123456.000000"),
+    }
+    assert {name: channel["created"] for name, channel in channels.items()} == expected_created
+    assert {name: channel["topic"]["last_set"] for name, channel in channels.items()} == expected_created
+    assert {name: channel["purpose"]["last_set"] for name, channel in channels.items()} == expected_created
+    # A user was last updated at their first message unless their file says otherwise, and one
+    # without a message at the earliest message of all.
+    sam_created = int(datetime.fromisoformat("2026-02-10T08:00:00+00:00").timestamp())
+    assert {name: user["updated"] for name, user in users.items()} == {
+        "claire": _shifted_seconds("1769123456.000000"),
+        "pagerbot": _shifted_seconds("1773900000.000000"),
+        "morgan.reyes": _shifted_seconds("1774000000.000000"),
+        "olivia_chen": _shifted_seconds("1774050000.000000"),
+        "sam": sam_created + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS,
+    }
+    info = _slack(external_services, "users.info", user=users["claire"]["id"])
+    assert info["user"]["updated"] == _shifted_seconds("1769123456.000000")
+    _assert_no_date_is_near_the_wall_clock(channels, users)
+
+
+def test_a_shift_to_the_trials_start_is_a_whole_number_of_days(
+    external_services_started_mid_day: RunningExternalServices,
+) -> None:
+    """The launcher is told it started part of a day past a whole number of days after the anchor,
+    and drops that part, so every timestamp keeps its weekday and its time of day."""
+    services = external_services_started_mid_day
+    issue = _linear(services, '{ issue(id: "ENG-2") { createdAt } }')
+    history = _slack(services, "conversations.history", channel=_channel_id(services, "eng-oncall"))
+
+    assert EXTERNAL_SERVICES_TEST_PART_DAY_SECONDS % (24 * 60 * 60) != 0
+    assert _control(services, "health")["shift_ms"] == EXTERNAL_SERVICES_TEST_SHIFT_SECONDS * 1000
+    assert issue.json()["data"]["issue"]["createdAt"] == _shifted_iso("2026-03-19T09:00:00.000Z")
+    assert history["messages"][0]["ts"] == _shifted("1774000000.000000")
 
 
 def test_history_takes_oldest_and_latest(external_services: RunningExternalServices) -> None:
@@ -829,6 +1163,8 @@ _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "17740600
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "channel": "no-such-channel"}]}),
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "user": "nobody"}]}),
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "thread_ts": "1.000000"}]}),
+        ("slack", {"channels": [{"name": "leads", "is_private": True, "members": ["nobody"]}]}),
+        ("linear", {"projects": [{"name": "Billing cleanup", "lead": "Nobody Here"}]}),
         # A user or a cycle listed again under what the fake already keeps one by is not added, so
         # the name or number only the second entry gives is no record's to refer to.
         (

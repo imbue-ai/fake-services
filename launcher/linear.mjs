@@ -1,9 +1,10 @@
 // The fake Linear: one GraphQL endpoint served from Linear's public schema by the resolvers here, on
 // a store that @emulators/linear seeds and resolves references in. Issues keep the seed's
-// identifiers and timestamps, with estimate, parent/children and relations; queries take nested
-// filters, date/number comparators, orderBy and searchIssues; a public field or argument the fake
-// does not hold is answered empty and counted; a mutation or subscription is refused. See
-// launcher.mjs for the interface this module exports.
+// identifiers and timestamps, with estimate, parent/children and relations; every other record takes
+// the dates the seed states or derives them from the seed's records (settle()), and a project serves
+// its lead and planned dates; queries take nested filters, date/number comparators, orderBy and
+// searchIssues; a public field or argument the fake does not hold is answered empty and counted; a
+// mutation or subscription is refused. See launcher.mjs for the interface this module exports.
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
@@ -180,7 +181,69 @@ export function create(seed, clock) {
     return Boolean(c.starts_at && c.ends_at && Date.parse(c.starts_at) <= now && now < Date.parse(c.ends_at));
   }
 
+  // The records the settle step dates, by collection. Issues and comments carry the seed's own dates.
+  const DATED = { organizations: ls.organizations, users: ls.users, teams: ls.teams, workflowStates: ls.workflowStates, issueLabels: ls.issueLabels, projects: ls.projects, cycles: ls.cycles };
+  const earliest = (stamps) => stamps.filter(Boolean).sort()[0] ?? null;
+  const latest = (stamps) => stamps.filter(Boolean).sort().at(-1) ?? null;
+  const membersOf = (project) => ls.issues.findBy("project_id", project.linear_id);
+
+  // Dates every team, user, label, project, cycle, workflow state and the organization once a seed's
+  // or an update's records are all in. The store stamps a record with the wall clock on insert and on
+  // every update, so the dates are written on the record itself, after the last update, and the ones
+  // a record had before this add are taken from `before`, captured ahead of it.
+  //   A record the add created takes the dates its file states (`stated`, already shifted); a date it
+  //   leaves out is derived from the records around it:
+  //     project       created: its earliest member issue's creation; updated: its latest member
+  //                   issue's update or comment
+  //     cycle         created: its start; updated: the later of its start and its latest member
+  //                   issue's update
+  //     user          the earliest issue they created or were assigned, or comment they wrote
+  //     label         the earliest issue carrying it
+  //     team, state   the team's earliest issue
+  //     organization  the earliest creation of every record above
+  //   A record with nothing to derive its creation from was created at the earliest issue, comment or
+  //   cycle start the fake holds, else at the anchor, and last updated then too. An update is never
+  //   earlier than the record's creation.
+  //   A record that was there before keeps its creation date, and its update date moves only forward.
+  function settle(before, stated) {
+    const floor = earliest([...ls.issues.all().map((i) => i.created_at), ...ls.comments.all().map((c) => c.created_at), ...ls.cycles.all().map((c) => c.starts_at)]) ?? clock.anchor;
+    const issuesBy = (pred) => ls.issues.all().filter(pred);
+    const teamStart = (teamId) => earliest(issuesBy((i) => i.team_id === teamId).map((i) => i.created_at));
+    const once = (created) => ({ created, updated: created });
+    // Each kind's derived dates; null where the records around it hold nothing to derive one from.
+    const derive = {
+      users: (u) =>
+        once(earliest([...issuesBy((i) => i.creator_id === u.linear_id || i.assignee_id === u.linear_id).map((i) => i.created_at), ...ls.comments.findBy("user_id", u.linear_id).map((c) => c.created_at)])),
+      teams: (t) => once(teamStart(t.linear_id)),
+      workflowStates: (x) => once(teamStart(x.team_id)),
+      issueLabels: (x) => once(earliest(issuesBy((i) => i.label_ids.includes(x.linear_id)).map((i) => i.created_at))),
+      projects: (p) => {
+        const members = membersOf(p);
+        return {
+          created: earliest(members.map((i) => i.created_at)),
+          updated: latest([...members.map((i) => i.updated_at), ...members.flatMap((i) => ls.comments.findBy("issue_id", i.linear_id).map((c) => c.created_at))]),
+        };
+      },
+      cycles: (c) => ({ created: c.starts_at, updated: latest([c.starts_at, ...ls.issues.findBy("cycle_id", c.linear_id).map((i) => i.updated_at)]) }),
+    };
+    const date = (kind, rec, derived) => {
+      const prior = before.get(`${kind}:${rec.id}`);
+      if (prior) {
+        rec.created_at = prior.created_at;
+        rec.updated_at = latest([prior.updated_at, derived.updated]);
+        return;
+      }
+      const own = stated.get(rec) ?? {};
+      rec.created_at = own.created ?? derived.created ?? floor;
+      rec.updated_at = own.updated ?? latest([rec.created_at, derived.updated]);
+    };
+    for (const [kind, coll] of Object.entries(DATED)) if (kind !== "organizations") for (const rec of coll.all()) date(kind, rec, derive[kind](rec));
+    const first = earliest([...Object.entries(DATED).filter(([kind]) => kind !== "organizations").flatMap(([, coll]) => coll.all().map((rec) => rec.created_at)), floor]);
+    for (const rec of ls.organizations.all()) date("organizations", rec, once(first));
+  }
+
   function add(cfg) {
+    const before = new Map(Object.entries(DATED).flatMap(([kind, coll]) => coll.all().map((rec) => [`${kind}:${rec.id}`, { created_at: rec.created_at, updated_at: rec.updated_at }])));
     emulator.seedFromConfig(store, orgUrl, {
       organization: cfg.organization,
       users: cfg.users,
@@ -194,6 +257,29 @@ export function create(seed, clock) {
       if (ref && !rec) throw new Error(`linear ${what} not found: ${ref}`);
       return rec?.linear_id ?? null;
     };
+    // What the file states of the records this add created, which the emulator does not keep: their
+    // dates for the settle step, and a project's lead and planned dates.
+    const stated = new Map();
+    const isNew = (kind, rec) => rec && !before.has(`${kind}:${rec.id}`);
+    const state = (kind, rec, entry) => {
+      if (isNew(kind, rec)) stated.set(rec, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
+    };
+    if (cfg.organization) state("organizations", ls.organizations.all()[0], cfg.organization);
+    for (const u of cfg.users ?? []) state("users", ls.users.findOneBy("email", u.email), u);
+    for (const t of cfg.teams ?? []) state("teams", ls.teams.findOneBy("key", t.key), t);
+    for (const x of cfg.labels ?? []) {
+      const teamId = x.team ? emulator.resolveTeam(store, x.team)?.linear_id ?? null : null;
+      state("issueLabels", ls.issueLabels.all().find((l) => l.name === x.name && (l.team_id === teamId || l.team_id === null)), x);
+    }
+    for (const c of cfg.cycles ?? []) state("cycles", emulator.resolveCycle(store, c.name ?? String(c.number), emulator.resolveTeam(store, c.team)?.linear_id), c);
+    for (const p of cfg.projects ?? []) {
+      const rec = emulator.resolveProject(store, p.name);
+      if (!isNew("projects", rec)) continue;
+      state("projects", rec, p);
+      rec.lead_id = need("user", p.lead, emulator.resolveUser(store, p.lead));
+      rec.start_date = clock.date(p.start_date);
+      rec.target_date = clock.date(p.target_date);
+    }
     let issues = 0;
     for (const i of cfg.issues ?? []) {
       const team = emulator.resolveTeam(store, i.team);
@@ -263,8 +349,12 @@ export function create(seed, clock) {
       rec.created_at = rec.updated_at = clock.iso(c.created_at);
       comments++;
     }
+    settle(before, stated);
     return { linear_issues: issues, linear_comments: comments };
   }
+
+  // The share of issues in a completed state, which is what an issue's completed_at marks.
+  const completedShare = (items) => (items.length ? items.filter((i) => i.completed_at).length / items.length : 0);
 
   function root(me) {
     const by = (coll, id) => (id ? coll.findOneBy("linear_id", id) : undefined);
@@ -313,13 +403,24 @@ export function create(seed, clock) {
     };
     const fState = (x) => x && { id: x.linear_id, name: x.name, type: x.type, position: x.position, color: "#95a2b3", team: () => fTeam(by(ls.teams, x.team_id)), createdAt: x.created_at, updatedAt: x.updated_at };
     const fLabel = (x) => x && { id: x.linear_id, name: x.name, color: x.color, description: x.description, team: () => fTeam(by(ls.teams, x.team_id)), createdAt: x.created_at, updatedAt: x.updated_at };
-    const fCycle = (x) => x && { id: x.linear_id, number: x.number, name: x.name, startsAt: x.starts_at, endsAt: x.ends_at, createdAt: x.created_at, updatedAt: x.updated_at, team: () => fTeam(by(ls.teams, x.team_id)), issues: issuesOf((i) => i.cycle_id === x.linear_id) };
+    const fCycle = (x) => x && {
+      id: x.linear_id, number: x.number, name: x.name, startsAt: x.starts_at, endsAt: x.ends_at, createdAt: x.created_at, updatedAt: x.updated_at, team: () => fTeam(by(ls.teams, x.team_id)), issues: issuesOf((i) => i.cycle_id === x.linear_id),
+      progress: () => completedShare(ls.issues.findBy("cycle_id", x.linear_id)),
+    };
+    // A project's planned dates are the seed's when it states them, else its member issues': it
+    // starts when the first of them was started (when none was, when the project was created) and
+    // targets the last due date among them. It is completed when every member issue is, at the last
+    // one's update.
     const fProject = (x) => x && {
-      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at, startDate: null, targetDate: null,
-      progress: () => {
-        const mine = ls.issues.all().filter((i) => i.project_id === x.linear_id);
-        return mine.length ? mine.filter((i) => i.completed_at).length / mine.length : 0;
+      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at, canceledAt: null,
+      lead: () => fUser(by(ls.users, x.lead_id)),
+      startDate: () => x.start_date ?? (earliest(membersOf(x).map((i) => i.started_at)) ?? x.created_at).slice(0, 10),
+      targetDate: () => x.target_date ?? latest(membersOf(x).map((i) => i.due_date)),
+      completedAt: () => {
+        const members = membersOf(x);
+        return members.length && members.every((i) => i.completed_at) ? latest(members.map((i) => i.updated_at)) : null;
       },
+      progress: () => completedShare(membersOf(x)),
       teams: (a, _context, info) => {
         const wanted = where(a, info, teamView);
         return connection(ls.teams.all().filter((t) => ls.issues.all().some((i) => i.project_id === x.linear_id && i.team_id === t.linear_id) && wanted(t)), a, fTeam);
@@ -328,6 +429,7 @@ export function create(seed, clock) {
     };
     const fTeam = (t) => t && {
       id: t.linear_id, key: t.key, name: t.name, description: t.description, private: t.private, createdAt: t.created_at, updatedAt: t.updated_at,
+      issueCount: ({ includeArchived }) => ls.issues.findBy("team_id", t.linear_id).filter((i) => includeArchived || !i.archived_at).length,
       states: (a, _context, info) => connection(ls.workflowStates.findBy("team_id", t.linear_id).filter(where(a, info, stateView)).sort((x, y) => x.position - y.position), a, fState),
       members: (a, _context, info) => connection(ls.users.all().filter(where(a, info, userView)), a, fUser),
       labels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => !x.team_id || x.team_id === t.linear_id).filter(where(a, info, labelView)), a, fLabel),
@@ -367,7 +469,7 @@ export function create(seed, clock) {
       viewer: () => fUser(me),
       organization: () => {
         const o = ls.organizations.all()[0];
-        return { id: o.linear_id, name: o.name, urlKey: o.url_key, createdAt: o.created_at };
+        return { id: o.linear_id, name: o.name, urlKey: o.url_key, createdAt: o.created_at, updatedAt: o.updated_at };
       },
       teams: (a, _context, info) => connection(ls.teams.all().filter(where(a, info, teamView)), a, fTeam),
       team: ({ id }) => one("Team", emulator.resolveTeam(store, id), fTeam),
