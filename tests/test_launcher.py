@@ -1476,6 +1476,10 @@ def test_every_linear_answer_carries_linears_rate_limit_headers(external_service
         },
         headers={"Authorization": _LINEAR_TOKEN},
     )
+    by_default = _linear(
+        external_services,
+        "query Q($n: Int = 10) { viewer { createdIssues(first: $n) { nodes { id title createdAt } } } }",
+    )
 
     headers = answer.headers
     assert answer.status_code == 200
@@ -1498,8 +1502,10 @@ def test_every_linear_answer_carries_linears_rate_limit_headers(external_service
         default_page.headers["x-complexity"],
         ten.headers["x-complexity"],
         by_variable.headers["x-complexity"],
+        by_default.headers["x-complexity"],
     ] == [
         "66",
+        "14",
         "14",
         "14",
     ]

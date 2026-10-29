@@ -86,7 +86,9 @@ function complexityOf(body) {
   const op = getOperationAST(doc, body.operationName);
   if (!op) return 0;
   const fragments = new Map(doc.definitions.filter((d) => d.kind === "FragmentDefinition").map((d) => [d.name.value, d]));
-  const variables = body.variables ?? {};
+  // A variable the request leaves out runs with the default its operation declares.
+  const defaults = Object.fromEntries((op.variableDefinitions ?? []).filter((d) => d.defaultValue?.kind === "IntValue").map((d) => [d.variable.name.value, Number(d.defaultValue.value)]));
+  const variables = { ...defaults, ...(body.variables ?? {}) };
   const pageSize = (field) => {
     for (const arg of field.arguments ?? [])
       if (arg.name.value === "first" || arg.name.value === "last") {
