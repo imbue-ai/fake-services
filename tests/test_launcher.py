@@ -4,6 +4,7 @@ packages (`just minds-evals-external-services-install`)."""
 import json
 import time
 from collections.abc import Iterator
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
@@ -78,6 +79,11 @@ def _shifted_iso(stamp: str) -> str:
 
 def _shifted_seconds(ts: str) -> int:
     return int(ts.split(".")[0]) + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+
+
+def _shifted_date(day: str) -> str:
+    """A seed's calendar date as the launcher serves it under the test's shift."""
+    return (date.fromisoformat(day) + timedelta(seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS)).isoformat()
 
 
 # Every key under which a fake serves a record's date, and the instant each names in epoch seconds.
@@ -226,9 +232,9 @@ def test_timestamps_are_shifted_by_the_start_minus_the_anchor(external_services:
     ]
     assert history["messages"][1]["reply_count"] == 1
     assert issue.json()["data"]["issue"] == {
-        "createdAt": "2026-10-05T09:00:00.000Z",
-        "updatedAt": "2026-10-06T12:00:00.000Z",
-        "comments": {"nodes": [{"createdAt": "2026-10-06T12:00:00.000Z"}]},
+        "createdAt": _shifted_iso("2026-03-19T09:00:00.000Z"),
+        "updatedAt": _shifted_iso("2026-03-20T12:00:00.000Z"),
+        "comments": {"nodes": [{"createdAt": _shifted_iso("2026-03-20T12:00:00.000Z")}]},
     }
 
 
@@ -682,7 +688,7 @@ def test_an_update_lands_on_its_own_service_with_the_seeds_shift(external_servic
     issue = _linear(external_services, '{ issue(id: "ENG-3") { title createdAt labels { nodes { name } } } }')
     assert issue.json()["data"]["issue"] == {
         "title": "Invoice line alignment",
-        "createdAt": "2026-10-06T18:00:00.000Z",
+        "createdAt": _shifted_iso("2026-03-20T18:00:00.000Z"),
         "labels": {"nodes": [{"name": "billing"}]},
     }
 
@@ -1202,9 +1208,9 @@ def test_the_launcher_takes_each_way_of_naming_a_record_the_checks_accept(
     # An offset and a fraction are read as the instant they state, then shifted like any other.
     stamped = _linear(external_services, '{ issue(id: "ENG-15") { createdAt updatedAt dueDate } }')
     assert stamped.json()["data"]["issue"] == {
-        "createdAt": "2026-10-06T21:00:00.000Z",
-        "updatedAt": "2026-10-06T21:30:00.123Z",
-        "dueDate": "2026-10-13",
+        "createdAt": _shifted_iso("2026-03-20T21:00:00.000Z"),
+        "updatedAt": _shifted_iso("2026-03-20T21:30:00.123Z"),
+        "dueDate": _shifted_date("2026-03-27"),
     }
 
 
