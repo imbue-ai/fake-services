@@ -760,7 +760,7 @@ def test_the_control_endpoints_are_on_the_control_port_only(external_services: R
     after = _control(external_services, "health")["counts"]
     assert (after["slack"], after["linear"]) == (before["slack"], before["linear"])
     # Unlike a request to the control port, each of these reached a fake and is in its log.
-    assert after["requests"] == {"slack": 4, "linear": 3}
+    assert after["requests"] == {"slack": 4, "linear": 3, "google": 0}
 
 
 def test_a_directory_holding_one_seed_serves_that_service_alone(

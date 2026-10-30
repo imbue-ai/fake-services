@@ -13,7 +13,7 @@ import * as emulator from "@emulators/linear";
 import { GraphQLError, buildSchema, execute, getNamedType, getOperationAST, isAbstractType, isEnumType, isListType, isNonNullType, isScalarType, parse, validate, valueFromAST } from "graphql";
 
 export const name = "linear";
-export const host = "api.linear.app";
+export const hosts = new Set(["api.linear.app"]);
 // What an error answer points its reader at. Nothing a caller is sent names what is serving it.
 const DOCS = "https://linear.app/developers/graphql";
 
@@ -687,7 +687,7 @@ export function create(seed, clock) {
 
   return {
     name,
-    host,
+    hosts,
     store,
     tokenUsers,
     add,

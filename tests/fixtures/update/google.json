@@ -1,0 +1,27 @@
+{
+  "users": [
+    {
+      "email": "olivia.chen@redwood.example",
+      "name": "Olivia Chen"
+    }
+  ],
+  "labels": [
+    {
+      "mailbox": "morgan.reyes@redwood.example",
+      "name": "Finance"
+    }
+  ],
+  "messages": [
+    {
+      "key": "corrected-invoice",
+      "mailbox": "morgan.reyes@redwood.example",
+      "from": "Olivia Chen <olivia.chen@redwood.example>",
+      "to": "morgan.reyes@redwood.example",
+      "subject": "Re: March invoice question",
+      "date": "2026-03-20T15:30:00-07:00",
+      "body": "Finance confirmed: the corrected total is $1,880.",
+      "labels": ["Finance", "UNREAD"],
+      "in_reply_to": "invoice-followup"
+    }
+  ]
+}

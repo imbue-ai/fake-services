@@ -45,16 +45,18 @@ export function createAccessLog(path, services) {
       const requestPhase = phase;
       const bodyText = req.method === "GET" ? "" : await req.clone().text();
       // The shim names the host a request was for. A service's other hosts (file downloads, uploads)
-      // are not served, and a request for one is answered here rather than by the real host.
-      const host = (req.headers.get("x-forwarded-host") ?? service.host).toLowerCase();
-      const res = host === service.host ? await service.route(req, url) : service.notFound();
+      // are not served, and a request for one is answered here rather than by the real host. A
+      // request that names none is for the service's first host.
+      const host = (req.headers.get("x-forwarded-host") ?? [...service.hosts][0]).toLowerCase();
+      const served = service.hosts.has(host);
+      const res = served ? await service.route(req, url) : service.notFound();
       const text = await res.clone().text();
       let json = null;
       try {
         json = JSON.parse(text);
       } catch {}
       const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-      const unsupported = host === service.host ? service.unsupportedKeys(url, json, req) : [`${service.name}:host:${host}`];
+      const unsupported = served ? service.unsupportedKeys(url, json, req) : [`${service.name}:host:${host}`];
       const inPhase = phaseCounts(requestPhase);
       inPhase.requests[service.name] += 1;
       for (const key of unsupported) {

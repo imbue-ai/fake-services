@@ -8,8 +8,8 @@ import { Hono, Store, WebhookDispatcher, authMiddleware, cors, createApiErrorHan
 import { getSlackStore, seedFromConfig, slackPlugin } from "@emulators/slack";
 
 export const name = "slack";
-export const host = "slack.com";
-const REAL_URL = `https://${host}`;
+export const hosts = new Set(["slack.com"]);
+const REAL_URL = "https://slack.com";
 // What an error answer points its reader at. Nothing a caller is sent names what is serving it.
 const DOCS = "https://api.slack.com/methods";
 
@@ -306,7 +306,7 @@ export function create(seed, clock) {
 
   return {
     name,
-    host,
+    hosts,
     store,
     tokenUsers,
     add,

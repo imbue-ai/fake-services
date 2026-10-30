@@ -1,0 +1,88 @@
+{
+  "anchor": "2026-03-21T00:00:00Z",
+  "time_shift": "to_trial_start",
+  "tokens": [
+    {
+      "token": "ya29.fake-redwood-google-token-morgan",
+      "user": "morgan.reyes@redwood.example"
+    },
+    {
+      "token": "ya29.fake-redwood-google-token-thomas",
+      "user": "thomas.baird@redwood.example"
+    }
+  ],
+  "users": [
+    {
+      "email": "morgan.reyes@redwood.example",
+      "name": "Morgan Reyes"
+    },
+    {
+      "email": "thomas.baird@redwood.example",
+      "name": "Thomas Baird"
+    }
+  ],
+  "labels": [
+    {
+      "mailbox": "morgan.reyes@redwood.example",
+      "name": "Vendors"
+    }
+  ],
+  "messages": [
+    {
+      "key": "invoice-question",
+      "mailbox": "morgan.reyes@redwood.example",
+      "from": "Priya Shah <priya@northwind.example>",
+      "to": "morgan.reyes@redwood.example",
+      "cc": "thomas.baird@redwood.example",
+      "subject": "March invoice question",
+      "date": "2026-03-16T09:15:00-07:00",
+      "body": "Hi Morgan, invoice 4411 looks off by $120 against the order.",
+      "labels": ["Vendors", "IMPORTANT"],
+      "message_id": "<4411-question@northwind.example>"
+    },
+    {
+      "key": "invoice-reply",
+      "mailbox": "morgan.reyes@redwood.example",
+      "from": "Morgan Reyes <morgan.reyes@redwood.example>",
+      "to": "Priya Shah <priya@northwind.example>",
+      "subject": "Re: March invoice question",
+      "date": "2026-03-16T17:40:00+01:00",
+      "body": "Checking with finance and will get back to you.",
+      "body_html": "<p>Checking with <b>finance</b> and will get back to you.</p>",
+      "in_reply_to": "invoice-question"
+    },
+    {
+      "key": "invoice-followup",
+      "mailbox": "morgan.reyes@redwood.example",
+      "from": "Priya Shah <priya@northwind.example>",
+      "to": "morgan.reyes@redwood.example",
+      "subject": "Re: March invoice question",
+      "date": "2026-03-19T08:05:00-07:00",
+      "body": "Any update on the corrected invoice?",
+      "labels": ["Vendors", "UNREAD", "STARRED"],
+      "in_reply_to": "invoice-reply"
+    },
+    {
+      "key": "newsletter",
+      "mailbox": "morgan.reyes@redwood.example",
+      "from": "Inference Weekly <news@inference-weekly.example>",
+      "to": "morgan.reyes@redwood.example",
+      "subject": "This week in inference",
+      "date": "2026-03-12T06:00:00Z",
+      "body": "Ten papers on speculative decoding.",
+      "archived": true
+    },
+    {
+      "key": "thomas-invoice-copy",
+      "mailbox": "thomas.baird@redwood.example",
+      "from": "Priya Shah <priya@northwind.example>",
+      "to": "morgan.reyes@redwood.example",
+      "cc": "thomas.baird@redwood.example",
+      "subject": "March invoice question",
+      "date": "2026-03-16T09:15:00-07:00",
+      "body": "Hi Morgan, invoice 4411 looks off by $120 against the order.",
+      "labels": ["UNREAD"],
+      "message_id": "<4411-question@northwind.example>"
+    }
+  ]
+}

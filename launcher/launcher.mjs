@@ -1,21 +1,21 @@
-// External data services for a minds-evals trial: fake Slack and Linear, each served on a loopback port
-// of its own by one Node process in the eval box. The workspace reaches them through the latchkey
+// External data services for a minds-evals trial: fake Slack, Linear and Google, each served on a
+// loopback port of its own by one Node process in the eval box. The workspace reaches them through the latchkey
 // gateway, whose curl the driver points at these ports for the real hosts.
 //
-// A service is served when the seed directory holds its file (slack.json, linear.json). Each service
-// is a module beside this file (slack.mjs, linear.mjs) that exports:
+// A service is served when the seed directory holds its file (slack.json, linear.json, google.json).
+// Each service is a module beside this file (slack.mjs, linear.mjs, google.mjs) that exports:
 //   name              the service's name; its seed is <name>.json
-//   host              the API host the fake answers for: a request for any other host of the
-//                     service is answered as not found
+//   hosts             the Set of API hosts the fake answers for: a request for any other host routed
+//                     to the service is answered as not found
 //   create(seed, clock) -> {
-//     name, host      the module's own
+//     name, hosts     the module's own
 //     store          the @emulators/core Store its records live in; an update is applied inside a
 //                     snapshot of it, so one that fails leaves the store as it was
 //     tokenUsers      Map of each token the seed names to the user it belongs to
 //     add(records)    places a seed's or an update's records, throws on one it cannot place, dates
 //                     every record from the seed's own dates (never the box's clock), and returns
 //                     what it added
-//     route(req, url) answers a request for the API host
+//     route(req, url) answers a request for one of its API hosts
 //     notFound()      what a request for another host is answered with
 //     counts()        the record counts for health
 //     outcome(json)   what the access log says of an answer: {ok, error, result_count}
@@ -44,7 +44,7 @@
 //     fake does not support, and control endpoints on a port of their own
 //
 // env: SEED_DIR=<directory of <service>.json> CONTROL_PORT=<port> SLACK_PORT=<port> LINEAR_PORT=<port>
-//      (0 takes a free port) [ACCESS_LOG=<jsonl path>] [START_MS=<epoch ms; the process's own clock
+//      GOOGLE_PORT=<port> (0 takes a free port) [ACCESS_LOG=<jsonl path>] [START_MS=<epoch ms; the process's own clock
 //      when unset>] [RATE_LIMIT_WINDOW_SECONDS=<seconds every rate limit bucket's window lasts; each
 //      bucket's own when unset; for a test that waits a window out>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
@@ -67,11 +67,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serve } from "@emulators/core";
 import { createAccessLog } from "./access_log.mjs";
+import * as google from "./google.mjs";
 import * as linear from "./linear.mjs";
 import { createRateLimits } from "./rate_limits.mjs";
 import * as slack from "./slack.mjs";
 
-const MODULES = [slack, linear];
+const MODULES = [slack, linear, google];
 
 const env = process.env;
 function fail(message) {
