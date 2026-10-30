@@ -124,7 +124,8 @@ export const limits = {
 // The system labels a seed's message may carry besides the user labels of its mailbox. DRAFT is not
 // one: a draft is a record of its own, which a seed does not hold.
 const SEED_SYSTEM_LABELS = new Set(["INBOX", "SENT", "UNREAD", "STARRED", "IMPORTANT", "TRASH", "SPAM", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS"]);
-// Where historyIds start: a mailbox's history counts up from here in the order its messages are added.
+// Where historyIds start: one count for every mailbox, rising from here through each seed's or
+// update's messages in date order, after everything the fake already held.
 const HISTORY_BASE = 1000000n;
 const OFFSET = /(Z|([+-])(\d{2}):(\d{2}))$/;
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
