@@ -164,6 +164,13 @@ def _shifted_ms(stamp: str) -> int:
     return round((datetime.fromisoformat(stamp).timestamp() + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS) * 1000)
 
 
+def _shifted_date_header(stamp: str) -> str:
+    """A seed's date as a Date header serves it under the test's shift: in the offset the seed states,
+    with the day unpadded as Gmail writes it."""
+    moment = datetime.fromisoformat(stamp) + timedelta(seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS)
+    return "{:%a}, {} {:%b %Y %H:%M:%S %z}".format(moment, moment.day, moment)
+
+
 def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_services: RunningExternalServices) -> None:
     identity = _slack(external_services, "auth.test")
     channels = _slack(external_services, "conversations.list")["channels"]
@@ -1402,7 +1409,7 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     """The verification flows drive the agent's own app, whose requests look like any other: the
     phase the driver marks is what tells them from the ones the app made while the agent worked."""
     assert _control(external_services, "health")["phases"] == {
-        "agent": {"requests": {"slack": 0, "linear": 0}, "unsupported_calls": {}, "rate_limited": {}}
+        "agent": {"requests": {"slack": 0, "linear": 0, "google": 0}, "unsupported_calls": {}, "rate_limited": {}}
     }
     _slack(external_services, "auth.test")
     httpx2.get("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
@@ -1425,17 +1432,17 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     assert [line["phase"] for line in file_lines] == [line["phase"] for line in log_lines]
     health = _control(external_services, "health")
     # The totals keep their shape, and each phase's counts sit beside them.
-    assert health["counts"]["requests"] == {"slack": 4, "linear": 1}
+    assert health["counts"]["requests"] == {"slack": 4, "linear": 1, "google": 0}
     assert health["unsupported_calls"] == {"slack:admin.users.list": 2}
     assert health["phase"] == "verification"
     assert health["phases"] == {
         "agent": {
-            "requests": {"slack": 2, "linear": 0},
+            "requests": {"slack": 2, "linear": 0, "google": 0},
             "unsupported_calls": {"slack:admin.users.list": 1},
             "rate_limited": {},
         },
         "verification": {
-            "requests": {"slack": 2, "linear": 1},
+            "requests": {"slack": 2, "linear": 1, "google": 0},
             "unsupported_calls": {"slack:admin.users.list": 1},
             "rate_limited": {},
         },
@@ -1446,7 +1453,11 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     # A later step's conversation is the agent's again, and adds to the agent's counts.
     _mark_phase(external_services, {"name": "agent"})
     _slack(external_services, "auth.test")
-    assert _control(external_services, "health")["phases"]["agent"]["requests"] == {"slack": 3, "linear": 0}
+    assert _control(external_services, "health")["phases"]["agent"]["requests"] == {
+        "slack": 3,
+        "linear": 0,
+        "google": 0,
+    }
     assert _control(external_services, "log")[-1]["phase"] == "agent"
 
 
@@ -1471,7 +1482,7 @@ def test_a_phase_named_like_an_object_key_is_counted_like_any_other(
     assert answered["ok"] is True
     phases = _control(external_services, "health")["phases"]
     assert phases["constructor"] == {
-        "requests": {"slack": 1, "linear": 0},
+        "requests": {"slack": 1, "linear": 0, "google": 0},
         "unsupported_calls": {},
         "rate_limited": {},
     }
@@ -1855,8 +1866,8 @@ def test_a_gmail_message_keeps_its_seeds_date_and_offset_shifted_to_the_trial(
     reply = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="metadata")
 
     # 200 days after 2026-03-16, in the offset each sender's clock kept.
-    assert _headers(question)["Date"] == "Fri, 2 Oct 2026 09:15:00 -0700"
-    assert _headers(reply)["Date"] == "Fri, 2 Oct 2026 17:40:00 +0100"
+    assert _headers(question)["Date"] == _shifted_date_header("2026-03-16T09:15:00-07:00")
+    assert _headers(reply)["Date"] == _shifted_date_header("2026-03-16T17:40:00+01:00")
     assert question["internalDate"] == str(_shifted_ms("2026-03-16T09:15:00-07:00"))
     assert reply["internalDate"] == str(_shifted_ms("2026-03-16T17:40:00+01:00"))
     for message in (question, reply):
@@ -1898,7 +1909,10 @@ def test_a_gmail_thread_holds_its_replies_with_their_headers_and_derived_labels(
     assert [part["mimeType"] for part in messages[1]["payload"]["parts"]] == ["text/plain", "text/html"]
     decoded = base64.urlsafe_b64decode(raw["raw"] + "==").decode()
     parsed = email.message_from_string(decoded)
-    assert (parsed["Date"], parsed.get_content_type()) == ("Fri, 2 Oct 2026 17:40:00 +0100", "multipart/alternative")
+    assert (parsed["Date"], parsed.get_content_type()) == (
+        _shifted_date_header("2026-03-16T17:40:00+01:00"),
+        "multipart/alternative",
+    )
     assert [part.get_payload() for part in parsed.walk() if not part.is_multipart()] == [
         "Checking with finance and will get back to you.",
         "<p>Checking with <b>finance</b> and will get back to you.</p>",
@@ -2026,7 +2040,11 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
     assert _listed_ids(external_services, q="label:Vendors is:unread") == [followup]
     assert _listed_ids(external_services, q='"corrected invoice"') == [followup]
     # A date is midnight Pacific time, as Gmail reads it, and newer_than counts from the trial's present.
-    assert _listed_ids(external_services, q="after:2026/10/02 before:2026/10/03") == [reply, question]
+    day = _shifted_date("2026-03-16")
+    next_day = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    assert _listed_ids(
+        external_services, q="after:{} before:{}".format(day.replace("-", "/"), next_day.replace("-", "/"))
+    ) == [reply, question]
     assert _listed_ids(external_services, q="newer_than:3d") == [followup]
     assert _listed_ids(external_services, "threads") == [question, newsletter]
     # Gmail leaves an empty list out, and refuses a malformed page token.
