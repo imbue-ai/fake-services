@@ -977,6 +977,18 @@ def test_a_phase_mark_that_names_no_identifier_is_refused_and_changes_nothing(
     assert list(_control(external_services, "health")["phases"]) == ["agent"]
 
 
+def test_a_phase_named_like_an_object_key_is_counted_like_any_other(
+    external_services: RunningExternalServices,
+) -> None:
+    marked = _mark_phase(external_services, {"name": "constructor"})
+    answered = _slack(external_services, "auth.test")
+
+    assert marked.status_code == 200
+    assert answered["ok"] is True
+    phases = _control(external_services, "health")["phases"]
+    assert phases["constructor"] == {"requests": {"slack": 1, "linear": 0}, "unsupported_calls": {}}
+
+
 def test_the_state_dump_redacts_every_token(external_services: RunningExternalServices) -> None:
     dump_text = httpx2.get("{}/_control/state".format(external_services.control_url)).text
     dump = json.loads(dump_text)

@@ -18,8 +18,9 @@ export function createAccessLog(path, services) {
   const unsupportedCalls = {};
   let phase = "agent";
   // Per phase, in the order the phases were first marked: its requests by service, and its calls the
-  // fakes do not support by what was asked.
-  const phases = {};
+  // fakes do not support by what was asked. Without a prototype, so a phase named like one of
+  // Object's own keys ("constructor") gets counts of its own.
+  const phases = Object.create(null);
   const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {} });
   phaseCounts(phase);
   function setPhase(name) {
