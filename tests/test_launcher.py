@@ -2,11 +2,16 @@
 packages (`just minds-evals-external-services-install`)."""
 
 import json
+import time
+from collections.abc import Iterator
+from datetime import datetime
+from datetime import timedelta
 from typing import Any
 
 import httpx2
 import pytest
 
+from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
 from imbue.minds_evals.conftest import RunningExternalServices
 from imbue.minds_evals.errors import TaskAuthoringError
@@ -19,6 +24,7 @@ from imbue.minds_evals.testing import EXTERNAL_SERVICES_SEED_FIXTURE
 from imbue.minds_evals.testing import EXTERNAL_SERVICES_UPDATE_FIXTURE
 from imbue.minds_evals.testing import external_services_document
 from imbue.minds_evals.testing import external_services_fixture_text
+from imbue.mngr.utils.polling import wait_for
 
 _SLACK_TOKEN = "xoxb-fake-redwood-slack-token"
 _LINEAR_TOKEN = "lin_api_fakeredwoodlineartoken"
@@ -29,10 +35,14 @@ def _slack(services: RunningExternalServices, method: str, **params: str) -> dic
     return httpx2.get("{}/api/{}".format(services.slack_url, method), params=params, headers=_SLACK_HEADERS).json()
 
 
-def _linear(services: RunningExternalServices, query: str, token: str = _LINEAR_TOKEN) -> httpx2.Response:
-    return httpx2.post(
-        "{}/graphql".format(services.linear_url), json={"query": query}, headers={"Authorization": token}
-    )
+def _linear(
+    services: RunningExternalServices,
+    query: str,
+    token: str = _LINEAR_TOKEN,
+    variables: dict[str, Any] | None = None,
+) -> httpx2.Response:
+    body: dict[str, Any] = {"query": query} if variables is None else {"query": query, "variables": variables}
+    return httpx2.post("{}/graphql".format(services.linear_url), json=body, headers={"Authorization": token})
 
 
 def _control(services: RunningExternalServices, route: str) -> Any:
@@ -49,13 +59,65 @@ def _issue_titles(services: RunningExternalServices) -> dict[str, str]:
 
 
 def _channel_id(services: RunningExternalServices, name: str) -> str:
-    channels = _slack(services, "conversations.list")["channels"]
+    channels = _slack(services, "conversations.list", types="public_channel,private_channel")["channels"]
     return next(channel["id"] for channel in channels if channel["name"] == name)
 
 
 def _shifted(ts: str) -> str:
     seconds, fraction = ts.split(".")
     return "{}.{}".format(int(seconds) + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS, fraction)
+
+
+def _shifted_iso(stamp: str) -> str:
+    """A seed's timestamp as the launcher serves it under the test's shift."""
+    moved = datetime.fromisoformat(stamp.replace("Z", "+00:00")) + timedelta(
+        seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+    )
+    return moved.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _shifted_seconds(ts: str) -> int:
+    return int(ts.split(".")[0]) + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+
+
+# Every key under which a fake serves a record's date, and the instant each names in epoch seconds.
+_DATE_KEYS = ("createdAt", "updatedAt", "completedAt", "startDate", "targetDate", "created", "updated", "last_set")
+
+
+def _served_dates(answer: Any) -> Iterator[float]:
+    if isinstance(answer, dict):
+        for key, value in answer.items():
+            if key in _DATE_KEYS and isinstance(value, str):
+                yield datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            elif key in _DATE_KEYS and isinstance(value, int):
+                yield float(value)
+            else:
+                yield from _served_dates(value)
+    elif isinstance(answer, list):
+        for item in answer:
+            yield from _served_dates(item)
+    else:
+        # A value outside a date key is no date, and holds none.
+        return
+
+
+def _assert_no_date_is_near_the_wall_clock(*answers: Any) -> None:
+    dates = [stamp for answer in answers for stamp in _served_dates(answer)]
+    assert dates
+    for stamp in dates:
+        assert abs(stamp - time.time()) > 24 * 60 * 60, datetime.fromtimestamp(stamp).isoformat()
+
+
+_LINEAR_DATES_QUERY = (
+    "{ organization { createdAt updatedAt } users { nodes { email createdAt updatedAt } } "
+    "teams { nodes { key createdAt updatedAt states { nodes { name createdAt updatedAt } } } } "
+    "issueLabels { nodes { name createdAt updatedAt } } projects { nodes { name createdAt updatedAt } } "
+    "cycles { nodes { name createdAt updatedAt } } }"
+)
+
+
+def _by(nodes: list[dict[str, Any]], key: str) -> dict[str, tuple[str, str]]:
+    return {node[key]: (node["createdAt"], node["updatedAt"]) for node in nodes}
 
 
 def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_services: RunningExternalServices) -> None:
@@ -72,8 +134,9 @@ def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_serv
         "Redwood Inference",
     )
     assert identity["url"] == "https://redwood.slack.com/"
+    # The token's user posted in eng-oncall and never in announcements.
     assert {channel["name"]: channel["is_member"] for channel in channels} == {
-        "announcements": True,
+        "announcements": False,
         "eng-oncall": True,
     }
     assert next(channel["id"] for channel in channels if channel["name"] == "announcements") == "C0Z2IPZAXKN"
@@ -95,14 +158,56 @@ def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_serv
         assert "emulate" not in json.dumps(answer).lower()
 
 
-def test_every_seeded_user_is_a_member_of_every_public_channel(external_services: RunningExternalServices) -> None:
-    channel_id = _channel_id(external_services, "eng-oncall")
+def _user_ids(services: RunningExternalServices) -> dict[str, str]:
+    return {member["name"]: member["id"] for member in _slack(services, "users.list")["members"]}
 
-    members = _slack(external_services, "conversations.members", channel=channel_id)["members"]
 
-    user_ids = {member["id"] for member in _slack(external_services, "users.list")["members"]}
-    assert len(user_ids) == 3
-    assert set(members) == user_ids
+def _members(services: RunningExternalServices, channel_name: str) -> set[str]:
+    by_id = {user_id: name for name, user_id in _user_ids(services).items()}
+    answer = _slack(services, "conversations.members", channel=_channel_id(services, channel_name))
+    return {by_id[user_id] for user_id in answer["members"]}
+
+
+def test_a_channels_members_are_the_users_who_posted_in_it_and_those_it_names(
+    external_services: RunningExternalServices,
+) -> None:
+    seeded = {name: _members(external_services, name) for name in ("announcements", "eng-oncall")}
+    added = _add(
+        external_services,
+        "slack",
+        json.dumps(
+            {
+                "users": [{"name": "olivia_chen", "real_name": "Olivia Chen"}],
+                "channels": [
+                    {"name": "leads", "is_private": True, "members": ["claire"]},
+                    {"name": "quiet", "members": ["pagerbot"]},
+                ],
+                "messages": [
+                    {"channel": "eng-oncall", "user": "olivia_chen", "ts": "1774050000.000000", "text": "Drafted."},
+                    {"channel": "leads", "user": "morgan.reyes", "ts": "1774060000.000000", "text": "Sync?"},
+                ],
+            }
+        ),
+    )
+
+    assert added.status_code == 200, added.text
+    assert seeded == {"announcements": {"claire"}, "eng-oncall": {"pagerbot", "claire", "morgan.reyes"}}
+    assert _members(external_services, "eng-oncall") == {"pagerbot", "claire", "morgan.reyes", "olivia_chen"}
+    assert _members(external_services, "leads") == {"claire", "morgan.reyes"}
+    assert _members(external_services, "quiet") == {"pagerbot"}
+    user_ids = _user_ids(external_services)
+    channels = {channel["name"]: channel for channel in _slack(external_services, "conversations.list")["channels"]}
+    assert {name: (channel["creator"], channel["num_members"]) for name, channel in channels.items()} == {
+        "announcements": (user_ids["claire"], 1),
+        "eng-oncall": (user_ids["pagerbot"], 4),
+        "quiet": (user_ids["pagerbot"], 1),
+    }
+    # A public channel reads the same to a token whose user never posted in it, as with a Slack user
+    # token; the private channel is listed only to its members.
+    history = _slack(external_services, "conversations.history", channel=channels["announcements"]["id"])
+    assert [message["user"] for message in history["messages"]] == [user_ids["claire"]]
+    private = _slack(external_services, "conversations.list", types="private_channel")["channels"]
+    assert [channel["name"] for channel in private] == ["leads"]
 
 
 def test_timestamps_are_shifted_by_the_start_minus_the_anchor(external_services: RunningExternalServices) -> None:
@@ -125,6 +230,308 @@ def test_timestamps_are_shifted_by_the_start_minus_the_anchor(external_services:
         "updatedAt": "2026-10-06T12:00:00.000Z",
         "comments": {"nodes": [{"createdAt": "2026-10-06T12:00:00.000Z"}]},
     }
+
+
+def test_every_linear_date_is_the_seeds_or_derived_from_its_records(
+    external_services: RunningExternalServices,
+) -> None:
+    """Only issues and comments state their dates in the fixture seed, besides Morgan's creation: a
+    project, cycle, user, label, team and state is dated from the issues and comments around it, and
+    the organization from the earliest record of all. Morgan was last updated by the first issue
+    they created."""
+    data = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    first_issue = _shifted_iso("2026-03-02T09:00:00.000Z")
+    assert data["organization"] == {"createdAt": _shifted_iso("2026-01-05T09:00:00.000Z")} | {
+        "updatedAt": _shifted_iso("2026-01-05T09:00:00.000Z")
+    }
+    assert _by(data["users"]["nodes"], "email") == {
+        "morgan.reyes@redwood.example": (_shifted_iso("2026-01-05T09:00:00.000Z"), first_issue),
+        "thomas.baird@redwood.example": (first_issue, first_issue),
+    }
+    (team,) = data["teams"]["nodes"]
+    assert (team["createdAt"], team["updatedAt"]) == (first_issue, first_issue)
+    assert set(_by(team["states"]["nodes"], "name").values()) == {(first_issue, first_issue)}
+    assert _by(data["issueLabels"]["nodes"], "name") == {"telemetry": (first_issue, first_issue)}
+    # The project's latest record is ENG-2's update and its comment; the cycle's is ENG-1's update.
+    assert _by(data["projects"]["nodes"], "name") == {
+        "Usage insights": (first_issue, _shifted_iso("2026-03-20T12:00:00.000Z"))
+    }
+    assert _by(data["cycles"]["nodes"], "name") == {
+        "2026-W11": (_shifted_iso("2026-03-09T00:00:00.000Z"), _shifted_iso("2026-03-12T17:00:00.000Z"))
+    }
+    _assert_no_date_is_near_the_wall_clock(data)
+
+
+def test_an_update_moves_a_linear_records_update_forward_and_never_its_creation_back(
+    external_services: RunningExternalServices,
+) -> None:
+    before = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "labels": [{"name": "billing", "created_at": "2025-12-01T10:00:00.000Z"}],
+                "issues": [
+                    {
+                        "identifier": "ENG-30",
+                        "team": "ENG",
+                        "title": "Backdated import",
+                        "state": "In Progress",
+                        "assignee": "Thomas Baird",
+                        "project": "Usage insights",
+                        "cycle": "2026-W11",
+                        "created_at": "2026-02-01T09:00:00.000Z",
+                        "updated_at": "2026-03-20T23:00:00.000Z",
+                    }
+                ],
+            }
+        ),
+    )
+    after = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    assert added.status_code == 200, added.text
+    # The new issue is older than everything the project, the cycle, Thomas and the team were dated
+    # from, and newer than their updates: each keeps its creation and moves its update forward.
+    newest = _shifted_iso("2026-03-20T23:00:00.000Z")
+    assert _by(after["projects"]["nodes"], "name")["Usage insights"] == (
+        _by(before["projects"]["nodes"], "name")["Usage insights"][0],
+        newest,
+    )
+    assert _by(after["cycles"]["nodes"], "name")["2026-W11"] == (
+        _by(before["cycles"]["nodes"], "name")["2026-W11"][0],
+        newest,
+    )
+    assert _by(after["users"]["nodes"], "email") == _by(before["users"]["nodes"], "email")
+    assert (after["teams"]["nodes"][0]["createdAt"], after["organization"]) == (
+        before["teams"]["nodes"][0]["createdAt"],
+        before["organization"],
+    )
+    # A record the update adds takes the date its file states.
+    assert _by(after["issueLabels"]["nodes"], "name")["billing"] == (_shifted_iso("2025-12-01T10:00:00.000Z"),) * 2
+    _assert_no_date_is_near_the_wall_clock(after)
+
+
+def test_a_record_an_update_adds_takes_the_dates_its_file_states(
+    external_services: RunningExternalServices,
+) -> None:
+    """A team keeps its stated dates though placing an issue on it advances its issue sequence, and a
+    stated last update earlier than the creation is served as the creation."""
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "teams": [
+                    {
+                        "key": "OPS",
+                        "name": "Operations",
+                        "states": [{"name": "Todo", "type": "unstarted", "position": 1}],
+                        "created_at": "2025-11-03T09:00:00.000Z",
+                        "updated_at": "2026-02-14T09:00:00.000Z",
+                    }
+                ],
+                "labels": [
+                    {
+                        "name": "billing",
+                        "created_at": "2025-12-01T10:00:00.000Z",
+                        "updated_at": "2025-11-01T10:00:00.000Z",
+                    }
+                ],
+                "issues": [
+                    {
+                        "identifier": "OPS-7",
+                        "team": "OPS",
+                        "title": "Rotate the pager",
+                        "state": "Todo",
+                        "created_at": "2026-03-10T09:00:00.000Z",
+                    }
+                ],
+            }
+        ),
+    )
+    data = _linear(external_services, _LINEAR_DATES_QUERY).json()["data"]
+
+    assert added.status_code == 200, added.text
+    assert _by(data["teams"]["nodes"], "key")["OPS"] == (
+        _shifted_iso("2025-11-03T09:00:00.000Z"),
+        _shifted_iso("2026-02-14T09:00:00.000Z"),
+    )
+    assert _by(data["issueLabels"]["nodes"], "name")["billing"] == (_shifted_iso("2025-12-01T10:00:00.000Z"),) * 2
+
+
+def test_a_project_serves_its_lead_and_dates_from_the_seed_or_its_issues(
+    external_services: RunningExternalServices,
+) -> None:
+    added = _add(
+        external_services,
+        "linear",
+        json.dumps(
+            {
+                "projects": [
+                    {
+                        "name": "Billing cleanup",
+                        "state": "completed",
+                        "description": "Invoices without drift.",
+                        "lead": "thomas.baird@redwood.example",
+                        "start_date": "2026-03-01",
+                        "target_date": "2026-03-31",
+                        "created_at": "2026-02-20T09:00:00.000Z",
+                    },
+                    {"name": "Legacy exports", "state": "canceled", "created_at": "2026-01-12T09:00:00.000Z"},
+                    {"name": "Usage alerts", "state": "started", "created_at": "2026-02-25T09:00:00.000Z"},
+                ],
+                "issues": [
+                    {
+                        "identifier": "ENG-42",
+                        "team": "ENG",
+                        "title": "Alert on quota",
+                        "state": "Done",
+                        "project": "Usage alerts",
+                        "created_at": "2026-03-05T09:00:00.000Z",
+                        "updated_at": "2026-03-06T15:00:00.000Z",
+                    },
+                    {
+                        "identifier": "ENG-40",
+                        "team": "ENG",
+                        "title": "Round line totals",
+                        "state": "Done",
+                        "project": "Billing cleanup",
+                        "created_at": "2026-03-03T09:00:00.000Z",
+                        "updated_at": "2026-03-18T15:00:00.000Z",
+                    },
+                    {
+                        "identifier": "ENG-41",
+                        "team": "ENG",
+                        "title": "Drop the legacy rounding",
+                        "state": "Done",
+                        "project": "Billing cleanup",
+                        "created_at": "2026-03-04T09:00:00.000Z",
+                        "updated_at": "2026-03-19T15:00:00.000Z",
+                    },
+                ],
+            }
+        ),
+    )
+    answer = _linear(
+        external_services,
+        "{ projects { nodes { name description state lead { name } startDate targetDate completedAt canceledAt "
+        "createdAt updatedAt progress } } "
+        'team(id: "ENG") { issueCount cycles { nodes { name progress } } } }',
+    )
+
+    assert added.status_code == 200, added.text
+    assert answer.status_code == 200 and "errors" not in answer.json(), answer.text
+    data = answer.json()["data"]
+    projects = {project.pop("name"): project for project in data["projects"]["nodes"]}
+    # The seed's project states none of these: its dates are its issues', it has no lead, and one of
+    # its two issues is still in progress.
+    assert projects["Usage insights"] == {
+        "description": "",
+        "state": "started",
+        "lead": None,
+        "startDate": _shifted_iso("2026-03-02T09:00:00.000Z")[:10],
+        "targetDate": _shifted_iso("2026-03-13T00:00:00.000Z")[:10],
+        "completedAt": None,
+        "canceledAt": None,
+        "createdAt": _shifted_iso("2026-03-02T09:00:00.000Z"),
+        "updatedAt": _shifted_iso("2026-03-20T12:00:00.000Z"),
+        "progress": 0.5,
+    }
+    assert projects["Billing cleanup"] == {
+        "description": "Invoices without drift.",
+        "state": "completed",
+        "lead": {"name": "Thomas Baird"},
+        "startDate": _shifted_iso("2026-03-01T00:00:00.000Z")[:10],
+        "targetDate": _shifted_iso("2026-03-31T00:00:00.000Z")[:10],
+        "completedAt": _shifted_iso("2026-03-19T15:00:00.000Z"),
+        "canceledAt": None,
+        "createdAt": _shifted_iso("2026-02-20T09:00:00.000Z"),
+        "updatedAt": _shifted_iso("2026-03-19T15:00:00.000Z"),
+        "progress": 1,
+    }
+    # A project has a completedAt or canceledAt only in that state, whatever its issues are.
+    assert (projects["Usage alerts"]["completedAt"], projects["Usage alerts"]["canceledAt"]) == (None, None)
+    assert (projects["Legacy exports"]["completedAt"], projects["Legacy exports"]["canceledAt"]) == (
+        None,
+        projects["Legacy exports"]["updatedAt"],
+    )
+    assert projects["Legacy exports"]["updatedAt"] == _shifted_iso("2026-01-12T09:00:00.000Z")
+    assert data["team"] == {"issueCount": 5, "cycles": {"nodes": [{"name": "2026-W11", "progress": 1}]}}
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_every_slack_date_is_the_seeds_or_derived_from_its_messages(
+    external_services: RunningExternalServices,
+) -> None:
+    added = _add(
+        external_services,
+        "slack",
+        json.dumps(
+            {
+                "users": [
+                    {"name": "olivia_chen", "real_name": "Olivia Chen"},
+                    {"name": "sam", "real_name": "Sam Ito", "created": "2026-02-10T08:00:00.000Z"},
+                ],
+                "channels": [
+                    {"name": "planning", "created": "2026-02-02T09:30:00.000Z"},
+                    {"name": "quiet", "members": ["sam"]},
+                ],
+                "messages": [
+                    {"channel": "planning", "user": "olivia_chen", "ts": "1774050000.000000", "text": "Q2 draft."},
+                ],
+            }
+        ),
+    )
+    channels = {
+        channel["name"]: channel
+        for channel in _slack(external_services, "conversations.list", types="public_channel,private_channel")[
+            "channels"
+        ]
+    }
+    users = {member["name"]: member for member in _slack(external_services, "users.list")["members"]}
+
+    assert added.status_code == 200, added.text
+    # A channel is created at its first message unless its file says otherwise, and one with no
+    # message at the earliest message of all; its topic and purpose were set when it was created.
+    planning_created = int(datetime.fromisoformat("2026-02-02T09:30:00+00:00").timestamp())
+    expected_created = {
+        "announcements": _shifted_seconds("1769123456.000000"),
+        "eng-oncall": _shifted_seconds("1773900000.000000"),
+        "planning": planning_created + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS,
+        "quiet": _shifted_seconds("1769123456.000000"),
+    }
+    assert {name: channel["created"] for name, channel in channels.items()} == expected_created
+    assert {name: channel["topic"]["last_set"] for name, channel in channels.items()} == expected_created
+    assert {name: channel["purpose"]["last_set"] for name, channel in channels.items()} == expected_created
+    # A user was last updated at their first message unless their file says otherwise, and one
+    # without a message at the earliest message of all.
+    sam_created = int(datetime.fromisoformat("2026-02-10T08:00:00+00:00").timestamp())
+    assert {name: user["updated"] for name, user in users.items()} == {
+        "claire": _shifted_seconds("1769123456.000000"),
+        "pagerbot": _shifted_seconds("1773900000.000000"),
+        "morgan.reyes": _shifted_seconds("1774000000.000000"),
+        "olivia_chen": _shifted_seconds("1774050000.000000"),
+        "sam": sam_created + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS,
+    }
+    info = _slack(external_services, "users.info", user=users["claire"]["id"])
+    assert info["user"]["updated"] == _shifted_seconds("1769123456.000000")
+    _assert_no_date_is_near_the_wall_clock(channels, users)
+
+
+def test_a_shift_to_the_trials_start_is_a_whole_number_of_days(
+    external_services_started_mid_day: RunningExternalServices,
+) -> None:
+    """The launcher is told it started part of a day past a whole number of days after the anchor,
+    and drops that part, so every timestamp keeps its weekday and its time of day."""
+    services = external_services_started_mid_day
+    issue = _linear(services, '{ issue(id: "ENG-2") { createdAt } }')
+    history = _slack(services, "conversations.history", channel=_channel_id(services, "eng-oncall"))
+
+    assert _control(services, "health")["shift_ms"] == EXTERNAL_SERVICES_TEST_SHIFT_SECONDS * 1000
+    assert issue.json()["data"]["issue"]["createdAt"] == _shifted_iso("2026-03-19T09:00:00.000Z")
+    assert history["messages"][0]["ts"] == _shifted("1774000000.000000")
 
 
 def test_history_takes_oldest_and_latest(external_services: RunningExternalServices) -> None:
@@ -373,7 +780,7 @@ def test_a_directory_holding_one_seed_serves_that_service_alone(
     assert _slack(slack_only_external_services, "auth.test")["user"] == "morgan.reyes"
 
 
-def test_a_seed_that_asks_for_no_time_shift_is_served_as_written(
+def test_a_seed_that_leaves_the_time_shift_out_is_served_as_written(
     slack_only_external_services: RunningExternalServices,
 ) -> None:
     added = _add(
@@ -829,6 +1236,8 @@ _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "17740600
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "channel": "no-such-channel"}]}),
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "user": "nobody"}]}),
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "thread_ts": "1.000000"}]}),
+        ("slack", {"channels": [{"name": "leads", "is_private": True, "members": ["nobody"]}]}),
+        ("linear", {"projects": [{"name": "Billing cleanup", "lead": "Nobody Here"}]}),
         # A user or a cycle listed again under what the fake already keeps one by is not added, so
         # the name or number only the second entry gives is no record's to refer to.
         (
@@ -899,7 +1308,7 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
     assert _SLACK_TOKEN not in log_text and _LINEAR_TOKEN not in log_text
     assert " ".join(slack_line) == (
         "ts seq phase service method url body content_type token_user token_sha256_8 user_agent caller "
-        "status ok error unsupported result_count response_bytes duration_ms"
+        "status ok error unsupported rate_limited result_count response_bytes duration_ms"
     )
     assert slack_line["url"] == "https://slack.com/api/conversations.list?limit=1&token=[redacted]"
     assert (slack_line["seq"], slack_line["service"], slack_line["method"]) == (1, "slack", "GET")
@@ -910,6 +1319,7 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
     )
     assert (slack_line["status"], slack_line["ok"], slack_line["result_count"]) == (200, True, 1)
     assert slack_line["response_bytes"] > 0
+    assert (slack_line["rate_limited"], linear_line["rate_limited"]) == (None, None)
     assert (linear_line["url"], linear_line["result_count"]) == ("https://api.linear.app/graphql", 1)
     assert json.loads(linear_line["body"]) == {"query": "{ teams { nodes { key } } }"}
     assert (refused_line["status"], refused_line["ok"], refused_line["token_user"]) == (401, False, None)
@@ -926,7 +1336,7 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     """The verification flows drive the agent's own app, whose requests look like any other: the
     phase the driver marks is what tells them from the ones the app made while the agent worked."""
     assert _control(external_services, "health")["phases"] == {
-        "agent": {"requests": {"slack": 0, "linear": 0}, "unsupported_calls": {}}
+        "agent": {"requests": {"slack": 0, "linear": 0}, "unsupported_calls": {}, "rate_limited": {}}
     }
     _slack(external_services, "auth.test")
     httpx2.get("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
@@ -953,8 +1363,16 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     assert health["unsupported_calls"] == {"slack:admin.users.list": 2}
     assert health["phase"] == "verification"
     assert health["phases"] == {
-        "agent": {"requests": {"slack": 2, "linear": 0}, "unsupported_calls": {"slack:admin.users.list": 1}},
-        "verification": {"requests": {"slack": 2, "linear": 1}, "unsupported_calls": {"slack:admin.users.list": 1}},
+        "agent": {
+            "requests": {"slack": 2, "linear": 0},
+            "unsupported_calls": {"slack:admin.users.list": 1},
+            "rate_limited": {},
+        },
+        "verification": {
+            "requests": {"slack": 2, "linear": 1},
+            "unsupported_calls": {"slack:admin.users.list": 1},
+            "rate_limited": {},
+        },
     }
     state = _control(external_services, "state")
     assert (state["phase"], state["phases"]) == (health["phase"], health["phases"])
@@ -986,7 +1404,11 @@ def test_a_phase_named_like_an_object_key_is_counted_like_any_other(
     assert marked.status_code == 200
     assert answered["ok"] is True
     phases = _control(external_services, "health")["phases"]
-    assert phases["constructor"] == {"requests": {"slack": 1, "linear": 0}, "unsupported_calls": {}}
+    assert phases["constructor"] == {
+        "requests": {"slack": 1, "linear": 0},
+        "unsupported_calls": {},
+        "rate_limited": {},
+    }
 
 
 def test_the_state_dump_redacts_every_token(external_services: RunningExternalServices) -> None:
@@ -1041,3 +1463,265 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
     assert refused["message"] == 'Field "slaStatus" is not defined by type "IssueFilter".'
     assert refused["extensions"]["code"] == "GRAPHQL_VALIDATION_FAILED"
     assert "html" not in answers[7].headers["content-type"]
+
+
+# What a burst of requests is sent through: one connection, so the burst is as quick as the fake.
+def _slack_burst(services: RunningExternalServices, method: str, count: int, **params: str) -> list[httpx2.Response]:
+    with httpx2.Client(headers=_SLACK_HEADERS) as client:
+        return [client.get("{}/api/{}".format(services.slack_url, method), params=params) for _ in range(count)]
+
+
+def _replies_params(services: RunningExternalServices) -> dict[str, str]:
+    return {"channel": _channel_id(services, "eng-oncall"), "ts": _shifted("1773900000.000000")}
+
+
+# Tier 3, 50 a minute, and the burst allowance of a fifth more.
+_TIER_3_LIMIT = 60
+
+
+def test_a_burst_past_a_slack_methods_tier_is_refused_as_slack_refuses_it(
+    external_services: RunningExternalServices,
+) -> None:
+    burst = _slack_burst(
+        external_services, "conversations.replies", _TIER_3_LIMIT + 2, **_replies_params(external_services)
+    )
+    history = _slack(external_services, "conversations.history", channel=_channel_id(external_services, "eng-oncall"))
+
+    assert [answer.json()["ok"] for answer in burst[:_TIER_3_LIMIT]] == [True] * _TIER_3_LIMIT
+    for refused in burst[_TIER_3_LIMIT:]:
+        assert refused.status_code == 429
+        assert refused.json() == {"ok": False, "error": "ratelimited"}
+        assert 1 <= int(refused.headers["retry-after"]) <= 60
+    assert "retry-after" not in burst[0].headers
+    # Slack limits each method on its own: the methods around the burst still answer.
+    assert history["ok"] is True
+    expected = {"slack:conversations.replies": 2}
+    assert _control(external_services, "health")["rate_limited"] == expected
+    assert _control(external_services, "state")["rate_limited"] == expected
+    assert _control(external_services, "health")["rate_limits"] == "real"
+    log = _control(external_services, "log")
+    replies_lines = [line for line in log if "conversations.replies" in line["url"]]
+    assert [(line["status"], line["error"], line["rate_limited"]) for line in replies_lines[-3:]] == [
+        (200, None, None),
+        (429, "ratelimited", "slack:conversations.replies"),
+        (429, "ratelimited", "slack:conversations.replies"),
+    ]
+
+
+def test_a_rate_limited_request_is_counted_under_the_phase_it_was_made_in(
+    external_services: RunningExternalServices,
+) -> None:
+    params = _replies_params(external_services)
+    agent_burst = _slack_burst(external_services, "conversations.replies", _TIER_3_LIMIT + 1, **params)
+    _mark_phase(external_services, {"name": "verification"})
+    # A bucket knows no phase, so the window the agent filled refuses these too.
+    verification_burst = _slack_burst(external_services, "conversations.replies", 2, **params)
+
+    assert [answer.status_code for answer in agent_burst[_TIER_3_LIMIT:] + verification_burst] == [429] * 3
+    health = _control(external_services, "health")
+    assert health["rate_limited"] == {"slack:conversations.replies": 3}
+    assert health["phases"]["agent"]["rate_limited"] == {"slack:conversations.replies": 1}
+    assert health["phases"]["verification"]["rate_limited"] == {"slack:conversations.replies": 2}
+    assert _control(external_services, "state")["phases"] == health["phases"]
+    assert [line["phase"] for line in _control(external_services, "log") if line["rate_limited"]] == [
+        "agent",
+        "verification",
+        "verification",
+    ]
+
+
+def test_a_slack_method_answers_again_once_its_retry_after_has_passed(
+    external_services_with_short_rate_limit_windows: RunningExternalServices,
+) -> None:
+    services = external_services_with_short_rate_limit_windows
+    # users.list is Tier 2: 20 a minute and 4 more.
+    burst = _slack_burst(services, "users.list", 25)
+    retry_after = int(burst[-1].headers["retry-after"])
+    # A refused request draws on nothing, so asking until one is answered waits the window out.
+    wait_for(
+        lambda: httpx2.get("{}/api/users.list".format(services.slack_url), headers=_SLACK_HEADERS).status_code == 200,
+        timeout=EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS + 3,
+        poll_interval=0.1,
+        error_message="users.list was still refused after its window",
+    )
+
+    assert [answer.status_code for answer in burst] == [200] * 24 + [429]
+    assert 1 <= retry_after <= EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS
+
+
+def test_a_seed_that_asks_for_no_rate_limits_serves_an_unlimited_burst(
+    unlimited_external_services: RunningExternalServices,
+) -> None:
+    burst = _slack_burst(
+        unlimited_external_services,
+        "conversations.replies",
+        3 * _TIER_3_LIMIT,
+        **_replies_params(unlimited_external_services),
+    )
+    linear_answer = _linear(unlimited_external_services, "{ viewer { id } }")
+
+    assert {answer.status_code for answer in burst} == {200}
+    assert "x-complexity" not in linear_answer.headers
+    health = _control(unlimited_external_services, "health")
+    assert (health["rate_limits"], health["rate_limited"]) == ("none", {})
+
+
+def _launcher_started_ms() -> float:
+    anchor = external_services_document(EXTERNAL_SERVICES_SEED_FIXTURE, "linear")["anchor"]
+    return (
+        datetime.fromisoformat(anchor.replace("Z", "+00:00")).timestamp() + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
+    ) * 1000
+
+
+def test_every_linear_answer_carries_linears_rate_limit_headers(external_services: RunningExternalServices) -> None:
+    answer = _linear(external_services, "{ viewer { name } }")
+    # Linear's own examples: a user and three fields of its created issues, 50 by default, is 66
+    # points, and 14 with `first: 10`.
+    default_page = _linear(external_services, "{ viewer { createdIssues { nodes { id title createdAt } } } }")
+    ten = _linear(external_services, "{ viewer { createdIssues(first: 10) { nodes { id title createdAt } } } }")
+    by_variable = _linear(
+        external_services,
+        "query Q($n: Int) { viewer { createdIssues(first: $n) { nodes { id title createdAt } } } }",
+        variables={"n": 10},
+    )
+    by_default = _linear(
+        external_services,
+        "query Q($n: Int = 10) { viewer { createdIssues(first: $n) { nodes { id title createdAt } } } }",
+    )
+
+    headers = answer.headers
+    assert answer.status_code == 200
+    # Linear's own example: a user with one property is 1.1 points, rounded up.
+    assert headers["x-complexity"] == "2"
+    assert (headers["x-ratelimit-requests-limit"], headers["x-ratelimit-requests-remaining"]) == ("2500", "2499")
+    assert (headers["x-ratelimit-complexity-limit"], headers["x-ratelimit-complexity-remaining"]) == (
+        "3000000",
+        "2999998",
+    )
+    # Each reset is when the bucket is whole again, in epoch milliseconds on the trial's clock: a
+    # request drains away in an hour's 2,500th, two points in an hour's 1,500,000th.
+    started_ms = _launcher_started_ms()
+    requests_reset = int(headers["x-ratelimit-requests-reset"])
+    complexity_reset = int(headers["x-ratelimit-complexity-reset"])
+    assert started_ms < complexity_reset < requests_reset < started_ms + 120_000
+    assert 1400 <= requests_reset - complexity_reset <= 1440
+    assert "retry-after" not in headers
+    assert [
+        default_page.headers["x-complexity"],
+        ten.headers["x-complexity"],
+        by_variable.headers["x-complexity"],
+        by_default.headers["x-complexity"],
+    ] == [
+        "66",
+        "14",
+        "14",
+        "14",
+    ]
+    assert default_page.headers["x-ratelimit-requests-remaining"] == "2498"
+
+
+# A query of exactly the per-query maximum: 100 teams, each 1 point for itself and 66 issues of 1.5.
+_MAX_COMPLEXITY_QUERY = (
+    "{ teams(first: 100) { nodes { issues(first: 66) { nodes { id title description createdAt updatedAt } } } } }"
+)
+# What the real API charged these on 2026-10-29 (`X-Complexity`), one for each rule of the scoring: the
+# root issues list and an issue's own lists are priced as objects, every other connection multiplies
+# its selection by its page size, and a selection of `id` alone is 0.2.
+_MEASURED_COMPLEXITIES = (
+    ("{ issues(first: 250) { nodes { id } } }", 2),
+    ("{ issues(first: 250) { nodes { id title } } }", 3),
+    ("{ issues(first: 250) { pageInfo { hasNextPage endCursor } nodes { id title } } }", 4),
+    ("{ issues(first: 250) { nodes { id labels { nodes { name } } } } }", 5),
+    ("{ issues(first: 250) { nodes { id project { id name } } } }", 4),
+    ("{ issues(first: 250) { nodes { id project { id projectMilestones { nodes { id name } } } } } }", 64),
+    ("{ issues(first: 250) { nodes { id assignee { id assignedIssues(first: 100) { nodes { id title } } } } } }", 124),
+    ("{ projects(first: 50) { nodes { id name } } }", 60),
+    ("{ projects(first: 50) { pageInfo { hasNextPage endCursor } nodes { id name } } }", 120),
+    ("{ projects(first: 50) { nodes { id projectUpdates(first: 20) { nodes { id body } } } } }", 1255),
+    ("{ teams { nodes { id issues(first: 250) { nodes { id } } } } }", 2555),
+    ("{ teams { nodes { id members { nodes { id } } issues(first: 250) { nodes { id } } } } }", 3055),
+    ("{ cycles(first: 10) { nodes { id issues(first: 250) { nodes { id title } } } } }", 3011),
+    (
+        "{ issues(first: 250) { nodes { id comments(first: 100) { nodes { id body user { name } } } labels { nodes { name } } "
+        "project { id name projectMilestones { nodes { id } } projectUpdates(first: 20) { nodes { id } } } team { key } "
+        "assignee { name } } } }",
+        25,
+    ),
+)
+
+
+def test_a_linear_query_past_the_per_query_maximum_is_refused_and_costs_nothing(
+    external_services: RunningExternalServices,
+) -> None:
+    at_maximum = _linear(external_services, _MAX_COMPLEXITY_QUERY)
+    past_maximum = _linear(
+        external_services,
+        "{ teams(first: 100) { nodes { issues(first: 67) { nodes { id title description createdAt updatedAt } } } } }",
+    )
+    after = _linear(external_services, "{ viewer { id } }")
+
+    assert (at_maximum.status_code, at_maximum.headers["x-complexity"]) == (200, "10000")
+    # Refused as Linear refuses it: an input error naming the score, with no standing headers.
+    assert past_maximum.status_code == 400
+    error = past_maximum.json()["errors"][0]
+    assert (error["message"], error["extensions"]["code"]) == ("Query too complex", "INPUT_ERROR")
+    assert error["extensions"]["userPresentableMessage"] == (
+        "The query is too complex. Complexity: 10150. Maximum allowed complexity: 10000."
+    )
+    assert not {
+        name for name in past_maximum.headers if name.startswith(("x-complexity", "x-ratelimit", "retry-after"))
+    }
+    # The refusal is not counted, so the next answer is the second counted.
+    assert at_maximum.headers["x-ratelimit-requests-remaining"] == "2499"
+    assert after.headers["x-ratelimit-requests-remaining"] == "2498"
+    assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
+
+
+def test_linear_scores_a_query_as_the_real_api_charges_it(external_services: RunningExternalServices) -> None:
+    scored = [
+        (query, int(_linear(external_services, query).headers["x-complexity"])) for query, _ in _MEASURED_COMPLEXITIES
+    ]
+
+    assert scored == list(_MEASURED_COMPLEXITIES)
+
+
+# The answers up to the first refusal, and how many seconds sending them took.
+def _linear_until_refused(
+    services: RunningExternalServices, query: str, at_most: int
+) -> tuple[list[httpx2.Response], float]:
+    answers: list[httpx2.Response] = []
+    began = time.monotonic()
+    with httpx2.Client(headers={"Authorization": _LINEAR_TOKEN}) as client:
+        while len(answers) < at_most and (not answers or answers[-1].status_code == 200):
+            answers.append(client.post("{}/graphql".format(services.linear_url), json={"query": query}))
+    return answers, time.monotonic() - began
+
+
+def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: RunningExternalServices) -> None:
+    answers, elapsed_seconds = _linear_until_refused(external_services, _MAX_COMPLEXITY_QUERY, 400)
+    refused = answers[-1]
+
+    # 3,000,000 points an hour hold 300 queries of 10,000, and one more drains away every 12 seconds.
+    assert 300 <= len(answers) - 1 <= 300 + elapsed_seconds / 12 + 1
+    assert refused.status_code == 429
+    assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
+    assert "complexity" in refused.json()["errors"][0]["message"]
+    # The bucket drains at 3,000,000 points an hour, so room for one more query takes seconds.
+    assert 1 <= int(refused.headers["retry-after"]) <= 13
+    assert int(refused.headers["x-ratelimit-complexity-remaining"]) < 10000
+    assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
+    assert _control(external_services, "log")[-1]["rate_limited"] == "linear:complexity"
+
+
+def test_linear_refuses_a_user_past_its_hourly_requests(external_services: RunningExternalServices) -> None:
+    answers, elapsed_seconds = _linear_until_refused(external_services, "{ viewer { id } }", 3000)
+    refused = answers[-1]
+
+    # 2,500 requests an hour, and one more for each 1.44 seconds the burst took to send.
+    assert 2500 <= len(answers) - 1 <= 2500 + elapsed_seconds / 1.44 + 1
+    assert refused.status_code == 429
+    assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
+    assert refused.headers["x-ratelimit-requests-remaining"] == "0"
+    # One request drains away every 1.44 seconds.
+    assert 1 <= int(refused.headers["retry-after"]) <= 2
+    assert _control(external_services, "health")["rate_limited"] == {"linear:requests": 1}

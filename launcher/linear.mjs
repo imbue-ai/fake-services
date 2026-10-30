@@ -1,9 +1,10 @@
 // The fake Linear: one GraphQL endpoint served from Linear's public schema by the resolvers here, on
 // a store that @emulators/linear seeds and resolves references in. Issues keep the seed's
-// identifiers and timestamps, with estimate, parent/children and relations; queries take nested
-// filters, date/number comparators, orderBy and searchIssues; a public field or argument the fake
-// does not hold is answered empty and counted; a mutation or subscription is refused. See
-// launcher.mjs for the interface this module exports.
+// identifiers and timestamps, with estimate, parent/children and relations; every other record takes
+// the dates the seed states or derives them from the seed's records (settle()), and a project serves
+// its lead and planned dates; queries take nested filters, date/number comparators, orderBy and
+// searchIssues; a public field or argument the fake does not hold is answered empty and counted; a
+// mutation or subscription is refused. See launcher.mjs for the interface this module exports.
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
@@ -64,6 +65,148 @@ function fieldResolver(source, args, context, info) {
   if (!source?.[EMPTY]) context.unsupported.add(`linear:field:${fieldName}`);
   return emptyValue(info.returnType);
 }
+
+// Linear's limits for an API key, as its documentation states them (linear.app/developers/
+// rate-limiting, read 2026-10-29): 2,500 requests and 3,000,000 complexity points per hour per user,
+// both leaky buckets refilling at limit/hour, and no single query above 10,000 points. An
+// unauthenticated request is refused by authentication here, so Linear's per-address limits for
+// those are not kept.
+const MAX_QUERY_COMPLEXITY = 10000;
+// A query's complexity as Linear charges it, measured against api.linear.app on 2026-10-29 (the rule
+// its documentation states -- 0.1 a property, 1 an object, a connection multiplying its children by
+// its page size -- charges a nested query orders of magnitude more than the API does). A selection on
+// an object costs 0.2 when it asks for `id` alone, else 1 plus 0.1 for each scalar field plus the
+// cost of each object field's own selection. A connection field multiplies the cost of its
+// selection's fields (`nodes`, `pageInfo`, each a selection of its own) by its pagination argument
+// (`first` or `last`), else 50 -- except the connections in UNMULTIPLIED_CONNECTIONS, which Linear
+// prices like a plain object: 1 plus the cost of its selection's fields. The sum is rounded up.
+// Counted in tenths, so the sum is exact. A document that does not parse, or names no operation to
+// run, costs nothing: Linear refuses it before it runs.
+// The connections Linear prices without a page-size multiplier: the root issues list, and the lists
+// an issue carries along. Every other connection measured (the root teams, projects, users, cycles,
+// comments and labels; a team's, project's, cycle's or user's issues; a project's members, teams,
+// milestones and updates; an issue's relations, history and documents; a comment's children) is
+// multiplied.
+const UNMULTIPLIED_CONNECTIONS = new Set(["Query.issues", "Issue.comments", "Issue.labels", "Issue.children", "Issue.attachments", "Issue.subscribers", "Issue.needs"]);
+function complexityOf(body) {
+  let doc;
+  try {
+    doc = parse(body.query ?? "");
+  } catch {
+    return 0;
+  }
+  const op = getOperationAST(doc, body.operationName);
+  if (!op) return 0;
+  const fragments = new Map(doc.definitions.filter((d) => d.kind === "FragmentDefinition").map((d) => [d.name.value, d]));
+  // A variable the request leaves out runs with the default its operation declares.
+  const defaults = Object.fromEntries((op.variableDefinitions ?? []).filter((d) => d.defaultValue?.kind === "IntValue").map((d) => [d.variable.name.value, Number(d.defaultValue.value)]));
+  const variables = { ...defaults, ...(body.variables ?? {}) };
+  const pageSize = (field) => {
+    for (const arg of field.arguments ?? [])
+      if (arg.name.value === "first" || arg.name.value === "last") {
+        const value = arg.value.kind === "Variable" ? variables[arg.value.name.value] : arg.value.kind === "IntValue" ? Number(arg.value.value) : undefined;
+        if (Number.isInteger(value)) return value;
+      }
+    return 50;
+  };
+  // The fragments being expanded, so a cycle (which validation refuses anyway) ends.
+  const expanding = new Set();
+  // The fields a selection set names, fragments expanded, each with the type it is read on.
+  const picked = (selectionSet, type, into) => {
+    for (const sel of selectionSet.selections) {
+      if (sel.kind === "InlineFragment") picked(sel.selectionSet, sel.typeCondition ? schema.getType(sel.typeCondition.name.value) : type, into);
+      else if (sel.kind === "FragmentSpread") {
+        const fragment = fragments.get(sel.name.value);
+        if (!fragment || expanding.has(sel.name.value)) continue;
+        expanding.add(sel.name.value);
+        picked(fragment.selectionSet, schema.getType(fragment.typeCondition.name.value), into);
+        expanding.delete(sel.name.value);
+      } else into.push({ field: sel, owner: type });
+    }
+    return into;
+  };
+  const fieldsCost = (selectionSet, type) => picked(selectionSet, type, []).reduce((sum, { field, owner }) => sum + fieldCost(field, owner), 0);
+  const selectionCost = (selectionSet, type) => {
+    const fields = picked(selectionSet, type, []);
+    if (fields.length === 1 && fields[0].field.name.value === "id") return 2;
+    return 10 + fields.reduce((sum, { field, owner }) => sum + fieldCost(field, owner), 0);
+  };
+  const fieldCost = (field, owner) => {
+    const def = owner?.getFields?.()[field.name.value];
+    if (!def || !field.selectionSet) return 1;
+    const named = getNamedType(def.type);
+    if (!named.name.endsWith("Connection")) return selectionCost(field.selectionSet, named);
+    if (UNMULTIPLIED_CONNECTIONS.has(`${owner.name}.${field.name.value}`)) return 10 + fieldsCost(field.selectionSet, named);
+    return pageSize(field) * fieldsCost(field.selectionSet, named);
+  };
+  return Math.ceil(fieldsCost(op.selectionSet, schema.getRootType(op.operation)) / 10);
+}
+// A /graphql request's document, variables and operation, from the URL for a GET and the body
+// otherwise: {body}, or {error}, what Linear answers a request it cannot read with.
+async function graphqlBody(req, url) {
+  if (req.method !== "GET") {
+    const body = jsonOf(await req.clone().text());
+    return body && typeof body === "object" ? { body } : { error: "POST body missing, invalid Content-Type, or JSON object has no keys." };
+  }
+  const variablesText = url.searchParams.get("variables");
+  const variables = variablesText === null ? null : jsonOf(variablesText);
+  if (variables === undefined || typeof variables !== "object") return { error: "Variables are invalid JSON." };
+  return { body: { query: url.searchParams.get("query") ?? "", variables, operationName: url.searchParams.get("operationName") ?? undefined } };
+}
+function jsonOf(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+const tokenOf = (req) => (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+const rateLimited = (message) => ({ errors: [{ message, extensions: { type: "ratelimited", code: "RATELIMITED", userError: true, userPresentableMessage: message } }] });
+// Shaped as Linear refuses a query past its per-query maximum (measured 2026-10-29): an HTTP 400 with no
+// standing headers.
+const tooComplex = (cost) =>
+  Response.json(
+    { errors: [{ message: "Query too complex", extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: `The query is too complex. Complexity: ${cost}. Maximum allowed complexity: ${MAX_QUERY_COMPLEXITY}.`, http: { status: 400 } } }] },
+    { status: 400 },
+  );
+// See rate_limits.mjs for what a policy holds.
+export const limits = {
+  buckets: {
+    requests: { limit: 2500, windowSeconds: 3600, algorithm: "leaky" },
+    complexity: { limit: 3000000, windowSeconds: 3600, algorithm: "leaky", maxCost: MAX_QUERY_COMPLEXITY },
+  },
+  async bucketOf(req, url, service) {
+    const user = service.tokenUsers.get(tokenOf(req));
+    if (!user || url.pathname !== "/graphql") return [];
+    const { body } = await graphqlBody(req, url);
+    return [
+      { bucket: "requests", scope: user, cost: 1 },
+      { bucket: "complexity", scope: user, cost: body ? complexityOf(body) : 0 },
+    ];
+  },
+  // A query above the per-query maximum is refused as Linear refuses it: an input error, not a rate
+  // limit, since waiting never admits it.
+  refuse: (req, retryAfterSeconds, bucket, cost) =>
+    retryAfterSeconds === null
+      ? tooComplex(cost)
+      : Response.json(
+          rateLimited(
+            bucket === "complexity"
+              ? "Rate limit exceeded: too much query complexity in the last hour."
+              : "Rate limit exceeded: too many requests in the last hour.",
+          ),
+          { status: 429 },
+        ),
+  headers: ({ requests, complexity }) => ({
+    "X-RateLimit-Requests-Limit": requests.limit,
+    "X-RateLimit-Requests-Remaining": requests.remaining,
+    "X-RateLimit-Requests-Reset": requests.resetMs,
+    "X-Complexity": complexity.cost,
+    "X-RateLimit-Complexity-Limit": complexity.limit,
+    "X-RateLimit-Complexity-Remaining": complexity.remaining,
+    "X-RateLimit-Complexity-Reset": complexity.resetMs,
+  }),
+};
 
 const PRIORITY_LABELS = ["No priority", "Urgent", "High", "Medium", "Low"];
 // Shaped as Linear shapes a query it validated and then refused.
@@ -180,7 +323,69 @@ export function create(seed, clock) {
     return Boolean(c.starts_at && c.ends_at && Date.parse(c.starts_at) <= now && now < Date.parse(c.ends_at));
   }
 
+  // The records the settle step dates, by collection. Issues and comments carry the seed's own dates.
+  const DATED = { organizations: ls.organizations, users: ls.users, teams: ls.teams, workflowStates: ls.workflowStates, issueLabels: ls.issueLabels, projects: ls.projects, cycles: ls.cycles };
+  const earliest = (stamps) => stamps.filter(Boolean).sort()[0] ?? null;
+  const latest = (stamps) => stamps.filter(Boolean).sort().at(-1) ?? null;
+  const membersOf = (project) => ls.issues.findBy("project_id", project.linear_id);
+
+  // Dates every team, user, label, project, cycle, workflow state and the organization once a seed's
+  // or an update's records are all in. The store stamps a record with the wall clock on insert and on
+  // every update, so the dates are written on the record itself, after the last update, and the ones
+  // a record had before this add are taken from `before`, captured ahead of it.
+  //   A record the add created takes the dates its file states (`stated`, already shifted); a date it
+  //   leaves out is derived from the records around it:
+  //     project       created: its earliest member issue's creation; updated: its latest member
+  //                   issue's update or comment
+  //     cycle         created: its start; updated: the later of its start and its latest member
+  //                   issue's update
+  //     user          the earliest issue they created or were assigned, or comment they wrote
+  //     label         the earliest issue carrying it
+  //     team, state   the team's earliest issue
+  //     organization  the earliest creation of every record above
+  //   A record with nothing to derive its creation from was created at the earliest issue, comment or
+  //   cycle start the fake holds, else at the anchor, and last updated then too. An update is never
+  //   earlier than the record's creation.
+  //   A record that was there before keeps its creation date, and its update date moves only forward.
+  function settle(before, stated) {
+    const floor = earliest([...ls.issues.all().map((i) => i.created_at), ...ls.comments.all().map((c) => c.created_at), ...ls.cycles.all().map((c) => c.starts_at)]) ?? clock.anchor;
+    const issuesBy = (pred) => ls.issues.all().filter(pred);
+    const teamStart = (teamId) => earliest(issuesBy((i) => i.team_id === teamId).map((i) => i.created_at));
+    const once = (created) => ({ created, updated: created });
+    // Each kind's derived dates; null where the records around it hold nothing to derive one from.
+    const derive = {
+      users: (u) =>
+        once(earliest([...issuesBy((i) => i.creator_id === u.linear_id || i.assignee_id === u.linear_id).map((i) => i.created_at), ...ls.comments.findBy("user_id", u.linear_id).map((c) => c.created_at)])),
+      teams: (t) => once(teamStart(t.linear_id)),
+      workflowStates: (x) => once(teamStart(x.team_id)),
+      issueLabels: (x) => once(earliest(issuesBy((i) => i.label_ids.includes(x.linear_id)).map((i) => i.created_at))),
+      projects: (p) => {
+        const members = membersOf(p);
+        return {
+          created: earliest(members.map((i) => i.created_at)),
+          updated: latest([...members.map((i) => i.updated_at), ...members.flatMap((i) => ls.comments.findBy("issue_id", i.linear_id).map((c) => c.created_at))]),
+        };
+      },
+      cycles: (c) => ({ created: c.starts_at, updated: latest([c.starts_at, ...ls.issues.findBy("cycle_id", c.linear_id).map((i) => i.updated_at)]) }),
+    };
+    const date = (kind, rec, derived) => {
+      const prior = before.get(`${kind}:${rec.id}`);
+      if (prior) {
+        rec.created_at = prior.created_at;
+        rec.updated_at = latest([prior.updated_at, derived.updated]);
+        return;
+      }
+      const own = stated.get(`${kind}:${rec.id}`) ?? {};
+      rec.created_at = own.created ?? derived.created ?? floor;
+      rec.updated_at = latest([rec.created_at, own.updated ?? derived.updated]);
+    };
+    for (const [kind, coll] of Object.entries(DATED)) if (kind !== "organizations") for (const rec of coll.all()) date(kind, rec, derive[kind](rec));
+    const first = earliest([...Object.entries(DATED).filter(([kind]) => kind !== "organizations").flatMap(([, coll]) => coll.all().map((rec) => rec.created_at)), floor]);
+    for (const rec of ls.organizations.all()) date("organizations", rec, once(first));
+  }
+
   function add(cfg) {
+    const before = new Map(Object.entries(DATED).flatMap(([kind, coll]) => coll.all().map((rec) => [`${kind}:${rec.id}`, { created_at: rec.created_at, updated_at: rec.updated_at }])));
     emulator.seedFromConfig(store, orgUrl, {
       organization: cfg.organization,
       users: cfg.users,
@@ -194,6 +399,32 @@ export function create(seed, clock) {
       if (ref && !rec) throw new Error(`linear ${what} not found: ${ref}`);
       return rec?.linear_id ?? null;
     };
+    // What the file states of the records this add created, which the emulator does not keep: their
+    // dates for the settle step (by the same key as `before`: the store's update replaces a record's
+    // object, as placing an issue does its team's, and keeps its id), and a project's lead and planned
+    // dates.
+    const stated = new Map();
+    const isNew = (kind, rec) => rec && !before.has(`${kind}:${rec.id}`);
+    const state = (kind, rec, entry) => {
+      if (isNew(kind, rec)) stated.set(`${kind}:${rec.id}`, { created: clock.iso(entry.created_at), updated: clock.iso(entry.updated_at) });
+    };
+    // The organization may state only its creation; its last update is derived.
+    if (cfg.organization) state("organizations", ls.organizations.all()[0], { created_at: cfg.organization.created_at });
+    for (const u of cfg.users ?? []) state("users", ls.users.findOneBy("email", u.email), u);
+    for (const t of cfg.teams ?? []) state("teams", ls.teams.findOneBy("key", t.key), t);
+    for (const x of cfg.labels ?? []) {
+      const teamId = x.team ? emulator.resolveTeam(store, x.team)?.linear_id ?? null : null;
+      state("issueLabels", ls.issueLabels.all().find((l) => l.name === x.name && (l.team_id === teamId || l.team_id === null)), x);
+    }
+    for (const c of cfg.cycles ?? []) state("cycles", emulator.resolveCycle(store, c.name ?? String(c.number), emulator.resolveTeam(store, c.team)?.linear_id), c);
+    for (const p of cfg.projects ?? []) {
+      const rec = emulator.resolveProject(store, p.name);
+      if (!isNew("projects", rec)) continue;
+      state("projects", rec, p);
+      rec.lead_id = need("user", p.lead, emulator.resolveUser(store, p.lead));
+      rec.start_date = clock.date(p.start_date);
+      rec.target_date = clock.date(p.target_date);
+    }
     let issues = 0;
     for (const i of cfg.issues ?? []) {
       const team = emulator.resolveTeam(store, i.team);
@@ -263,8 +494,12 @@ export function create(seed, clock) {
       rec.created_at = rec.updated_at = clock.iso(c.created_at);
       comments++;
     }
+    settle(before, stated);
     return { linear_issues: issues, linear_comments: comments };
   }
+
+  // The share of issues in a completed state, which is what an issue's completed_at marks.
+  const completedShare = (items) => (items.length ? items.filter((i) => i.completed_at).length / items.length : 0);
 
   function root(me) {
     const by = (coll, id) => (id ? coll.findOneBy("linear_id", id) : undefined);
@@ -313,13 +548,23 @@ export function create(seed, clock) {
     };
     const fState = (x) => x && { id: x.linear_id, name: x.name, type: x.type, position: x.position, color: "#95a2b3", team: () => fTeam(by(ls.teams, x.team_id)), createdAt: x.created_at, updatedAt: x.updated_at };
     const fLabel = (x) => x && { id: x.linear_id, name: x.name, color: x.color, description: x.description, team: () => fTeam(by(ls.teams, x.team_id)), createdAt: x.created_at, updatedAt: x.updated_at };
-    const fCycle = (x) => x && { id: x.linear_id, number: x.number, name: x.name, startsAt: x.starts_at, endsAt: x.ends_at, createdAt: x.created_at, updatedAt: x.updated_at, team: () => fTeam(by(ls.teams, x.team_id)), issues: issuesOf((i) => i.cycle_id === x.linear_id) };
+    const fCycle = (x) => x && {
+      id: x.linear_id, number: x.number, name: x.name, startsAt: x.starts_at, endsAt: x.ends_at, createdAt: x.created_at, updatedAt: x.updated_at, team: () => fTeam(by(ls.teams, x.team_id)), issues: issuesOf((i) => i.cycle_id === x.linear_id),
+      progress: () => completedShare(ls.issues.findBy("cycle_id", x.linear_id)),
+    };
+    // A project's planned dates are the seed's when it states them, else its member issues': it
+    // starts when the first of them was started (when none was, when the project was created) and
+    // targets the last due date among them. As in Linear, only a project in the completed or canceled
+    // state has a completedAt or canceledAt: a completed one was completed when its last member issue
+    // was (at its own last update with none), a canceled one at its last update.
     const fProject = (x) => x && {
-      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at, startDate: null, targetDate: null,
-      progress: () => {
-        const mine = ls.issues.all().filter((i) => i.project_id === x.linear_id);
-        return mine.length ? mine.filter((i) => i.completed_at).length / mine.length : 0;
-      },
+      id: x.linear_id, name: x.name, description: x.description ?? "", state: x.state, url: `${orgUrl}/project/${x.linear_id}`, createdAt: x.created_at, updatedAt: x.updated_at,
+      lead: () => fUser(by(ls.users, x.lead_id)),
+      startDate: () => x.start_date ?? (earliest(membersOf(x).map((i) => i.started_at)) ?? x.created_at).slice(0, 10),
+      targetDate: () => x.target_date ?? latest(membersOf(x).map((i) => i.due_date)),
+      completedAt: () => (x.state === "completed" ? latest(membersOf(x).map((i) => i.completed_at)) ?? x.updated_at : null),
+      canceledAt: () => (x.state === "canceled" ? x.updated_at : null),
+      progress: () => completedShare(membersOf(x)),
       teams: (a, _context, info) => {
         const wanted = where(a, info, teamView);
         return connection(ls.teams.all().filter((t) => ls.issues.all().some((i) => i.project_id === x.linear_id && i.team_id === t.linear_id) && wanted(t)), a, fTeam);
@@ -328,6 +573,7 @@ export function create(seed, clock) {
     };
     const fTeam = (t) => t && {
       id: t.linear_id, key: t.key, name: t.name, description: t.description, private: t.private, createdAt: t.created_at, updatedAt: t.updated_at,
+      issueCount: ({ includeArchived }) => ls.issues.findBy("team_id", t.linear_id).filter((i) => includeArchived || !i.archived_at).length,
       states: (a, _context, info) => connection(ls.workflowStates.findBy("team_id", t.linear_id).filter(where(a, info, stateView)).sort((x, y) => x.position - y.position), a, fState),
       members: (a, _context, info) => connection(ls.users.all().filter(where(a, info, userView)), a, fUser),
       labels: (a, _context, info) => connection(ls.issueLabels.all().filter((x) => !x.team_id || x.team_id === t.linear_id).filter(where(a, info, labelView)), a, fLabel),
@@ -367,7 +613,7 @@ export function create(seed, clock) {
       viewer: () => fUser(me),
       organization: () => {
         const o = ls.organizations.all()[0];
-        return { id: o.linear_id, name: o.name, urlKey: o.url_key, createdAt: o.created_at };
+        return { id: o.linear_id, name: o.name, urlKey: o.url_key, createdAt: o.created_at, updatedAt: o.updated_at };
       },
       teams: (a, _context, info) => connection(ls.teams.all().filter(where(a, info, teamView)), a, fTeam),
       team: ({ id }) => one("Team", emulator.resolveTeam(store, id), fTeam),
@@ -395,29 +641,16 @@ export function create(seed, clock) {
 
   // Each request's unsupported keys, by the request, for the access log and the counts.
   const unsupportedOf = new WeakMap();
-  const jsonOf = (text) => {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return undefined;
-    }
-  };
   // Every request for /graphql, GET with the document in the URL or POST with it in the body, goes
   // through the public schema: validated, then a query is answered by root() and a mutation or
   // subscription refused and counted. No request reaches the emulator's own schema.
   async function route(req, url) {
-    const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+    const token = tokenOf(req);
     const record = token ? ls.tokens.findOneBy("token", token) : undefined;
     if (!record) return authFailure();
     if (url.pathname !== "/graphql") return Response.json({ message: "Not Found", documentation_url: DOCS }, { status: 404 });
-    let body;
-    if (req.method === "GET") {
-      const variablesText = url.searchParams.get("variables");
-      const variables = variablesText === null ? null : jsonOf(variablesText);
-      if (variables === undefined || typeof variables !== "object") return Response.json({ errors: [{ message: "Variables are invalid JSON." }] }, { status: 400 });
-      body = { query: url.searchParams.get("query") ?? "", variables, operationName: url.searchParams.get("operationName") ?? undefined };
-    } else body = jsonOf(await req.clone().text());
-    if (!body || typeof body !== "object") return Response.json({ errors: [{ message: "POST body missing, invalid Content-Type, or JSON object has no keys." }] }, { status: 400 });
+    const { body, error } = await graphqlBody(req, url);
+    if (error) return Response.json({ errors: [{ message: error }] }, { status: 400 });
     let doc;
     try {
       doc = parse(body.query ?? "");

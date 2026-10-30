@@ -2,7 +2,7 @@
 // not support. Every line carries the phase of the trial it was made in: "agent" until the driver
 // marks another (setPhase), so the requests the verification flows cause are told apart from the
 // ones the agent's app made while the agent worked. See launcher.mjs for the service interface this
-// wraps.
+// wraps, and rate_limits.mjs for the rateLimitedBucket(req) its guard adds to every service.
 import crypto from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 
@@ -17,11 +17,12 @@ export function createAccessLog(path, services) {
   const lines = [];
   const unsupportedCalls = {};
   let phase = "agent";
-  // Per phase, in the order the phases were first marked: its requests by service, and its calls the
-  // fakes do not support by what was asked. Without a prototype, so a phase named like one of
-  // Object's own keys ("constructor") gets counts of its own.
+  // Per phase, in the order the phases were first marked: its requests by service, its calls the
+  // fakes do not support by what was asked, and its rate limit refusals by "<service>:<bucket>".
+  // Without a prototype, so a phase named like one of Object's own keys ("constructor") gets counts
+  // of its own.
   const phases = Object.create(null);
-  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {} });
+  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {}, rate_limited: {} });
   phaseCounts(phase);
   function setPhase(name) {
     const previous = phase;
@@ -60,6 +61,8 @@ export function createAccessLog(path, services) {
         unsupportedCalls[key] = (unsupportedCalls[key] ?? 0) + 1;
         inPhase.unsupported_calls[key] = (inPhase.unsupported_calls[key] ?? 0) + 1;
       }
+      const rateLimited = service.rateLimitedBucket(req);
+      if (rateLimited) inPhase.rate_limited[rateLimited] = (inPhase.rate_limited[rateLimited] ?? 0) + 1;
       const outcome = service.outcome(json);
       const rec = {
         ts: new Date(began).toISOString(),
@@ -80,6 +83,8 @@ export function createAccessLog(path, services) {
         error: outcome.error,
         // The first of a request's unsupported keys; the counts carry every one.
         unsupported: unsupported[0] ?? null,
+        // "<service>:<bucket>" of the rate limit that refused the request, else null.
+        rate_limited: rateLimited,
         result_count: outcome.result_count,
         response_bytes: Buffer.byteLength(text),
         duration_ms: Date.now() - began,

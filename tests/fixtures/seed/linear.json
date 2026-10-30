@@ -1,5 +1,6 @@
 {
   "anchor": "2026-03-21T00:00:00Z",
+  "time_shift": "to_trial_start",
   "tokens": [
     {
       "token": "lin_api_fakeredwoodlineartoken",
@@ -38,7 +39,8 @@
       "name": "Morgan Reyes",
       "email": "morgan.reyes@redwood.example",
       "admin": true,
-      "id": "5485bf92-2976-5129-9b07-bd4c79ca0790"
+      "id": "5485bf92-2976-5129-9b07-bd4c79ca0790",
+      "created_at": "2026-01-05T09:00:00.000Z"
     },
     {
       "name": "Thomas Baird",
