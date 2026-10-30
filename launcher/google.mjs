@@ -1,7 +1,7 @@
 // The fake Google: one fake for every Google API a task reads, on @emulators/google's app and store,
 // served on each host those APIs live on and routed by path to a product module under google/.
-// A request for a path no product serves is answered as Google answers a method it does not have,
-// and counted. The accounts (`users`) are Google's own,
+// A request for a path no product serves, or for a Google host the fake does not serve, is answered
+// with the HTML 404 page Google's frontends answer a path no API takes, and counted. The accounts (`users`) are Google's own,
 // shared by every product; each product seeds its own records for them. See launcher.mjs for the
 // interface this module exports.
 //
@@ -22,7 +22,7 @@
 import crypto from "node:crypto";
 import { Hono, Store, WebhookDispatcher, authMiddleware } from "@emulators/core";
 import { getGoogleStore, googlePlugin, seedFromConfig } from "@emulators/google";
-import { credentialsInvalid, credentialsMissing, internalError, notFound, unrouted } from "./google/errors.mjs";
+import { credentialsInvalid, credentialsMissing, internalError, noSuchPath, unrouted } from "./google/errors.mjs";
 import * as gmail from "./google/gmail.mjs";
 
 export const name = "google";
@@ -97,7 +97,7 @@ export function create(seed, clock) {
     if (index < 0) {
       const [first = "", second = ""] = url.pathname.split("/").filter(Boolean);
       unsupportedOf.set(req, [`google:path:/${[first, second].filter(Boolean).join("/")}`]);
-      return notFound();
+      return noSuchPath(url.pathname);
     }
     const token = tokenOf(req);
     if (!token) return credentialsMissing();
@@ -115,7 +115,7 @@ export function create(seed, clock) {
     tokenUsers,
     add,
     route,
-    notFound,
+    notFound: (url) => noSuchPath(url.pathname),
     counts: () => Object.assign({ users: gs.users.all().length }, ...products.map((p) => p.counts())),
     outcome: (json) => ({ ok: json ? !json.error : null, error: json?.error?.message ?? null, result_count: resultCount(json) }),
     unsupportedKeys: (url, json, req) => unsupportedOf.get(req) ?? [],

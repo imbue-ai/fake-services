@@ -49,7 +49,7 @@ export function createAccessLog(path, services) {
       // request that names none is for the service's first host.
       const host = (req.headers.get("x-forwarded-host") ?? [...service.hosts][0]).toLowerCase();
       const served = service.hosts.has(host);
-      const res = served ? await service.route(req, url) : service.notFound();
+      const res = served ? await service.route(req, url) : service.notFound(url);
       const text = await res.clone().text();
       let json = null;
       try {

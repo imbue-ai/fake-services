@@ -3,11 +3,12 @@
 // derived from the seed, so they read the same in every trial; a message keeps the UTC offset its seed
 // states in its Date header, and its labels are derived from who sent it;
 // users.getProfile; a search operator the package answers wrongly is counted; a list leaves out an
-// empty list and refuses a malformed page token, as Gmail does. See google.mjs for the product
+// empty list and refuses a malformed page token, a listed label carries no counts, and a message's
+// headers in every format are those of its MIME form, as Gmail does. See google.mjs for the product
 // interface this module exports.
 import crypto from "node:crypto";
 import { seedFromConfig } from "@emulators/google";
-import { googleError, isUnrouted, notFound } from "./errors.mjs";
+import { googleError, isUnrouted, noSuchPath } from "./errors.mjs";
 
 export const prefixes = ["/gmail/v1/", "/upload/gmail/v1/"];
 const BASE_URL = "https://oauth2.googleapis.com";
@@ -146,29 +147,58 @@ const labelIdOf = (mailbox, name) => `Label_${BigInt("0x" + hash(`label\n${mailb
 const ADDRESS = /[^\s<>,;"']+@[^\s<>,;"']+/g;
 const addressesOf = (...headers) => headers.flatMap((h) => (h ?? "").match(ADDRESS) ?? []).map((a) => a.toLowerCase());
 
-// The message as Gmail serves it in format=raw: its headers and its text, and its HTML beside the
-// text when it has one, base64url-encoded.
-function rawOf(m) {
+// A message's MIME structure: its text alone, or its text and its HTML as the two parts of a
+// multipart/alternative. format=raw serves it as MIME, and format=full and metadata show the same
+// headers, so the formats agree. The top-level headers are in the order Gmail serves them.
+const textPartHeaders = (type) => [
+  ["Content-Type", `${type}; charset="UTF-8"`],
+  ["Content-Transfer-Encoding", "8bit"],
+];
+function mimeOf(m) {
   const headers = [
-    `From: ${m.from}`,
-    `To: ${m.to}`,
-    ...(m.cc ? [`Cc: ${m.cc}`] : []),
-    ...(m.bcc ? [`Bcc: ${m.bcc}`] : []),
-    `Subject: ${m.subject}`,
-    `Date: ${m.date_header}`,
-    `Message-ID: ${m.message_id}`,
-    ...(m.in_reply_to ? [`In-Reply-To: ${m.in_reply_to}`] : []),
-    ...(m.references ? [`References: ${m.references}`] : []),
-    "MIME-Version: 1.0",
-  ];
-  const part = (type, text) => `Content-Type: ${type}; charset="UTF-8"\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${text}`;
-  let text;
-  if (m.body_html) {
-    const boundary = `000000000000${hash(m.message_id).slice(0, 16)}`;
-    headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
-    text = `${headers.join("\r\n")}\r\n\r\n--${boundary}\r\n${part("text/plain", m.body_text)}\r\n--${boundary}\r\n${part("text/html", m.body_html)}\r\n--${boundary}--\r\n`;
-  } else text = `${headers.join("\r\n")}\r\n${part("text/plain", m.body_text)}`;
+    ["MIME-Version", "1.0"],
+    ["Date", m.date_header],
+    ["References", m.references],
+    ["In-Reply-To", m.in_reply_to],
+    ["Message-ID", m.message_id],
+    ["Subject", m.subject],
+    ["From", m.from],
+    ["To", m.to],
+    ["Cc", m.cc],
+    ["Bcc", m.bcc],
+  ].filter(([, value]) => value !== null && value !== undefined);
+  if (!m.body_html) return { headers: [...headers, ...textPartHeaders("text/plain")], boundary: null, parts: [] };
+  const boundary = `000000000000${hash(m.message_id).slice(0, 16)}`;
+  return {
+    headers: [...headers, ["Content-Type", `multipart/alternative; boundary="${boundary}"`]],
+    boundary,
+    parts: [
+      { headers: textPartHeaders("text/plain"), text: m.body_text },
+      { headers: textPartHeaders("text/html"), text: m.body_html },
+    ],
+  };
+}
+
+// The message as Gmail serves it in format=raw, base64url-encoded.
+function rawOf(m) {
+  const { headers, boundary, parts } = mimeOf(m);
+  const block = (lines) => lines.map(([name, value]) => `${name}: ${value}\r\n`).join("");
+  const text = boundary
+    ? `${block(headers)}\r\n${parts.map((part) => `--${boundary}\r\n${block(part.headers)}\r\n${part.text}\r\n`).join("")}--${boundary}--\r\n`
+    : `${block(headers)}\r\n${m.body_text}`;
   return Buffer.from(text, "utf-8").toString("base64url");
+}
+
+// A message resource of format full or metadata with the headers its MIME structure holds; a
+// metadata get that names headers gets those alone, matched whatever their case, as Gmail matches
+// them.
+function withMimeHeaders(resource, m, named) {
+  const { headers, parts } = mimeOf(m);
+  const asHeaders = (lines) => lines.map(([name, value]) => ({ name, value }));
+  const wanted = named.length ? new Set(named.map((h) => h.toLowerCase())) : null;
+  resource.payload.headers = asHeaders(wanted ? headers.filter(([name]) => wanted.has(name.toLowerCase())) : headers);
+  resource.payload.mimeType = headers.find(([name]) => name === "Content-Type")[1].split(";")[0];
+  for (const [i, part] of (resource.payload.parts ?? []).entries()) part.headers = asHeaders(parts[i].headers);
 }
 
 // Search. The package's own parser takes from:, to:, subject:, label:, -label:, in:, is:, after: and
@@ -179,6 +209,9 @@ function rawOf(m) {
 //     newer_than:/older_than: in days are taken from the trial's present
 //   - an operator the package answers wrongly with a 200 is passed on as it is and counted, under
 //     google:gmail:q:<operator>
+//   - `or` and `and` written in anything but capitals are words to Gmail, which the package drops as
+//     it drops OR and AND; such a term is passed on as it is and counted, under google:gmail:q:or-word
+//     and google:gmail:q:and-word. AND itself is Gmail's implicit AND, which dropping it keeps.
 const UNSUPPORTED_OPERATORS = new Set(["cc", "bcc", "deliveredto", "list", "filename", "category", "size", "larger", "smaller", "header", "rfc822msgid"]);
 const DATE_OPERATORS = new Map([["after", "after"], ["before", "before"], ["newer", "after"], ["older", "before"]]);
 // Every operator Gmail has: a word with a colon that names none of these is a word to Gmail too.
@@ -202,6 +235,7 @@ function rewriteQuery(q, email, nowMs) {
   const terms = (q.match(/"[^"]+"|\S+/g) ?? []).map((term) => {
     if (term.startsWith('"')) return term;
     if (term === "OR" || term === "AROUND") return keys.push(term), term;
+    if (term !== "AND" && /^(or|and)$/i.test(term)) return keys.push(`${term.toLowerCase()}-word`), term;
     if (/[{}]/.test(term)) return keys.push("{}"), term;
     if (term.length > 1 && term.startsWith("+")) return keys.push("+"), term;
     const negated = term.length > 1 && term.startsWith("-");
@@ -376,12 +410,13 @@ export function create({ app, store, gs, clock }) {
     const path = parsePath(url.pathname);
     const unsupported = () => {
       keys.push(`google:gmail:${req.method} ${path.userId === null ? "" : "users/{userId}/"}${path.template}`);
-      return notFound();
+      return noSuchPath(url.pathname);
     };
     if (path.userId === null) return unsupported();
-    // Another mailbox is refused as Gmail refuses a mailbox the credential is not delegated.
+    // Another mailbox is refused as Gmail refuses a mailbox the credential is not delegated, naming
+    // the caller's own address rather than the mailbox asked for.
     if (path.userId !== "me" && path.userId.toLowerCase() !== email.toLowerCase())
-      return googleError(403, `Delegation denied for ${path.userId}`, "forbidden", "PERMISSION_DENIED");
+      return googleError(403, `Delegation denied for ${email}`, "forbidden", "PERMISSION_DENIED");
     const action = `${req.method} ${path.template}`;
     if (action === "GET profile") {
       const messages = owned(email);
@@ -409,8 +444,19 @@ export function create({ app, store, gs, clock }) {
     const res = await forward(req, target);
     if (isUnrouted(res) || (res.headers.get("content-type") ?? "").includes("text/html")) return unsupported();
     if (req.method !== "GET" || res.status !== 200) return res;
-    // Google leaves an empty list out of an answer.
     const answer = await res.json();
+    // A listed label carries no counts; labels.get alone serves them.
+    if (action === "GET labels")
+      answer.labels = answer.labels.map(({ id, name, messageListVisibility, labelListVisibility, type, color }) => ({ id, name, messageListVisibility, labelListVisibility, type, color }));
+    // A message the fake placed is shown with the headers of the raw form it was given; one the
+    // package made keeps the package's.
+    const format = url.searchParams.get("format") ?? "full";
+    if (path.rest.length === 2 && (path.rest[0] === "messages" || path.rest[0] === "threads") && (format === "full" || format === "metadata")) {
+      const placed = new Map(owned(email).filter((m) => m.seed_key).map((m) => [m.gmail_id, m]));
+      const asked = format === "metadata" ? url.searchParams.getAll("metadataHeaders") : [];
+      for (const resource of answer.messages ?? [answer]) if (placed.has(resource.id)) withMimeHeaders(resource, placed.get(resource.id), asked);
+    }
+    // Google leaves an empty list out of an answer.
     for (const [k, v] of Object.entries(answer)) if (Array.isArray(v) && !v.length) delete answer[k];
     return Response.json(answer);
   }

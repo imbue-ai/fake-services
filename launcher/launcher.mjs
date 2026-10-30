@@ -16,9 +16,10 @@
 //                     every record from the seed's own dates (never the box's clock), and returns
 //                     what it added
 //     route(req, url) answers a request for one of its API hosts
-//     notFound()      what a request for another host is answered with
+//     notFound(url)   what a request for another host is answered with
 //     counts()        the record counts for health
-//     outcome(json)   what the access log says of an answer: {ok, error, result_count}
+//     outcome(json)   what the access log says of an answer, given its JSON (null for one that is
+//                     not JSON): {ok, error, result_count}
 //     unsupportedKeys(url, json, req)
 //                     what a request asked for that the real service has and the fake lacks
 //   }

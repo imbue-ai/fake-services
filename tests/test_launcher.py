@@ -1905,6 +1905,99 @@ def test_a_gmail_thread_holds_its_replies_with_their_headers_and_derived_labels(
     assert keys["invoice-question"] == "8b5677a1c796501d"
 
 
+def test_a_gmail_message_shows_the_mime_headers_of_its_raw_form(external_services: RunningExternalServices) -> None:
+    keys = _message_keys(external_services)
+
+    question = _gmail(external_services, "me/messages/{}".format(keys["invoice-question"]))
+    reply = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]))
+    reply_metadata = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="metadata")
+    named = _gmail(
+        external_services,
+        "me/messages/{}".format(keys["invoice-reply"]),
+        format="metadata",
+        metadataHeaders="content-type",
+    )
+    thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]), format="metadata")
+    reply_raw = email.message_from_bytes(
+        base64.urlsafe_b64decode(
+            _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="raw")["raw"] + "=="
+        )
+    )
+
+    # A single-part message, in the order Gmail serves its headers.
+    assert [header["name"] for header in question["payload"]["headers"]] == [
+        "MIME-Version",
+        "Date",
+        "Message-ID",
+        "Subject",
+        "From",
+        "To",
+        "Cc",
+        "Content-Type",
+        "Content-Transfer-Encoding",
+    ]
+    assert (_headers(question)["MIME-Version"], _headers(question)["Content-Type"]) == (
+        "1.0",
+        'text/plain; charset="UTF-8"',
+    )
+    # A message with HTML is multipart/alternative, on the boundary its raw form uses, and each part
+    # names its own type.
+    assert [header["name"] for header in reply["payload"]["headers"]] == [
+        "MIME-Version",
+        "Date",
+        "References",
+        "In-Reply-To",
+        "Message-ID",
+        "Subject",
+        "From",
+        "To",
+        "Content-Type",
+    ]
+    content_type = 'multipart/alternative; boundary="{}"'.format(reply_raw.get_boundary())
+    assert (reply["payload"]["mimeType"], _headers(reply)["Content-Type"]) == ("multipart/alternative", content_type)
+    assert _headers(reply)["Content-Type"] == reply_raw["Content-Type"]
+    assert [part["headers"] for part in reply["payload"]["parts"]] == [
+        [
+            {"name": "Content-Type", "value": 'text/{}; charset="UTF-8"'.format(subtype)},
+            {"name": "Content-Transfer-Encoding", "value": "8bit"},
+        ]
+        for subtype in ("plain", "html")
+    ]
+    assert [dict(part.items()) for part in reply_raw.walk() if not part.is_multipart()] == [
+        {header["name"]: header["value"] for header in part["headers"]} for part in reply["payload"]["parts"]
+    ]
+    # metadata shows the same headers, or those it names whatever their case.
+    assert (reply_metadata["payload"]["mimeType"], reply_metadata["payload"]["headers"]) == (
+        "multipart/alternative",
+        reply["payload"]["headers"],
+    )
+    assert named["payload"]["headers"] == [{"name": "Content-Type", "value": content_type}]
+    assert [message["payload"]["headers"][0] for message in thread["messages"]] == [
+        {"name": "MIME-Version", "value": "1.0"}
+    ] * 3
+
+
+def test_a_gmail_label_list_carries_no_counts_and_a_label_get_does(
+    external_services: RunningExternalServices,
+) -> None:
+    labels = _gmail(external_services, "me/labels")["labels"]
+    inbox = _gmail(external_services, "me/labels/INBOX")
+
+    for label in labels:
+        assert set(label) <= {"id", "name", "messageListVisibility", "labelListVisibility", "type", "color"}, label
+        assert {"id", "name", "type"} <= set(label), label
+    # Which system labels Gmail gives a visibility is not pinned here.
+    assert {key: inbox[key] for key in inbox if not key.endswith("Visibility")} == {
+        "id": "INBOX",
+        "name": "INBOX",
+        "type": "system",
+        "messagesTotal": 2,
+        "messagesUnread": 1,
+        "threadsTotal": 1,
+        "threadsUnread": 1,
+    }
+
+
 def test_gmail_lists_and_searches_with_the_operators_it_supports(external_services: RunningExternalServices) -> None:
     keys = _message_keys(external_services)
     question, reply, followup, newsletter = (
@@ -1948,10 +2041,15 @@ def test_a_gmail_search_operator_the_fake_answers_wrongly_is_counted(
 ) -> None:
     for query in ("invoice OR newsletter", "-from:priya", "cc:thomas", "{invoice newsletter}", "older_than:1y"):
         assert _gmail_get(external_services, "me/messages", q=query).status_code == 200
+    # Gmail reads `or` and `and` in anything but capitals as words; AND is its implicit AND.
+    for query in ("invoice or newsletter", "invoice Or newsletter", "and", "invoice AND question"):
+        assert _gmail_get(external_services, "me/messages", q=query).status_code == 200
     _gmail_get(external_services, "me/threads", q="subject:(invoice question) has:drive")
 
     assert _control(external_services, "health")["unsupported_calls"] == {
         "google:gmail:q:OR": 1,
+        "google:gmail:q:or-word": 2,
+        "google:gmail:q:and-word": 1,
         "google:gmail:q:-": 1,
         "google:gmail:q:cc": 1,
         "google:gmail:q:{}": 1,
@@ -1962,14 +2060,20 @@ def test_a_gmail_search_operator_the_fake_answers_wrongly_is_counted(
     assert [line["unsupported"] for line in _control(external_services, "log")][-1] == "google:gmail:q:subject:()"
 
 
-def test_a_google_path_or_host_the_fake_does_not_serve_is_not_found_and_counted(
+def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found_and_counted(
     external_services: RunningExternalServices,
 ) -> None:
     headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
     vacation = _gmail_get(external_services, "me/settings/vacation")
     vacation_again = _gmail_get(external_services, _MORGAN + "/settings/vacation")
+    no_such_setting = _gmail_get(external_services, "me/settings/doesnotexist")
+    no_such_method = _gmail_get(external_services, "me/nothinghere")
     calendar = httpx2.get(
         "{}/calendar/v3/users/me/calendarList".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    drive = httpx2.get(
+        "{}/drive/v3/files".format(external_services.google_url),
         headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
     )
     oauth = httpx2.get(
@@ -1987,23 +2091,44 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_not_found_and_counted(
     )
     missing_message = _gmail_get(external_services, "me/messages/0000000000000000")
 
-    for answer in (vacation, vacation_again, calendar, oauth, other_host):
+    # Google's frontends answer a path no API method takes with their HTML page, naming the path.
+    for answer in (vacation, vacation_again, no_such_setting, no_such_method, calendar, drive, oauth, other_host):
         assert answer.status_code == 404
-        assert answer.json()["error"] == {
-            "code": 404,
-            "message": "Requested entity was not found.",
-            "errors": [{"message": "Requested entity was not found.", "domain": "global", "reason": "notFound"}],
-            "status": "NOT_FOUND",
-        }
+        assert answer.headers["content-type"] == "text/html; charset=UTF-8"
+        assert answer.text.startswith("<!DOCTYPE html>")
+        assert "<title>Error 404 (Not Found)!!1</title>" in answer.text
+        assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
     assert (on_www.status_code, on_www.json()["emailAddress"]) == (200, _MORGAN)
     # A message that is not there is the caller's mistake, as it is against Gmail, and not counted.
-    assert missing_message.status_code == 404
+    assert (missing_message.status_code, missing_message.json()) == (
+        404,
+        {
+            "error": {
+                "code": 404,
+                "message": "Requested entity was not found.",
+                "errors": [{"message": "Requested entity was not found.", "domain": "global", "reason": "notFound"}],
+                "status": "NOT_FOUND",
+            }
+        },
+    )
     assert _control(external_services, "health")["unsupported_calls"] == {
         "google:gmail:GET users/{userId}/settings/vacation": 2,
+        "google:gmail:GET users/{userId}/settings/doesnotexist": 1,
+        "google:gmail:GET users/{userId}/nothinghere": 1,
         "google:path:/calendar/v3": 1,
+        "google:path:/drive/v3": 1,
         "google:path:/o/oauth2": 1,
         "google:host:people.googleapis.com": 1,
     }
+    # The access log reads an answer that is not JSON as neither ok nor an error, and keeps its gap.
+    vacation_line = _control(external_services, "log")[0]
+    assert (vacation_line["status"], vacation_line["ok"], vacation_line["error"], vacation_line["result_count"]) == (
+        404,
+        None,
+        None,
+        None,
+    )
+    assert vacation_line["unsupported"] == "google:gmail:GET users/{userId}/settings/vacation"
 
 
 def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:
@@ -2022,9 +2147,19 @@ def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExt
     # Thomas's copy of the question is cc'd mail in his INBOX, a message of his own apart from Morgan's.
     assert thomas_keys["thomas-invoice-copy"] not in morgan_keys.values()
     assert across.status_code == 404
-    assert (delegated.status_code, delegated.json()["error"]["message"]) == (
+    # Gmail names the caller's own address, not the mailbox it asked for.
+    assert (delegated.status_code, delegated.json()) == (
         403,
-        "Delegation denied for thomas.baird@redwood.example",
+        {
+            "error": {
+                "code": 403,
+                "message": "Delegation denied for {}".format(_MORGAN),
+                "errors": [
+                    {"message": "Delegation denied for {}".format(_MORGAN), "domain": "global", "reason": "forbidden"}
+                ],
+                "status": "PERMISSION_DENIED",
+            }
+        },
     )
     assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
     assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
