@@ -1988,8 +1988,21 @@ def test_a_gmail_label_list_carries_no_counts_and_a_label_get_does(
     for label in labels:
         assert set(label) <= {"id", "name", "messageListVisibility", "labelListVisibility", "type", "color"}, label
         assert {"id", "name", "type"} <= set(label), label
-    # Which system labels Gmail gives a visibility is not pinned here.
-    assert {key: inbox[key] for key in inbox if not key.endswith("Visibility")} == {
+    hidden = {"messageListVisibility": "hide", "labelListVisibility": "labelHide"}
+    visibility = {
+        label["id"]: {key: value for key, value in label.items() if key.endswith("Visibility")}
+        for label in labels
+        if label["type"] == "system"
+    }
+    assert {label: visibility[label] for label in ("INBOX", "SENT", "STARRED", "UNREAD", "IMPORTANT", "SPAM")} == {
+        "INBOX": {},
+        "SENT": {},
+        "STARRED": {},
+        "UNREAD": {},
+        "IMPORTANT": hidden,
+        "SPAM": hidden,
+    }
+    assert inbox == {
         "id": "INBOX",
         "name": "INBOX",
         "type": "system",

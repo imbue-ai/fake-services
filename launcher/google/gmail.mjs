@@ -140,6 +140,15 @@ function dateHeader(ms, offsetMinutes) {
   return `${DAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} ${zone}`;
 }
 const hash = (text) => crypto.createHash("sha1").update(text).digest("hex");
+// A system label's visibility as Gmail serves it (measured 2026-10-30): INBOX, SENT, DRAFT, STARRED
+// and UNREAD carry none, and every other system label is hidden from both lists.
+const UNHIDDEN_SYSTEM_LABELS = new Set(["INBOX", "SENT", "DRAFT", "STARRED", "UNREAD"]);
+function withSystemVisibility(label) {
+  if (label.type !== "system") return label;
+  const { messageListVisibility, labelListVisibility, ...rest } = label;
+  return UNHIDDEN_SYSTEM_LABELS.has(label.id) ? rest : { ...rest, messageListVisibility: "hide", labelListVisibility: "labelHide" };
+}
+
 // Ids derived from the seed: a message's id (and the id of a thread it starts) is 16 hex digits as
 // Gmail's are, a user label's is Label_ and a number.
 const messageIdOf = (key) => hash(`message\n${key}`).slice(0, 16);
@@ -447,7 +456,14 @@ export function create({ app, store, gs, clock }) {
     const answer = await res.json();
     // A listed label carries no counts; labels.get alone serves them.
     if (action === "GET labels")
-      answer.labels = answer.labels.map(({ id, name, messageListVisibility, labelListVisibility, type, color }) => ({ id, name, messageListVisibility, labelListVisibility, type, color }));
+      answer.labels = answer.labels.map(({ id, name, messageListVisibility, labelListVisibility, type, color }) =>
+        withSystemVisibility({ id, name, messageListVisibility, labelListVisibility, type, color }),
+      );
+    if (action === "GET labels/{id}") {
+      const shown = withSystemVisibility(answer);
+      for (const key of Object.keys(answer)) if (!(key in shown)) delete answer[key];
+      Object.assign(answer, shown);
+    }
     // A message the fake placed is shown with the headers of the raw form it was given; one the
     // package made keeps the package's.
     const format = url.searchParams.get("format") ?? "full";
