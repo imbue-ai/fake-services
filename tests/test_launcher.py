@@ -1,6 +1,8 @@
 """The real launcher on small seeds. Skipped on a machine without node or the launcher's npm
 packages (`just minds-evals-external-services-install`)."""
 
+import base64
+import email
 import json
 import time
 from collections.abc import Iterator
@@ -124,6 +126,42 @@ _LINEAR_DATES_QUERY = (
 
 def _by(nodes: list[dict[str, Any]], key: str) -> dict[str, tuple[str, str]]:
     return {node[key]: (node["createdAt"], node["updatedAt"]) for node in nodes}
+
+
+_GOOGLE_TOKEN = "ya29.fake-redwood-google-token-morgan"
+_THOMAS_GOOGLE_TOKEN = "ya29.fake-redwood-google-token-thomas"
+_MORGAN = "morgan.reyes@redwood.example"
+
+
+def _gmail_get(
+    services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str | list[str]
+) -> httpx2.Response:
+    headers = {} if token is None else {"Authorization": "Bearer {}".format(token)}
+    return httpx2.get("{}/gmail/v1/users/{}".format(services.google_url, path), params=params, headers=headers)
+
+
+def _gmail(services: RunningExternalServices, path: str, **params: str | list[str]) -> Any:
+    answer = _gmail_get(services, path, **params)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _message_keys(services: RunningExternalServices, mailbox: str = _MORGAN) -> dict[str, str]:
+    """Each seeded message's Gmail id by its key, as the state dump holds them."""
+    items = _control(services, "state")["google"]["collections"]["google.messages"]["items"]
+    return {item["seed_key"]: item["gmail_id"] for item in items if item["user_email"] == mailbox}
+
+
+def _listed_ids(services: RunningExternalServices, kind: str = "messages", **params: str) -> list[str]:
+    return [entry["id"] for entry in _gmail(services, "me/{}".format(kind), **params).get(kind, [])]
+
+
+def _headers(message: dict[str, Any]) -> dict[str, str]:
+    return {header["name"]: header["value"] for header in message["payload"]["headers"]}
+
+
+def _shifted_ms(stamp: str) -> int:
+    return round((datetime.fromisoformat(stamp).timestamp() + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS) * 1000)
 
 
 def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_services: RunningExternalServices) -> None:
@@ -1223,6 +1261,15 @@ _PLACEABLE_ISSUE = {
 }
 _PLACEABLE_COMMENT = {"issue": "ENG-1", "body": "Noted.", "created_at": "2026-03-20T22:00:00.000Z"}
 _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "1774060000.000000", "text": "Noted."}
+_PLACEABLE_EMAIL = {
+    "key": "placeable",
+    "mailbox": "morgan.reyes@redwood.example",
+    "from": "Priya Shah <priya@northwind.example>",
+    "to": "morgan.reyes@redwood.example",
+    "subject": "Noted",
+    "date": "2026-03-20T15:30:00-07:00",
+    "body": "Noted.",
+}
 
 
 @pytest.mark.parametrize(
@@ -1244,6 +1291,19 @@ _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "17740600
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "thread_ts": "1.000000"}]}),
         ("slack", {"channels": [{"name": "leads", "is_private": True, "members": ["nobody"]}]}),
         ("linear", {"projects": [{"name": "Billing cleanup", "lead": "Nobody Here"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "mailbox": "nobody@redwood.example"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "in_reply_to": "no-such-message"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "labels": ["Vendors", "No such label"]}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "key": "invoice-question"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "date": "2026-03-20T15:30:00"}]}),
+        ("google", {"labels": [{"mailbox": "morgan.reyes@redwood.example", "name": "vendors"}]}),
+        ("google", {"labels": [{"mailbox": "nobody@redwood.example", "name": "Finance"}]}),
+        ("google", {"users": [{"email": "thomas.baird@redwood.example"}]}),
+        # Thomas has no Vendors label of his own: a label belongs to one mailbox.
+        (
+            "google",
+            {"messages": [{**_PLACEABLE_EMAIL, "mailbox": "thomas.baird@redwood.example", "labels": ["Vendors"]}]},
+        ),
         # A user or a cycle listed again under what the fake already keeps one by is not added, so
         # the name or number only the second entry gives is no record's to refer to.
         (
@@ -1458,6 +1518,27 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
         ),
         httpx2.get("{}/_control/health".format(external_services.slack_url), headers=_SLACK_HEADERS),
         httpx2.get("{}/_control/state".format(external_services.linear_url), headers={"Authorization": _LINEAR_TOKEN}),
+        _gmail_get(external_services, "me/settings/vacation"),
+        _gmail_get(external_services, "me/messages/0000000000000000"),
+        _gmail_get(external_services, "me/profile", token=None),
+        _gmail_get(external_services, "me/profile", token="ya29.other"),
+        _gmail_get(external_services, "thomas.baird@redwood.example/profile"),
+        _gmail_get(external_services, "me/messages", pageToken="x"),
+        _gmail_get(external_services, "me/messages", q="nothing-says-this"),
+        _gmail_get(external_services, "me/threads", q="invoice"),
+        _gmail_get(external_services, "me/messages/8b5677a1c796501d", format="raw"),
+        _gmail_get(external_services, "me/threads/8b5677a1c796501d"),
+        _gmail_get(external_services, "me/history", startHistoryId="1"),
+        _gmail_get(external_services, "me/labels"),
+        _gmail_get(external_services, "me/settings/sendAs"),
+        _gmail_get(external_services, "me/drafts"),
+        httpx2.get("{}/".format(external_services.google_url)),
+        httpx2.get("{}/o/oauth2/v2/auth".format(external_services.google_url)),
+        httpx2.get("{}/oauth2/v2/userinfo".format(external_services.google_url)),
+        httpx2.get(
+            "{}/gmail/v1/users/me/profile".format(external_services.google_url),
+            headers={"X-Forwarded-Host": "accounts.googleapis.com"},
+        ),
     ]
 
     for answer in answers:
@@ -1731,3 +1812,274 @@ def test_linear_refuses_a_user_past_its_hourly_requests(external_services: Runni
     # One request drains away every 1.44 seconds.
     assert 1 <= int(refused.headers["retry-after"]) <= 2
     assert _control(external_services, "health")["rate_limited"] == {"linear:requests": 1}
+
+
+def test_the_google_store_holds_the_seed_and_nothing_of_the_emulators_own(
+    external_services: RunningExternalServices,
+) -> None:
+    profile = _gmail(external_services, "me/profile")
+    labels = _gmail(external_services, "me/labels")["labels"]
+    dump = _control(external_services, "state")["google"]["collections"]
+
+    assert profile == {"emailAddress": _MORGAN, "messagesTotal": 4, "threadsTotal": 2, "historyId": "1000005"}
+    assert sorted(user["email"] for user in dump["google.users"]["items"]) == [
+        _MORGAN,
+        "thomas.baird@redwood.example",
+    ]
+    # No calendar, file or default mailbox of the package's own, and no record names it.
+    for collection in ("google.calendars", "google.calendar_events", "google.drive_items", "google.drafts"):
+        assert dump.get(collection, {"items": []})["items"] == [], collection
+    assert "testuser" not in json.dumps(dump) and "emulate" not in json.dumps(dump).lower()
+    assert [label["name"] for label in labels if label["type"] == "user"] == ["Vendors"]
+    assert {label["id"] for label in labels} >= {"INBOX", "SENT", "UNREAD", "STARRED", "IMPORTANT"}
+    # Every record is dated from the seed's messages, never by the box's clock.
+    stamps = [
+        datetime.fromisoformat(item[key].replace("Z", "+00:00")).timestamp()
+        for collection in dump.values()
+        for item in collection["items"]
+        for key in ("created_at", "updated_at")
+    ]
+    assert stamps
+    for stamp in stamps:
+        assert abs(stamp - time.time()) > 24 * 60 * 60, datetime.fromtimestamp(stamp).isoformat()
+
+
+def test_a_gmail_message_keeps_its_seeds_date_and_offset_shifted_to_the_trial(
+    external_services: RunningExternalServices,
+) -> None:
+    keys = _message_keys(external_services)
+
+    question = _gmail(external_services, "me/messages/{}".format(keys["invoice-question"]))
+    reply = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="metadata")
+
+    # 200 days after 2026-03-16, in the offset each sender's clock kept.
+    assert _headers(question)["Date"] == "Fri, 2 Oct 2026 09:15:00 -0700"
+    assert _headers(reply)["Date"] == "Fri, 2 Oct 2026 17:40:00 +0100"
+    assert question["internalDate"] == str(_shifted_ms("2026-03-16T09:15:00-07:00"))
+    assert reply["internalDate"] == str(_shifted_ms("2026-03-16T17:40:00+01:00"))
+    for message in (question, reply):
+        assert abs(int(message["internalDate"]) / 1000 - time.time()) > 24 * 60 * 60
+
+
+def test_a_gmail_thread_holds_its_replies_with_their_headers_and_derived_labels(
+    external_services: RunningExternalServices,
+) -> None:
+    keys = _message_keys(external_services)
+    vendors = next(
+        label["id"] for label in _gmail(external_services, "me/labels")["labels"] if label["name"] == "Vendors"
+    )
+
+    thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]))
+    raw = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="raw")
+
+    # A thread takes the id of its first message, and holds its replies oldest first.
+    assert thread["id"] == keys["invoice-question"]
+    messages = thread["messages"]
+    assert [message["id"] for message in messages] == [
+        keys["invoice-question"],
+        keys["invoice-reply"],
+        keys["invoice-followup"],
+    ]
+    # Received mail is in the INBOX and sent mail is SENT; the rest is what the seed states.
+    assert [message["labelIds"] for message in messages] == [
+        ["INBOX", vendors, "IMPORTANT"],
+        ["SENT"],
+        ["INBOX", vendors, "UNREAD", "STARRED"],
+    ]
+    question_headers, reply_headers, followup_headers = (_headers(message) for message in messages)
+    assert question_headers["Message-ID"] == "<4411-question@northwind.example>"
+    assert reply_headers["In-Reply-To"] == "<4411-question@northwind.example>"
+    assert reply_headers["Message-ID"].endswith("@redwood.example>")
+    assert followup_headers["In-Reply-To"] == reply_headers["Message-ID"]
+    assert followup_headers["References"] == "<4411-question@northwind.example> {}".format(reply_headers["Message-ID"])
+    # A message with HTML serves both its parts, and its raw form is a well-formed MIME message.
+    assert [part["mimeType"] for part in messages[1]["payload"]["parts"]] == ["text/plain", "text/html"]
+    decoded = base64.urlsafe_b64decode(raw["raw"] + "==").decode()
+    parsed = email.message_from_string(decoded)
+    assert (parsed["Date"], parsed.get_content_type()) == ("Fri, 2 Oct 2026 17:40:00 +0100", "multipart/alternative")
+    assert [part.get_payload() for part in parsed.get_payload()] == [
+        "Checking with finance and will get back to you.",
+        "<p>Checking with <b>finance</b> and will get back to you.</p>",
+    ]
+    # Ids and Message-IDs are derived from the seed: the same in every trial.
+    assert keys["invoice-question"] == "8b5677a1c796501d"
+
+
+def test_gmail_lists_and_searches_with_the_operators_it_supports(external_services: RunningExternalServices) -> None:
+    keys = _message_keys(external_services)
+    question, reply, followup, newsletter = (
+        keys[key] for key in ("invoice-question", "invoice-reply", "invoice-followup", "newsletter")
+    )
+
+    # Newest first; an archived message is listed, and only the mailbox's own.
+    assert _listed_ids(external_services) == [followup, reply, question, newsletter]
+    assert _listed_ids(external_services, labelIds="INBOX") == [followup, question]
+    assert _listed_ids(external_services, q="from:me") == [reply]
+    assert _listed_ids(external_services, q="label:Vendors is:unread") == [followup]
+    assert _listed_ids(external_services, q='"corrected invoice"') == [followup]
+    # A date is midnight Pacific time, as Gmail reads it, and newer_than counts from the trial's present.
+    assert _listed_ids(external_services, q="after:2026/10/02 before:2026/10/03") == [reply, question]
+    assert _listed_ids(external_services, q="newer_than:3d") == [followup]
+    assert _listed_ids(external_services, "threads") == [question, newsletter]
+    # Gmail leaves an empty list out, and refuses a page token it never issued.
+    assert _gmail(external_services, "me/messages", q="nothing-says-this") == {"resultSizeEstimate": 0}
+    assert _gmail(external_services, "me/threads", q="nothing-says-this") == {"resultSizeEstimate": 0}
+    paged = _gmail(external_services, "me/messages", maxResults="2")
+    assert (len(paged["messages"]), _listed_ids(external_services, pageToken=paged["nextPageToken"])) == (
+        2,
+        [question, newsletter],
+    )
+    bad_token = _gmail_get(external_services, "me/messages", pageToken="not-a-token")
+    assert (bad_token.status_code, bad_token.json()["error"]["status"]) == (400, "INVALID_ARGUMENT")
+    # A metadata header is matched whatever its case, as Gmail matches it.
+    metadata = _gmail(
+        external_services, "me/messages/{}".format(question), format="metadata", metadataHeaders="subject"
+    )
+    assert metadata["payload"]["headers"] == [{"name": "Subject", "value": "March invoice question"}]
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_a_gmail_search_operator_the_fake_answers_wrongly_is_counted(
+    external_services: RunningExternalServices,
+) -> None:
+    for query in ("invoice OR newsletter", "-from:priya", "cc:thomas", "{invoice newsletter}", "older_than:1y"):
+        assert _gmail_get(external_services, "me/messages", q=query).status_code == 200
+    _gmail_get(external_services, "me/threads", q="subject:(invoice question) has:drive")
+
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:gmail:q:OR": 1,
+        "google:gmail:q:-": 1,
+        "google:gmail:q:cc": 1,
+        "google:gmail:q:{}": 1,
+        "google:gmail:q:older_than": 1,
+        "google:gmail:q:subject:()": 1,
+        "google:gmail:q:has": 1,
+    }
+    assert [line["unsupported"] for line in _control(external_services, "log")][-1] == "google:gmail:q:subject:()"
+
+
+def test_a_google_path_or_host_the_fake_does_not_serve_is_not_found_and_counted(
+    external_services: RunningExternalServices,
+) -> None:
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
+    vacation = _gmail_get(external_services, "me/settings/vacation")
+    vacation_again = _gmail_get(external_services, _MORGAN + "/settings/vacation")
+    calendar = httpx2.get(
+        "{}/calendar/v3/users/me/calendarList".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    oauth = httpx2.get(
+        "{}/o/oauth2/v2/auth".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    other_host = httpx2.get(
+        "{}/gmail/v1/users/me/profile".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "people.googleapis.com"},
+    )
+    # Gmail is served on both of its hosts.
+    on_www = httpx2.get(
+        "{}/gmail/v1/users/me/profile".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    missing_message = _gmail_get(external_services, "me/messages/0000000000000000")
+
+    for answer in (vacation, vacation_again, calendar, oauth, other_host):
+        assert answer.status_code == 404
+        assert answer.json()["error"] == {
+            "code": 404,
+            "message": "Requested entity was not found.",
+            "errors": [{"message": "Requested entity was not found.", "domain": "global", "reason": "notFound"}],
+            "status": "NOT_FOUND",
+        }
+    assert (on_www.status_code, on_www.json()["emailAddress"]) == (200, _MORGAN)
+    # A message that is not there is the caller's mistake, as it is against Gmail, and not counted.
+    assert missing_message.status_code == 404
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:gmail:GET users/{userId}/settings/vacation": 2,
+        "google:path:/calendar/v3": 1,
+        "google:path:/o/oauth2": 1,
+        "google:host:people.googleapis.com": 1,
+    }
+
+
+def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:
+    thomas_keys = _message_keys(external_services, "thomas.baird@redwood.example")
+    morgan_keys = _message_keys(external_services)
+
+    thomas = _gmail(external_services, "me/profile", token=_THOMAS_GOOGLE_TOKEN)
+    thomas_listed = _gmail(external_services, "me/messages", token=_THOMAS_GOOGLE_TOKEN)
+    across = _gmail_get(external_services, "me/messages/{}".format(thomas_keys["thomas-invoice-copy"]))
+    delegated = _gmail_get(external_services, "thomas.baird@redwood.example/messages")
+    anonymous = _gmail_get(external_services, "me/profile", token=None)
+    unknown = _gmail_get(external_services, "me/profile", token="ya29.other")
+
+    assert (thomas["emailAddress"], thomas["messagesTotal"]) == ("thomas.baird@redwood.example", 1)
+    assert [entry["id"] for entry in thomas_listed["messages"]] == [thomas_keys["thomas-invoice-copy"]]
+    # Thomas's copy of the question is cc'd mail in his INBOX, a message of his own apart from Morgan's.
+    assert thomas_keys["thomas-invoice-copy"] not in morgan_keys.values()
+    assert across.status_code == 404
+    assert (delegated.status_code, delegated.json()["error"]["message"]) == (
+        403,
+        "Delegation denied for thomas.baird@redwood.example",
+    )
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
+
+
+def test_a_gmail_update_lands_in_its_thread_as_newer_history(external_services: RunningExternalServices) -> None:
+    before = _gmail(external_services, "me/profile")
+
+    added = _add(
+        external_services, "google", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "google")
+    )
+    after = _gmail(external_services, "me/profile")
+    keys = _message_keys(external_services)
+    history = _gmail(external_services, "me/history", startHistoryId=before["historyId"])
+
+    assert (added.status_code, added.json()["added"]) == (
+        200,
+        {"google_users": 1, "gmail_labels": 1, "gmail_messages": 1},
+    )
+    assert (after["messagesTotal"], after["threadsTotal"]) == (5, 2)
+    assert int(after["historyId"]) > int(before["historyId"])
+    assert [entry["messagesAdded"][0]["message"]["id"] for entry in history["history"]] == [keys["corrected-invoice"]]
+    thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]), format="minimal")
+    assert thread["messages"][-1]["id"] == keys["corrected-invoice"]
+    assert thread["messages"][-1]["internalDate"] == str(_shifted_ms("2026-03-20T15:30:00-07:00"))
+    assert _listed_ids(external_services, q="label:Finance") == [keys["corrected-invoice"]]
+    users = _control(external_services, "state")["google"]["collections"]["google.users"]["items"]
+    assert "olivia.chen@redwood.example" in {user["email"] for user in users}
+
+
+def test_a_burst_past_gmails_per_user_quota_is_refused_as_gmail_refuses_it(
+    external_services: RunningExternalServices,
+) -> None:
+    message_id = _message_keys(external_services)["invoice-question"]
+    # A full get costs 60 of a user's 6,000 units a minute: 100 fit, and the 101st does not.
+    with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
+        burst = [
+            client.get("{}/gmail/v1/users/me/messages/{}".format(external_services.google_url, message_id))
+            for _ in range(101)
+        ]
+    # The quota is each user's own, and a cheaper call does not fit either once it is spent.
+    cheap = _gmail_get(external_services, "me/profile")
+    thomas = _gmail_get(external_services, "me/profile", token=_THOMAS_GOOGLE_TOKEN)
+
+    assert [answer.status_code for answer in burst[:100]] == [200] * 100
+    refused = burst[100]
+    assert refused.status_code == 403
+    assert refused.json() == {
+        "error": {
+            "code": 403,
+            "message": "User Rate Limit Exceeded",
+            "errors": [
+                {"message": "User Rate Limit Exceeded", "domain": "usageLimits", "reason": "userRateLimitExceeded"}
+            ],
+            "status": "PERMISSION_DENIED",
+        }
+    }
+    assert 1 <= int(refused.headers["retry-after"]) <= 60
+    # Gmail documents no rate limit headers, so an admitted answer carries none.
+    assert not {name for name in burst[0].headers if name.startswith(("x-ratelimit", "retry-after"))}
+    assert (cheap.status_code, thomas.status_code) == (403, 200)
+    assert _control(external_services, "health")["rate_limited"] == {"google:gmail_per_user": 2}

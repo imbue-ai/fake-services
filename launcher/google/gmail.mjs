@@ -226,7 +226,8 @@ function rewriteQuery(q, email, nowMs) {
     }
     return term;
   });
-  return { q: terms.join(" "), keys: keys.map((k) => `google:gmail:q:${k}`) };
+  // A gap is counted once per request, however many of the query's terms meet it.
+  return { q: terms.join(" "), keys: [...new Set(keys)].map((k) => `google:gmail:q:${k}`) };
 }
 
 // The headers a metadata get may name, as the package spells them; Gmail matches the names whatever
