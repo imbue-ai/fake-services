@@ -1,7 +1,7 @@
 // Gmail v1 for the fake Google: @emulators/google's Gmail routes and store, with what a trial needs on
 // top. Messages are inserted straight into the store, with ids, threads, Message-IDs and historyIds
 // derived from the seed, so they read the same in every trial; a message keeps the UTC offset its seed
-// states in its Date header, and its labels are derived from who sent it (settle step in add());
+// states in its Date header, and its labels are derived from who sent it;
 // users.getProfile; a search operator the package answers wrongly is counted; a list leaves out an
 // empty list and refuses a page token it never issued, as Gmail does. See google.mjs for the product
 // interface this module exports.
