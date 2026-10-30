@@ -8,7 +8,7 @@ from datetime import datetime
 from datetime import timedelta
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
@@ -30,21 +30,21 @@ _SLACK_HEADERS = {"Authorization": "Bearer {}".format(_SLACK_TOKEN)}
 
 
 def _slack(services: RunningExternalServices, method: str, **params: str) -> dict[str, Any]:
-    return httpx.get("{}/api/{}".format(services.slack_url, method), params=params, headers=_SLACK_HEADERS).json()
+    return httpx2.get("{}/api/{}".format(services.slack_url, method), params=params, headers=_SLACK_HEADERS).json()
 
 
-def _linear(services: RunningExternalServices, query: str, token: str = _LINEAR_TOKEN) -> httpx.Response:
-    return httpx.post(
+def _linear(services: RunningExternalServices, query: str, token: str = _LINEAR_TOKEN) -> httpx2.Response:
+    return httpx2.post(
         "{}/graphql".format(services.linear_url), json={"query": query}, headers={"Authorization": token}
     )
 
 
 def _control(services: RunningExternalServices, route: str) -> Any:
-    return httpx.get("{}/_control/{}".format(services.control_url, route)).json()
+    return httpx2.get("{}/_control/{}".format(services.control_url, route)).json()
 
 
-def _add(services: RunningExternalServices, service_name: str, update_text: str) -> httpx.Response:
-    return httpx.post("{}/_control/records/{}".format(services.control_url, service_name), content=update_text)
+def _add(services: RunningExternalServices, service_name: str, update_text: str) -> httpx2.Response:
+    return httpx2.post("{}/_control/records/{}".format(services.control_url, service_name), content=update_text)
 
 
 def _issue_titles(services: RunningExternalServices) -> dict[str, str]:
@@ -644,11 +644,11 @@ def test_the_active_cycle_is_the_one_spanning_the_trials_present(external_servic
 
 
 def test_only_a_seeded_token_authenticates(external_services: RunningExternalServices) -> None:
-    slack_answer = httpx.get(
+    slack_answer = httpx2.get(
         "{}/api/conversations.list".format(external_services.slack_url), headers={"Authorization": "Bearer xoxb-other"}
     )
     linear_answer = _linear(external_services, "{ viewer { name } }", token="lin_api_other")
-    anonymous = httpx.get("{}/api/conversations.list".format(external_services.slack_url))
+    anonymous = httpx2.get("{}/api/conversations.list".format(external_services.slack_url))
 
     assert slack_answer.json()["ok"] is False
     assert anonymous.json() == {"ok": False, "error": "not_authed"}
@@ -709,7 +709,7 @@ def test_an_update_goes_to_a_served_service_by_name_and_nowhere_else(
     update_text = external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "slack")
     before = _control(external_services, "health")["counts"]
 
-    unnamed = httpx.post("{}/_control/records".format(external_services.control_url), content=update_text)
+    unnamed = httpx2.post("{}/_control/records".format(external_services.control_url), content=update_text)
     unknown = _add(external_services, "github", update_text)
 
     assert (unnamed.status_code, unnamed.json()) == (404, {"error": "unknown control route"})
@@ -727,7 +727,7 @@ def test_the_control_endpoints_are_on_the_control_port_only(external_services: R
     update_text = external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "slack")
 
     answers = [
-        httpx.get("{}/_control/{}".format(service_url, route), headers=headers)
+        httpx2.get("{}/_control/{}".format(service_url, route), headers=headers)
         for service_url, headers in (
             (external_services.slack_url, _SLACK_HEADERS),
             (external_services.linear_url, {"Authorization": _LINEAR_TOKEN}),
@@ -735,7 +735,7 @@ def test_the_control_endpoints_are_on_the_control_port_only(external_services: R
         for route in ("health", "state", "log")
     ]
     answers.append(
-        httpx.post(
+        httpx2.post(
             "{}/_control/records/slack".format(external_services.slack_url),
             content=update_text,
             headers=_SLACK_HEADERS,
@@ -804,21 +804,21 @@ def test_a_request_for_a_services_other_host_is_not_found_and_counted(
 ) -> None:
     """The curl shim points every host of a service at its fake and names the host the request was
     for; only the API host is served."""
-    slack_file = httpx.get(
+    slack_file = httpx2.get(
         "{}/files-pri/T1-F1/report.pdf".format(external_services.slack_url),
         headers={**_SLACK_HEADERS, "X-Forwarded-Host": "files.slack.com"},
     )
     # The path is one the API host serves, so only the named host can be what refuses it.
-    sibling_api = httpx.get(
+    sibling_api = httpx2.get(
         "{}/api/auth.test".format(external_services.slack_url),
         headers={**_SLACK_HEADERS, "X-Forwarded-Host": "redwood.slack.com"},
     )
-    linear_upload = httpx.post(
+    linear_upload = httpx2.post(
         "{}/graphql".format(external_services.linear_url),
         json={"query": "{ viewer { name } }"},
         headers={"Authorization": _LINEAR_TOKEN, "X-Forwarded-Host": "uploads.linear.app"},
     )
-    primary = httpx.get(
+    primary = httpx2.get(
         "{}/api/auth.test".format(external_services.slack_url),
         headers={**_SLACK_HEADERS, "X-Forwarded-Host": "slack.com"},
     )
@@ -951,12 +951,12 @@ def test_every_graphql_request_goes_through_the_public_schema(external_services:
         external_services,
         'mutation { issueCreate(input: {teamId: "ENG", title: "x"}) { success } commentCreate(input: {body: "y"}) { success } }',
     )
-    got = httpx.get(
+    got = httpx2.get(
         "{}/graphql".format(external_services.linear_url),
         params={"query": "{ viewer { name } }"},
         headers={"Authorization": _LINEAR_TOKEN},
     )
-    invalid_get = httpx.get(
+    invalid_get = httpx2.get(
         "{}/graphql".format(external_services.linear_url),
         params={"query": "{ viewer { noSuchField } }"},
         headers={"Authorization": _LINEAR_TOKEN},
@@ -989,8 +989,8 @@ def test_a_write_is_refused_only_when_it_is_the_operation_that_would_run(
         'mutation Write { issueCreate(input: {teamId: "ENG", title: "x"}) { success } } query Read { viewer { name } }'
     )
 
-    def post(operation_name: str) -> httpx.Response:
-        return httpx.post(
+    def post(operation_name: str) -> httpx2.Response:
+        return httpx2.post(
             "{}/graphql".format(external_services.linear_url),
             json={"query": document, "operationName": operation_name},
             headers={"Authorization": _LINEAR_TOKEN},
@@ -1025,8 +1025,8 @@ def test_a_query_missing_its_required_variable_is_refused_with_400(external_serv
 
 
 def test_a_get_carries_its_variables_as_json_in_the_url(external_services: RunningExternalServices) -> None:
-    def get(variables: str) -> httpx.Response:
-        return httpx.get(
+    def get(variables: str) -> httpx2.Response:
+        return httpx2.get(
             "{}/graphql".format(external_services.linear_url),
             params={"query": "query One($id: String!) { issue(id: $id) { identifier } }", "variables": variables},
             headers={"Authorization": _LINEAR_TOKEN},
@@ -1042,15 +1042,15 @@ def test_a_get_carries_its_variables_as_json_in_the_url(external_services: Runni
 def test_a_slack_method_the_fake_does_not_have_is_answered_as_slack_does_and_counted(
     external_services: RunningExternalServices,
 ) -> None:
-    asked = httpx.get(
+    asked = httpx2.get(
         "{}/api/admin.users.list".format(external_services.slack_url), params={"limit": "5"}, headers=_SLACK_HEADERS
     )
-    posted = httpx.post("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
-    other = httpx.get("{}/api/no.such.method".format(external_services.slack_url), headers=_SLACK_HEADERS)
+    posted = httpx2.post("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
+    other = httpx2.get("{}/api/no.such.method".format(external_services.slack_url), headers=_SLACK_HEADERS)
     # A method the fake has, a call that fails for the caller's own reason, and a path that is no method.
     _slack(external_services, "auth.test")
     missing_argument = _slack(external_services, "conversations.history")
-    not_a_method = httpx.get("{}/no/such/path".format(external_services.slack_url), headers=_SLACK_HEADERS)
+    not_a_method = httpx2.get("{}/no/such/path".format(external_services.slack_url), headers=_SLACK_HEADERS)
 
     for answer in (asked, posted, other):
         assert (answer.status_code, answer.json()) == (200, {"ok": False, "error": "unknown_method"})
@@ -1284,7 +1284,7 @@ def test_the_launcher_refuses_what_the_checks_refuse_for_a_reference(
 
 def test_the_access_log_holds_one_line_per_request_and_no_token(external_services: RunningExternalServices) -> None:
     _control(external_services, "health")
-    httpx.get(
+    httpx2.get(
         "{}/api/conversations.list".format(external_services.slack_url),
         params={"limit": "1", "token": _SLACK_TOKEN},
         headers={**_SLACK_HEADERS, "User-Agent": "roadmap-app/1.0", "X-Eval-Caller": "app"},
@@ -1320,7 +1320,7 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
 
 
 def test_the_state_dump_redacts_every_token(external_services: RunningExternalServices) -> None:
-    dump_text = httpx.get("{}/_control/state".format(external_services.control_url)).text
+    dump_text = httpx2.get("{}/_control/state".format(external_services.control_url)).text
     dump = json.loads(dump_text)
 
     assert _SLACK_TOKEN not in dump_text and _LINEAR_TOKEN not in dump_text
@@ -1344,22 +1344,22 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
         _linear(external_services, "{ noSuchField }"),
         _linear(external_services, "{ viewer { name }", token="lin_api_other"),
         _linear(external_services, 'mutation { issueCreate(input: {teamId: "NOPE", title: "x"}) { success } }'),
-        httpx.get("{}/".format(external_services.linear_url), headers={"Authorization": _LINEAR_TOKEN}),
-        httpx.get("{}/".format(external_services.slack_url), headers=_SLACK_HEADERS),
-        httpx.get("{}/no/such/path".format(external_services.slack_url), headers=_SLACK_HEADERS),
-        httpx.get("{}/api/no.such.method".format(external_services.slack_url), headers=_SLACK_HEADERS),
-        httpx.get("{}/api/conversations.history".format(external_services.slack_url), headers=_SLACK_HEADERS),
-        httpx.get("{}/api/auth.test".format(external_services.slack_url)),
-        httpx.get(
+        httpx2.get("{}/".format(external_services.linear_url), headers={"Authorization": _LINEAR_TOKEN}),
+        httpx2.get("{}/".format(external_services.slack_url), headers=_SLACK_HEADERS),
+        httpx2.get("{}/no/such/path".format(external_services.slack_url), headers=_SLACK_HEADERS),
+        httpx2.get("{}/api/no.such.method".format(external_services.slack_url), headers=_SLACK_HEADERS),
+        httpx2.get("{}/api/conversations.history".format(external_services.slack_url), headers=_SLACK_HEADERS),
+        httpx2.get("{}/api/auth.test".format(external_services.slack_url)),
+        httpx2.get(
             "{}/files-pri/T1-F1/report.pdf".format(external_services.slack_url),
             headers={**_SLACK_HEADERS, "X-Forwarded-Host": "files.slack.com"},
         ),
-        httpx.get(
+        httpx2.get(
             "{}/abc".format(external_services.linear_url),
             headers={"Authorization": _LINEAR_TOKEN, "X-Forwarded-Host": "uploads.linear.app"},
         ),
-        httpx.get("{}/_control/health".format(external_services.slack_url), headers=_SLACK_HEADERS),
-        httpx.get("{}/_control/state".format(external_services.linear_url), headers={"Authorization": _LINEAR_TOKEN}),
+        httpx2.get("{}/_control/health".format(external_services.slack_url), headers=_SLACK_HEADERS),
+        httpx2.get("{}/_control/state".format(external_services.linear_url), headers={"Authorization": _LINEAR_TOKEN}),
     ]
 
     for answer in answers:
