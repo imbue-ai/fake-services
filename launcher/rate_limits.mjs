@@ -12,15 +12,17 @@
 //   bucketOf(req, url, service) -> [{bucket, scope, cost}]
 //                the buckets a request draws on, each with the scope whose window it shares (a
 //                workspace, a user) and what it costs there; empty for a request nothing limits
-//   refuse(req, retryAfterSeconds, bucket) -> Response
-//                the vendor's own refusal; retryAfterSeconds is null for a request that never fits
+//   refuse(req, retryAfterSeconds, bucket, cost) -> Response
+//                the vendor's own refusal; retryAfterSeconds is null for a request that never fits,
+//                and cost is what the request would have drawn on the refusing bucket
 //   headers(standing) -> {name: value}, optional
 //                the vendor's headers, set on every answer to a limited request, from each bucket's
 //                standing once an admitted request is counted, or as the scope stands for a refused
 //                one: {bucket: {limit, remaining, resetMs, cost}}, resetMs being when the scope's
 //                bucket is next whole (epoch ms)
-// A refusal that waiting cures also carries Retry-After, in whole seconds. A refused request draws on
-// no bucket, so a caller that retries after Retry-After is admitted.
+// A refusal that waiting cures carries the standing headers and Retry-After, in whole seconds; one
+// that never fits carries neither, as a vendor refusing a malformed request sends none. A refused
+// request draws on no bucket, so a caller that retries after Retry-After is admitted.
 //
 // createRateLimits({enabled, now, windowSeconds}): `now()` is the launcher's clock in epoch ms;
 // `windowSeconds`, when set, replaces every bucket's window (a test's, so one can be waited out).
@@ -102,7 +104,7 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
         rateLimited[key] = (rateLimited[key] ?? 0) + 1;
         refusedBy.set(req, key);
         const retryAfter = never ? null : Math.max(1, Math.ceil(by.retryMs / 1000));
-        return withHeaders(policy.refuse(req, retryAfter, by.bucket), retryAfter === null ? headers : { ...headers, "Retry-After": retryAfter });
+        return withHeaders(policy.refuse(req, retryAfter, by.bucket, by.cost), retryAfter === null ? {} : { ...headers, "Retry-After": retryAfter });
       }
       for (const a of assessed) a.commit();
       return withHeaders(await service.route(req, url), headers);

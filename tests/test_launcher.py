@@ -1513,8 +1513,34 @@ def test_every_linear_answer_carries_linears_rate_limit_headers(external_service
     assert default_page.headers["x-ratelimit-requests-remaining"] == "2498"
 
 
-# A query of exactly the per-query maximum: 100 teams, each 1 point for itself and 90 issues of 1.1.
-_MAX_COMPLEXITY_QUERY = "{ teams(first: 100) { nodes { issues(first: 90) { nodes { id } } } } }"
+# A query of exactly the per-query maximum: 100 teams, each 1 point for itself and 66 issues of 1.5.
+_MAX_COMPLEXITY_QUERY = (
+    "{ teams(first: 100) { nodes { issues(first: 66) { nodes { id title description createdAt updatedAt } } } } }"
+)
+# What the real API charged these on 2026-10-29 (`X-Complexity`), one for each rule of the scoring: the
+# root issues list and an issue's own lists are priced as objects, every other connection multiplies
+# its selection by its page size, and a selection of `id` alone is 0.2.
+_MEASURED_COMPLEXITIES = (
+    ("{ issues(first: 250) { nodes { id } } }", 2),
+    ("{ issues(first: 250) { nodes { id title } } }", 3),
+    ("{ issues(first: 250) { pageInfo { hasNextPage endCursor } nodes { id title } } }", 4),
+    ("{ issues(first: 250) { nodes { id labels { nodes { name } } } } }", 5),
+    ("{ issues(first: 250) { nodes { id project { id name } } } }", 4),
+    ("{ issues(first: 250) { nodes { id project { id projectMilestones { nodes { id name } } } } } }", 64),
+    ("{ issues(first: 250) { nodes { id assignee { id assignedIssues(first: 100) { nodes { id title } } } } } }", 124),
+    ("{ projects(first: 50) { nodes { id name } } }", 60),
+    ("{ projects(first: 50) { pageInfo { hasNextPage endCursor } nodes { id name } } }", 120),
+    ("{ projects(first: 50) { nodes { id projectUpdates(first: 20) { nodes { id body } } } } }", 1255),
+    ("{ teams { nodes { id issues(first: 250) { nodes { id } } } } }", 2555),
+    ("{ teams { nodes { id members { nodes { id } } issues(first: 250) { nodes { id } } } } }", 3055),
+    ("{ cycles(first: 10) { nodes { id issues(first: 250) { nodes { id title } } } } }", 3011),
+    (
+        "{ issues(first: 250) { nodes { id comments(first: 100) { nodes { id body user { name } } } labels { nodes { name } } "
+        "project { id name projectMilestones { nodes { id } } projectUpdates(first: 20) { nodes { id } } } team { key } "
+        "assignee { name } } } }",
+        25,
+    ),
+)
 
 
 def test_a_linear_query_past_the_per_query_maximum_is_refused_and_costs_nothing(
@@ -1522,21 +1548,34 @@ def test_a_linear_query_past_the_per_query_maximum_is_refused_and_costs_nothing(
 ) -> None:
     at_maximum = _linear(external_services, _MAX_COMPLEXITY_QUERY)
     past_maximum = _linear(
-        external_services, "{ teams(first: 100) { nodes { issues(first: 90) { nodes { id title } } } } }"
+        external_services,
+        "{ teams(first: 100) { nodes { issues(first: 67) { nodes { id title description createdAt updatedAt } } } } }",
     )
     after = _linear(external_services, "{ viewer { id } }")
 
     assert (at_maximum.status_code, at_maximum.headers["x-complexity"]) == (200, "10000")
-    assert (past_maximum.status_code, past_maximum.headers["x-complexity"]) == (429, "10900")
+    # Refused as Linear refuses it: an input error naming the score, with no standing headers.
+    assert past_maximum.status_code == 400
     error = past_maximum.json()["errors"][0]
-    assert error["extensions"]["code"] == "RATELIMITED"
-    assert "10000" in error["message"]
-    # Waiting never admits it, so no wait is named.
-    assert "retry-after" not in past_maximum.headers
-    # The refusal reports the user's standing without itself, and the next answer is the second counted.
-    assert past_maximum.headers["x-ratelimit-requests-remaining"] == "2499"
+    assert (error["message"], error["extensions"]["code"]) == ("Query too complex", "INPUT_ERROR")
+    assert error["extensions"]["userPresentableMessage"] == (
+        "The query is too complex. Complexity: 10150. Maximum allowed complexity: 10000."
+    )
+    assert not {
+        name for name in past_maximum.headers if name.startswith(("x-complexity", "x-ratelimit", "retry-after"))
+    }
+    # The refusal is not counted, so the next answer is the second counted.
+    assert at_maximum.headers["x-ratelimit-requests-remaining"] == "2499"
     assert after.headers["x-ratelimit-requests-remaining"] == "2498"
     assert _control(external_services, "health")["rate_limited"] == {"linear:complexity": 1}
+
+
+def test_linear_scores_a_query_as_the_real_api_charges_it(external_services: RunningExternalServices) -> None:
+    scored = [
+        (query, int(_linear(external_services, query).headers["x-complexity"])) for query, _ in _MEASURED_COMPLEXITIES
+    ]
+
+    assert scored == list(_MEASURED_COMPLEXITIES)
 
 
 # The answers up to the first refusal, and how many seconds sending them took.

@@ -72,10 +72,22 @@ function fieldResolver(source, args, context, info) {
 // unauthenticated request is refused by authentication here, so Linear's per-address limits for
 // those are not kept.
 const MAX_QUERY_COMPLEXITY = 10000;
-// A query's complexity as Linear scores it: each property 0.1 point, each object 1, and a connection
-// multiplies its children's points by its pagination argument (`first` or `last`), else 50; the sum
-// is rounded up. Counted in tenths, so the sum is exact. A document that does not parse, or names no
-// operation to run, costs nothing: Linear refuses it before it runs.
+// A query's complexity as Linear charges it, measured against api.linear.app on 2026-10-29 (the rule
+// its documentation states -- 0.1 a property, 1 an object, a connection multiplying its children by
+// its page size -- charges a nested query orders of magnitude more than the API does). A selection on
+// an object costs 0.2 when it asks for `id` alone, else 1 plus 0.1 for each scalar field plus the
+// cost of each object field's own selection. A connection field multiplies the cost of its
+// selection's fields (`nodes`, `pageInfo`, each a selection of its own) by its pagination argument
+// (`first` or `last`), else 50 -- except the connections in UNMULTIPLIED_CONNECTIONS, which Linear
+// prices like a plain object: 1 plus the cost of its selection's fields. The sum is rounded up.
+// Counted in tenths, so the sum is exact. A document that does not parse, or names no operation to
+// run, costs nothing: Linear refuses it before it runs.
+// The connections Linear prices without a page-size multiplier: the root issues list, and the lists
+// an issue carries along. Every other connection measured (the root teams, projects, users, cycles,
+// comments and labels; a team's, project's, cycle's or user's issues; a project's members, teams,
+// milestones and updates; an issue's relations, history and documents; a comment's children) is
+// multiplied.
+const UNMULTIPLIED_CONNECTIONS = new Set(["Query.issues", "Issue.comments", "Issue.labels", "Issue.children", "Issue.attachments", "Issue.subscribers", "Issue.needs"]);
 function complexityOf(body) {
   let doc;
   try {
@@ -99,29 +111,35 @@ function complexityOf(body) {
   };
   // The fragments being expanded, so a cycle (which validation refuses anyway) ends.
   const expanding = new Set();
-  const tenths = (selectionSet, type) => {
-    let sum = 0;
+  // The fields a selection set names, fragments expanded, each with the type it is read on.
+  const picked = (selectionSet, type, into) => {
     for (const sel of selectionSet.selections) {
-      if (sel.kind === "InlineFragment") sum += tenths(sel.selectionSet, sel.typeCondition ? schema.getType(sel.typeCondition.name.value) : type);
+      if (sel.kind === "InlineFragment") picked(sel.selectionSet, sel.typeCondition ? schema.getType(sel.typeCondition.name.value) : type, into);
       else if (sel.kind === "FragmentSpread") {
         const fragment = fragments.get(sel.name.value);
         if (!fragment || expanding.has(sel.name.value)) continue;
         expanding.add(sel.name.value);
-        sum += tenths(fragment.selectionSet, schema.getType(fragment.typeCondition.name.value));
+        picked(fragment.selectionSet, schema.getType(fragment.typeCondition.name.value), into);
         expanding.delete(sel.name.value);
-      } else {
-        const def = type?.getFields?.()[sel.name.value];
-        if (!def || !sel.selectionSet) sum += 1;
-        else {
-          const named = getNamedType(def.type);
-          const children = tenths(sel.selectionSet, named);
-          sum += named.name.endsWith("Connection") ? pageSize(sel) * children : 10 + children;
-        }
-      }
+      } else into.push({ field: sel, owner: type });
     }
-    return sum;
+    return into;
   };
-  return Math.ceil(tenths(op.selectionSet, schema.getRootType(op.operation)) / 10);
+  const fieldsCost = (selectionSet, type) => picked(selectionSet, type, []).reduce((sum, { field, owner }) => sum + fieldCost(field, owner), 0);
+  const selectionCost = (selectionSet, type) => {
+    const fields = picked(selectionSet, type, []);
+    if (fields.length === 1 && fields[0].field.name.value === "id") return 2;
+    return 10 + fields.reduce((sum, { field, owner }) => sum + fieldCost(field, owner), 0);
+  };
+  const fieldCost = (field, owner) => {
+    const def = owner?.getFields?.()[field.name.value];
+    if (!def || !field.selectionSet) return 1;
+    const named = getNamedType(def.type);
+    if (!named.name.endsWith("Connection")) return selectionCost(field.selectionSet, named);
+    if (UNMULTIPLIED_CONNECTIONS.has(`${owner.name}.${field.name.value}`)) return 10 + fieldsCost(field.selectionSet, named);
+    return pageSize(field) * fieldsCost(field.selectionSet, named);
+  };
+  return Math.ceil(fieldsCost(op.selectionSet, schema.getRootType(op.operation)) / 10);
 }
 // A /graphql request's document, variables and operation, from the URL for a GET and the body
 // otherwise: {body}, or {error}, what Linear answers a request it cannot read with.
@@ -144,6 +162,13 @@ function jsonOf(text) {
 }
 const tokenOf = (req) => (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
 const rateLimited = (message) => ({ errors: [{ message, extensions: { type: "ratelimited", code: "RATELIMITED", userError: true, userPresentableMessage: message } }] });
+// Shaped as Linear refuses a query past its per-query maximum (measured 2026-10-29): an HTTP 400 with no
+// standing headers.
+const tooComplex = (cost) =>
+  Response.json(
+    { errors: [{ message: "Query too complex", extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: `The query is too complex. Complexity: ${cost}. Maximum allowed complexity: ${MAX_QUERY_COMPLEXITY}.`, http: { status: 400 } } }] },
+    { status: 400 },
+  );
 // See rate_limits.mjs for what a policy holds.
 export const limits = {
   buckets: {
@@ -159,19 +184,19 @@ export const limits = {
       { bucket: "complexity", scope: user, cost: body ? complexityOf(body) : 0 },
     ];
   },
-  // A query above the per-query maximum is refused as a rate limit with no time to wait, since
-  // waiting never admits it.
-  refuse: (req, retryAfterSeconds, bucket) =>
-    Response.json(
-      rateLimited(
-        retryAfterSeconds === null
-          ? `Query too complex: a single query may cost at most ${MAX_QUERY_COMPLEXITY} complexity points.`
-          : bucket === "complexity"
-            ? "Rate limit exceeded: too much query complexity in the last hour."
-            : "Rate limit exceeded: too many requests in the last hour.",
-      ),
-      { status: 429 },
-    ),
+  // A query above the per-query maximum is refused as Linear refuses it: an input error, not a rate
+  // limit, since waiting never admits it.
+  refuse: (req, retryAfterSeconds, bucket, cost) =>
+    retryAfterSeconds === null
+      ? tooComplex(cost)
+      : Response.json(
+          rateLimited(
+            bucket === "complexity"
+              ? "Rate limit exceeded: too much query complexity in the last hour."
+              : "Rate limit exceeded: too many requests in the last hour.",
+          ),
+          { status: 429 },
+        ),
   headers: ({ requests, complexity }) => ({
     "X-RateLimit-Requests-Limit": requests.limit,
     "X-RateLimit-Requests-Remaining": requests.remaining,
