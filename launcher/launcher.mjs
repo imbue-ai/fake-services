@@ -38,8 +38,15 @@
 //      when unset>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
-//   GET  /_control/health             {ok, shift_ms, services, counts, unsupported_calls}
-//   GET  /_control/state              the stores of the served services, tokens redacted
+//   GET  /_control/health             {ok, shift_ms, services, counts, unsupported_calls, phase,
+//                                     phases}; counts.requests and unsupported_calls are the totals,
+//                                     phases[<phase>] holds {requests, unsupported_calls} of the
+//                                     requests made in that phase alone
+//   GET  /_control/state              the stores of the served services, tokens redacted, with the
+//                                     health's counts and phases
+//   POST /_control/phase              {"name": <phase>}: every request from now on is logged and
+//                                     counted in that phase ("agent" until one is marked); answers
+//                                     {ok, phase, previous}
 //   POST /_control/records/<service>  add an update to a served service (its seed's record collections,
 //                                     same time shift); all of it lands or none does
 //   GET  /_control/log                the access log so far, as a JSON array
@@ -107,7 +114,8 @@ const counts = () => ({
 });
 async function control(req) {
   const url = new URL(req.url);
-  if (url.pathname === "/_control/health") return Response.json({ ok: true, shift_ms: shiftMs, services: served, counts: counts(), unsupported_calls: log.unsupportedCalls });
+  if (url.pathname === "/_control/health")
+    return Response.json({ ok: true, shift_ms: shiftMs, services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, phase: log.phase(), phases: log.phases });
   if (url.pathname === "/_control/log") return Response.json(log.lines);
   if (url.pathname === "/_control/state") {
     const redact = (snap) => JSON.parse(JSON.stringify(snap, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
@@ -116,8 +124,21 @@ async function control(req) {
       shift_ms: shiftMs,
       counts: counts(),
       unsupported_calls: log.unsupportedCalls,
+      phase: log.phase(),
+      phases: log.phases,
       ...Object.fromEntries(served.map((name) => [name, redact(services[name].store.snapshot())])),
     });
+  }
+  if (url.pathname === "/_control/phase" && req.method === "POST") {
+    let name;
+    try {
+      ({ name } = await req.json());
+    } catch {
+      return Response.json({ ok: false, error: "the phase mark is not JSON" }, { status: 400 });
+    }
+    // A phase names a key of the health's phases, so it is kept to a plain identifier.
+    if (typeof name !== "string" || !/^[a-z][a-z0-9_]*$/.test(name)) return Response.json({ ok: false, error: `the phase name ${JSON.stringify(name)} is not a lowercase identifier` }, { status: 400 });
+    return Response.json({ ok: true, phase: name, previous: log.setPhase(name) });
   }
   const records = url.pathname.match(/^\/_control\/records\/([a-z]+)$/);
   if (records && req.method === "POST") {

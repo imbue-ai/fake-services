@@ -1,5 +1,8 @@
 // The access log: one line per request that reaches a fake, and the count of every call a fake does
-// not support. See launcher.mjs for the service interface this wraps.
+// not support. Every line carries the phase of the trial it was made in: "agent" until the driver
+// marks another (setPhase), so the requests the verification flows cause are told apart from the
+// ones the agent's app made while the agent worked. See launcher.mjs for the service interface this
+// wraps.
 import crypto from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 
@@ -13,6 +16,18 @@ export function createAccessLog(path, services) {
   if (path) writeFileSync(path, "");
   const lines = [];
   const unsupportedCalls = {};
+  let phase = "agent";
+  // Per phase, in the order the phases were first marked: its requests by service, and its calls the
+  // fakes do not support by what was asked.
+  const phases = {};
+  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {} });
+  phaseCounts(phase);
+  function setPhase(name) {
+    const previous = phase;
+    phase = name;
+    phaseCounts(name);
+    return previous;
+  }
   // Slack takes a token as a query or form parameter too, so the logged URL and body are masked of
   // every token the seeds name.
   function withoutTokens(text) {
@@ -24,6 +39,8 @@ export function createAccessLog(path, services) {
     return async (req) => {
       const url = new URL(req.url);
       const began = Date.now();
+      // The phase the request began in, as its ts is when it began.
+      const requestPhase = phase;
       const bodyText = req.method === "GET" ? "" : await req.clone().text();
       // The shim names the host a request was for. A service's other hosts (file downloads, uploads)
       // are not served, and a request for one is answered here rather than by the real host.
@@ -36,11 +53,17 @@ export function createAccessLog(path, services) {
       } catch {}
       const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
       const unsupported = host === service.host ? service.unsupportedKeys(url, json, req) : [`${service.name}:host:${host}`];
-      for (const key of unsupported) unsupportedCalls[key] = (unsupportedCalls[key] ?? 0) + 1;
+      const inPhase = phaseCounts(requestPhase);
+      inPhase.requests[service.name] += 1;
+      for (const key of unsupported) {
+        unsupportedCalls[key] = (unsupportedCalls[key] ?? 0) + 1;
+        inPhase.unsupported_calls[key] = (inPhase.unsupported_calls[key] ?? 0) + 1;
+      }
       const outcome = service.outcome(json);
       const rec = {
         ts: new Date(began).toISOString(),
         seq: lines.length + 1,
+        phase: requestPhase,
         service: service.name,
         method: req.method,
         url: withoutTokens(`https://${host}${url.pathname}${url.search}`),
@@ -65,5 +88,13 @@ export function createAccessLog(path, services) {
       return res;
     };
   }
-  return { logged, lines, unsupportedCalls, requestCount: (name) => lines.filter((rec) => rec.service === name).length };
+  return {
+    logged,
+    lines,
+    unsupportedCalls,
+    requestCount: (name) => lines.filter((rec) => rec.service === name).length,
+    setPhase,
+    phase: () => phase,
+    phases,
+  };
 }

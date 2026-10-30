@@ -898,7 +898,7 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
 
     assert _SLACK_TOKEN not in log_text and _LINEAR_TOKEN not in log_text
     assert " ".join(slack_line) == (
-        "ts seq service method url body content_type token_user token_sha256_8 user_agent caller "
+        "ts seq phase service method url body content_type token_user token_sha256_8 user_agent caller "
         "status ok error unsupported result_count response_bytes duration_ms"
     )
     assert slack_line["url"] == "https://slack.com/api/conversations.list?limit=1&token=[redacted]"
@@ -914,6 +914,67 @@ def test_the_access_log_holds_one_line_per_request_and_no_token(external_service
     assert json.loads(linear_line["body"]) == {"query": "{ teams { nodes { key } } }"}
     assert (refused_line["status"], refused_line["ok"], refused_line["token_user"]) == (401, False, None)
     assert _control(external_services, "log") == [slack_line, linear_line, refused_line]
+
+
+def _mark_phase(services: RunningExternalServices, body: Any) -> httpx2.Response:
+    return httpx2.post("{}/_control/phase".format(services.control_url), json=body)
+
+
+def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
+    external_services: RunningExternalServices,
+) -> None:
+    """The verification flows drive the agent's own app, whose requests look like any other: the
+    phase the driver marks is what tells them from the ones the app made while the agent worked."""
+    assert _control(external_services, "health")["phases"] == {
+        "agent": {"requests": {"slack": 0, "linear": 0}, "unsupported_calls": {}}
+    }
+    _slack(external_services, "auth.test")
+    httpx2.get("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
+
+    marked = _mark_phase(external_services, {"name": "verification"})
+
+    _slack(external_services, "auth.test")
+    httpx2.get("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
+    _linear(external_services, "{ teams { nodes { key } } }")
+    assert (marked.status_code, marked.json()) == (200, {"ok": True, "phase": "verification", "previous": "agent"})
+    log_lines = _control(external_services, "log")
+    assert [(line["phase"], line["service"]) for line in log_lines] == [
+        ("agent", "slack"),
+        ("agent", "slack"),
+        ("verification", "slack"),
+        ("verification", "slack"),
+        ("verification", "linear"),
+    ]
+    file_lines = [json.loads(line) for line in external_services.access_log_path.read_text().splitlines()]
+    assert [line["phase"] for line in file_lines] == [line["phase"] for line in log_lines]
+    health = _control(external_services, "health")
+    # The totals keep their shape, and each phase's counts sit beside them.
+    assert health["counts"]["requests"] == {"slack": 4, "linear": 1}
+    assert health["unsupported_calls"] == {"slack:admin.users.list": 2}
+    assert health["phase"] == "verification"
+    assert health["phases"] == {
+        "agent": {"requests": {"slack": 2, "linear": 0}, "unsupported_calls": {"slack:admin.users.list": 1}},
+        "verification": {"requests": {"slack": 2, "linear": 1}, "unsupported_calls": {"slack:admin.users.list": 1}},
+    }
+    state = _control(external_services, "state")
+    assert (state["phase"], state["phases"]) == (health["phase"], health["phases"])
+
+    # A later step's conversation is the agent's again, and adds to the agent's counts.
+    _mark_phase(external_services, {"name": "agent"})
+    _slack(external_services, "auth.test")
+    assert _control(external_services, "health")["phases"]["agent"]["requests"] == {"slack": 3, "linear": 0}
+    assert _control(external_services, "log")[-1]["phase"] == "agent"
+
+
+@pytest.mark.parametrize("body", [{"name": "Verification phase"}, {"name": ""}, {"name": 3}, {}])
+def test_a_phase_mark_that_names_no_identifier_is_refused_and_changes_nothing(
+    external_services: RunningExternalServices, body: Any
+) -> None:
+    refused = _mark_phase(external_services, body)
+
+    assert refused.status_code == 400 and refused.json()["ok"] is False
+    assert _control(external_services, "health")["phase"] == "agent"
+    assert list(_control(external_services, "health")["phases"]) == ["agent"]
 
 
 def test_the_state_dump_redacts_every_token(external_services: RunningExternalServices) -> None:
