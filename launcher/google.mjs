@@ -51,7 +51,12 @@ const accountId = (email) => "1" + BigInt("0x" + crypto.createHash("sha1").updat
 export function create(seed, clock) {
   const app = new Hono();
   const store = new Store();
-  app.onError(() => internalError());
+  // A route that throws is answered as Google answers its own failure, and the error goes to the
+  // launcher's log.
+  app.onError((err, c) => {
+    console.error(`google: ${c.req.method} ${c.req.path} failed:`, err);
+    return internalError();
+  });
   const tokenUsers = new Map((seed.tokens ?? []).map((entry) => [entry.token, entry.user]));
   // The package's routes read the caller's account from this map: a token the seed names, as its
   // account's address.
