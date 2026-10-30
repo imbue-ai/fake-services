@@ -179,7 +179,9 @@ function rawOf(m) {
 //   - an operator the package answers wrongly with a 200 is passed on as it is and counted, under
 //     google:gmail:q:<operator>
 const UNSUPPORTED_OPERATORS = new Set(["cc", "bcc", "deliveredto", "list", "filename", "category", "size", "larger", "smaller", "header", "rfc822msgid"]);
-const DATE_OPERATORS = { after: "after", before: "before", newer: "after", older: "before" };
+const DATE_OPERATORS = new Map([["after", "after"], ["before", "before"], ["newer", "after"], ["older", "before"]]);
+// Every operator Gmail has: a word with a colon that names none of these is a word to Gmail too.
+const OPERATORS = new Set(["from", "to", "subject", "label", "in", "is", "has", "newer_than", "older_than", ...DATE_OPERATORS.keys(), ...UNSUPPORTED_OPERATORS]);
 const PACIFIC = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", timeZoneName: "longOffset" });
 function pacificMidnightSeconds(year, month, day) {
   // 08:00 UTC is before 02:00 in Los Angeles, when its offset changes, so it keeps midnight's offset.
@@ -208,6 +210,7 @@ function rewriteQuery(q, email, nowMs) {
     if (!op) return term;
     const [, written, value] = op;
     const name = written.toLowerCase();
+    if (!OPERATORS.has(name)) return term;
     const lower = value.toLowerCase();
     const rebuilt = (operator, operand) => `${negated ? "-" : ""}${open}${operator}:${operand}${close}`;
     if (value.startsWith("(")) return keys.push(`${name}:()`), term;
@@ -215,9 +218,9 @@ function rewriteQuery(q, email, nowMs) {
     if ((name === "from" || name === "to") && lower === "me") return rebuilt(written, email);
     if (name === "in" && (lower === "anywhere" || lower === "archive")) return keys.push(`in:${lower}`), term;
     if (name === "has" && lower !== "attachment") return keys.push("has"), term;
-    if (name in DATE_OPERATORS) {
+    if (DATE_OPERATORS.has(name)) {
       const seconds = /^\d+$/.test(value) ? Number(value) : secondsOfDate(value);
-      return seconds === null ? (keys.push(name), term) : rebuilt(DATE_OPERATORS[name], seconds);
+      return seconds === null ? (keys.push(name), term) : rebuilt(DATE_OPERATORS.get(name), seconds);
     }
     if (name === "newer_than" || name === "older_than") {
       const days = value.match(/^(\d+)d$/i);

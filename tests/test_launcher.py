@@ -134,13 +134,13 @@ _MORGAN = "morgan.reyes@redwood.example"
 
 
 def _gmail_get(
-    services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str | list[str]
+    services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str
 ) -> httpx2.Response:
     headers = {} if token is None else {"Authorization": "Bearer {}".format(token)}
     return httpx2.get("{}/gmail/v1/users/{}".format(services.google_url, path), params=params, headers=headers)
 
 
-def _gmail(services: RunningExternalServices, path: str, **params: str | list[str]) -> Any:
+def _gmail(services: RunningExternalServices, path: str, **params: str) -> Any:
     answer = _gmail_get(services, path, **params)
     assert answer.status_code == 200, answer.text
     return answer.json()
@@ -1897,7 +1897,7 @@ def test_a_gmail_thread_holds_its_replies_with_their_headers_and_derived_labels(
     decoded = base64.urlsafe_b64decode(raw["raw"] + "==").decode()
     parsed = email.message_from_string(decoded)
     assert (parsed["Date"], parsed.get_content_type()) == ("Fri, 2 Oct 2026 17:40:00 +0100", "multipart/alternative")
-    assert [part.get_payload() for part in parsed.get_payload()] == [
+    assert [part.get_payload() for part in parsed.walk() if not part.is_multipart()] == [
         "Checking with finance and will get back to you.",
         "<p>Checking with <b>finance</b> and will get back to you.</p>",
     ]
@@ -1936,6 +1936,10 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
         external_services, "me/messages/{}".format(question), format="metadata", metadataHeaders="subject"
     )
     assert metadata["payload"]["headers"] == [{"name": "Subject", "value": "March invoice question"}]
+    # A word with a colon that names no Gmail operator is a word to Gmail, and no gap of the fake's.
+    assert _gmail(external_services, "me/messages", q="see:(notes) constructor:x https://northwind.example") == {
+        "resultSizeEstimate": 0
+    }
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
