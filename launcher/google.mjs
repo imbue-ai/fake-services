@@ -1,7 +1,7 @@
 // The fake Google: one fake for every Google API a task reads, on @emulators/google's app and store,
 // served on each host those APIs live on and routed by path to a product module under google/.
-// Gmail (google/gmail.mjs) is the one product served; a request for any other path is answered as
-// Google answers a method it does not have, and counted. The accounts (`users`) are Google's own,
+// A request for a path no product serves is answered as Google answers a method it does not have,
+// and counted. The accounts (`users`) are Google's own,
 // shared by every product; each product seeds its own records for them. See launcher.mjs for the
 // interface this module exports.
 //

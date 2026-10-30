@@ -1,6 +1,6 @@
 // External data services for a minds-evals trial: fake Slack, Linear and Google, each served on a
-// loopback port of its own by one Node process in the eval box. The workspace reaches them through the latchkey
-// gateway, whose curl the driver points at these ports for the real hosts.
+// loopback port of its own by one Node process in the eval box. The workspace reaches them through
+// the latchkey gateway, whose curl the driver points at these ports for the real hosts.
 //
 // A service is served when the seed directory holds its file (slack.json, linear.json, google.json).
 // Each service is a module beside this file (slack.mjs, linear.mjs, google.mjs) that exports:
@@ -44,8 +44,8 @@
 //     fake does not support, and control endpoints on a port of their own
 //
 // env: SEED_DIR=<directory of <service>.json> CONTROL_PORT=<port> SLACK_PORT=<port> LINEAR_PORT=<port>
-//      GOOGLE_PORT=<port> (0 takes a free port) [ACCESS_LOG=<jsonl path>] [START_MS=<epoch ms; the process's own clock
-//      when unset>] [RATE_LIMIT_WINDOW_SECONDS=<seconds every rate limit bucket's window lasts; each
+//      GOOGLE_PORT=<port> (0 takes a free port) [ACCESS_LOG=<jsonl path>] [START_MS=<epoch ms; the
+//      process's own clock when unset>] [RATE_LIMIT_WINDOW_SECONDS=<seconds every rate limit bucket's window lasts; each
 //      bucket's own when unset; for a test that waits a window out>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
