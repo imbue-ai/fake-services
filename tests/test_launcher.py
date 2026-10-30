@@ -1921,7 +1921,7 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
     assert _listed_ids(external_services, q="after:2026/10/02 before:2026/10/03") == [reply, question]
     assert _listed_ids(external_services, q="newer_than:3d") == [followup]
     assert _listed_ids(external_services, "threads") == [question, newsletter]
-    # Gmail leaves an empty list out, and refuses a page token it never issued.
+    # Gmail leaves an empty list out, and refuses a malformed page token.
     assert _gmail(external_services, "me/messages", q="nothing-says-this") == {"resultSizeEstimate": 0}
     assert _gmail(external_services, "me/threads", q="nothing-says-this") == {"resultSizeEstimate": 0}
     paged = _gmail(external_services, "me/messages", maxResults="2")

@@ -3,7 +3,7 @@
 // derived from the seed, so they read the same in every trial; a message keeps the UTC offset its seed
 // states in its Date header, and its labels are derived from who sent it;
 // users.getProfile; a search operator the package answers wrongly is counted; a list leaves out an
-// empty list and refuses a page token it never issued, as Gmail does. See google.mjs for the product
+// empty list and refuses a malformed page token, as Gmail does. See google.mjs for the product
 // interface this module exports.
 import crypto from "node:crypto";
 import { seedFromConfig } from "@emulators/google";
