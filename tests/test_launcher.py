@@ -1800,6 +1800,8 @@ def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: Run
     assert _control(external_services, "log")[-1]["rate_limited"] == "linear:complexity"
 
 
+# 2,500 requests take about 6 seconds alone, and longer beside a parallel suite.
+@pytest.mark.timeout(30)
 def test_linear_refuses_a_user_past_its_hourly_requests(external_services: RunningExternalServices) -> None:
     answers, elapsed_seconds = _linear_until_refused(external_services, "{ viewer { id } }", 3000)
     refused = answers[-1]
