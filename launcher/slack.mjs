@@ -247,15 +247,14 @@ export function create(seed, clock) {
       const channel_id = ch.channel_id;
       const ts = clock.slackTs(m.ts);
       const thread_ts = clock.slackTs(m.thread_ts) ?? undefined;
+      const p = thread_ts && thread_ts !== ts ? ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === thread_ts) ?? null : null;
       if (thread_ts && thread_ts !== ts) {
-        const p = ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === thread_ts);
         if (!p) throw new Error(`thread parent missing for ${m.channel}/${m.ts}`);
         // conversations.replies serves a thread parent first, then its replies oldest first.
         if (Number(ts) <= Number(thread_ts)) throw new Error(`slack reply ${m.channel}/${m.ts} is no later than its parent ${m.thread_ts}`);
       }
       ss.messages.insert({ ts, channel_id, user: uid, text: m.text, type: "message", thread_ts, reply_count: 0, reply_users: [], reactions: [] });
-      if (thread_ts && thread_ts !== ts) {
-        const p = ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === thread_ts);
+      if (p) {
         ss.messages.update(p.id, {
           thread_ts: p.ts,
           reply_count: p.reply_count + 1,
