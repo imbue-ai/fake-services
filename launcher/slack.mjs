@@ -140,64 +140,20 @@ export function create(seed, clock) {
   const dmOfKey = (key) => ss.channels.all().find((ch) => isDm(ch) && ch.seed_key === key);
   const sameMembers = (a, b) => a.length === b.length && [...a].sort().join(",") === [...b].sort().join(",");
 
-  function add(cfg) {
-    const dms = cfg.dms ?? [];
-    const dmKeys = new Set(dms.map((d) => d.key));
-    for (const c of cfg.channels ?? []) {
-      if (dmKeys.has(c.name) || dmOfKey(c.name)) throw new Error(`slack channel ${c.name} takes the key of a dm`);
-      // The package finds a channel to keep by name alone, a direct message's included.
-      if (!namedChannel(c.name) && ss.channels.all().some((ch) => isDm(ch) && ch.name === c.name)) throw new Error(`slack channel ${c.name} takes the name a dm is served under`);
-    }
-    for (const d of dms) if ((cfg.channels ?? []).some((c) => c.name === d.key) || namedChannel(d.key)) throw new Error(`slack dm ${d.key} takes the name of a channel`);
-    const newChannelNames = (cfg.channels ?? []).filter((c) => !namedChannel(c.name)).map((c) => c.name);
-    const newUsers = new Map((cfg.users ?? []).filter((u) => !ss.users.all().some((x) => x.name === u.name)).map((u) => [u.name, u]));
-    // The emulator only renames a team it already has, and answers for a missing one under its own name.
-    if (!ss.teams.all()[0]) ss.teams.insert({ team_id: "T" + slackId("", domain), name: cfg.team?.name ?? domain, domain });
-    seedFromConfig(store, REAL_URL, {
-      team: cfg.team,
-      users: (cfg.users ?? []).map((u) => ({ name: u.name, real_name: u.real_name, email: u.email ?? `${u.name}@${domain}.example`, profile: { title: u.title ?? "" } })),
-      channels: (cfg.channels ?? []).map((c) => ({ name: c.name, topic: c.topic, is_private: c.is_private })),
-      tokens: cfg.tokens,
+  const user = (ref) => (ss.users.all().find((x) => x.name === ref) ?? ss.users.findOneBy("user_id", ref))?.user_id;
+  const memberIds = (what, refs) =>
+    refs.map((ref) => {
+      const id = user(ref);
+      if (!id) throw new Error(`slack ${what} names an unknown member ${ref}`);
+      return id;
     });
-    for (const u of cfg.users ?? []) {
-      const rec = ss.users.all().find((x) => x.name === u.name);
-      const id = u.id ?? slackId("U", u.name);
-      if (rec.user_id === id) continue;
-      const old = rec.user_id;
-      ss.users.update(rec.id, { user_id: id, is_bot: Boolean(u.is_bot) });
-      for (const ch of ss.channels.all())
-        if (ch.members.includes(old) || ch.creator === old)
-          ss.channels.update(ch.id, { members: ch.members.map((m) => (m === old ? id : m)), creator: ch.creator === old ? id : ch.creator });
-      for (const t of ss.tokens.all()) if (t.user_id === old) ss.tokens.update(t.id, { user_id: id });
-    }
-    for (const c of cfg.channels ?? []) {
-      const rec = namedChannel(c.name);
-      const id = c.id ?? slackId("C", c.name);
-      if (rec.channel_id !== id) ss.channels.update(rec.id, { channel_id: id });
-    }
-    const user = (ref) => (ss.users.all().find((x) => x.name === ref) ?? ss.users.findOneBy("user_id", ref))?.user_id;
-    // What a message names its conversation by: a dm's key, a channel's name, or either's id.
-    const conversation = (ref) => dmOfKey(ref) ?? namedChannel(ref) ?? ss.channels.findOneBy("channel_id", ref);
-    // The records settle() dates afresh, and the members each states, by channel id. A new channel
-    // starts with no members: settle() gives it its posters and the users it names.
-    const newConversations = new Map();
-    const statedMembers = new Map();
-    for (const name of newChannelNames) {
-      const rec = namedChannel(name);
-      rec.members = [];
-      newConversations.set(rec.channel_id, (cfg.channels ?? []).find((c) => c.name === name));
-    }
-    const memberIds = (what, refs) =>
-      refs.map((ref) => {
-        const id = user(ref);
-        if (!id) throw new Error(`slack ${what} names an unknown member ${ref}`);
-        return id;
-      });
-    for (const c of cfg.channels ?? []) statedMembers.set(namedChannel(c.name).channel_id, memberIds(`channel ${c.name}`, c.members ?? []));
-    // A direct message is Slack's im between two members or its mpim among three or more, read by its
-    // members alone, and one at most for a set of members, as Slack keeps it. It is listed only to a
-    // token's user, so one with no such member could never be read and is refused. One the trial
-    // opened already (conversations.open) takes the dm's key and keeps its id.
+
+  // A direct message is Slack's im between two members or its mpim among three or more, read by its
+  // members alone, and one at most for a set of members, as Slack keeps it. It is listed only to a
+  // token's user, so one with no such member could never be read and is refused. One the trial
+  // opened already (conversations.open) takes the dm's key and keeps its id. Each dm placed afresh
+  // goes into newConversationsOut and statedMembersOut, by channel id, for settle().
+  function placeDms(dms, newConversationsOut, statedMembersOut) {
     const tokenIds = [...tokenUsers.values()].map(user).filter(Boolean);
     const team = ss.teams.all()[0];
     for (const d of dms) {
@@ -237,9 +193,59 @@ export function create(seed, clock) {
         last_read: {},
         seed_key: d.key,
       });
-      newConversations.set(rec.channel_id, d);
-      statedMembers.set(rec.channel_id, ids);
+      newConversationsOut.set(rec.channel_id, d);
+      statedMembersOut.set(rec.channel_id, ids);
     }
+  }
+
+  function add(cfg) {
+    const dms = cfg.dms ?? [];
+    const dmKeys = new Set(dms.map((d) => d.key));
+    for (const c of cfg.channels ?? []) {
+      if (dmKeys.has(c.name) || dmOfKey(c.name)) throw new Error(`slack channel ${c.name} takes the key of a dm`);
+      // The package finds a channel to keep by name alone, a direct message's included.
+      if (!namedChannel(c.name) && ss.channels.all().some((ch) => isDm(ch) && ch.name === c.name)) throw new Error(`slack channel ${c.name} takes the name a dm is served under`);
+    }
+    for (const d of dms) if ((cfg.channels ?? []).some((c) => c.name === d.key) || namedChannel(d.key)) throw new Error(`slack dm ${d.key} takes the name of a channel`);
+    const newChannelNames = (cfg.channels ?? []).filter((c) => !namedChannel(c.name)).map((c) => c.name);
+    const newUsers = new Map((cfg.users ?? []).filter((u) => !ss.users.all().some((x) => x.name === u.name)).map((u) => [u.name, u]));
+    // The emulator only renames a team it already has, and answers for a missing one under its own name.
+    if (!ss.teams.all()[0]) ss.teams.insert({ team_id: "T" + slackId("", domain), name: cfg.team?.name ?? domain, domain });
+    seedFromConfig(store, REAL_URL, {
+      team: cfg.team,
+      users: (cfg.users ?? []).map((u) => ({ name: u.name, real_name: u.real_name, email: u.email ?? `${u.name}@${domain}.example`, profile: { title: u.title ?? "" } })),
+      channels: (cfg.channels ?? []).map((c) => ({ name: c.name, topic: c.topic, is_private: c.is_private })),
+      tokens: cfg.tokens,
+    });
+    for (const u of cfg.users ?? []) {
+      const rec = ss.users.all().find((x) => x.name === u.name);
+      const id = u.id ?? slackId("U", u.name);
+      if (rec.user_id === id) continue;
+      const old = rec.user_id;
+      ss.users.update(rec.id, { user_id: id, is_bot: Boolean(u.is_bot) });
+      for (const ch of ss.channels.all())
+        if (ch.members.includes(old) || ch.creator === old)
+          ss.channels.update(ch.id, { members: ch.members.map((m) => (m === old ? id : m)), creator: ch.creator === old ? id : ch.creator });
+      for (const t of ss.tokens.all()) if (t.user_id === old) ss.tokens.update(t.id, { user_id: id });
+    }
+    for (const c of cfg.channels ?? []) {
+      const rec = namedChannel(c.name);
+      const id = c.id ?? slackId("C", c.name);
+      if (rec.channel_id !== id) ss.channels.update(rec.id, { channel_id: id });
+    }
+    // What a message names its conversation by: a dm's key, a channel's name, or either's id.
+    const conversation = (ref) => dmOfKey(ref) ?? namedChannel(ref) ?? ss.channels.findOneBy("channel_id", ref);
+    // The records settle() dates afresh, and the members each states, by channel id. A new channel
+    // starts with no members: settle() gives it its posters and the users it names.
+    const newConversations = new Map();
+    const statedMembers = new Map();
+    for (const name of newChannelNames) {
+      const rec = namedChannel(name);
+      rec.members = [];
+      newConversations.set(rec.channel_id, (cfg.channels ?? []).find((c) => c.name === name));
+    }
+    for (const c of cfg.channels ?? []) statedMembers.set(namedChannel(c.name).channel_id, memberIds(`channel ${c.name}`, c.members ?? []));
+    placeDms(dms, newConversations, statedMembers);
     let n = 0;
     for (const m of cfg.messages ?? []) {
       const ch = conversation(m.channel);
