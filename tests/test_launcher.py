@@ -2530,15 +2530,10 @@ def test_calendar_pages_250_events_at_a_time_unless_asked_otherwise(
     assert _add(external_services, "google", json.dumps({"events": many})).status_code == 200
 
     whole = _calendar(external_services, "calendars/primary/events")
-    pages: list[list[str]] = []
-    token: str | None = None
-    while True:
-        params = {"maxResults": "5", **({"pageToken": token} if token else {})}
-        page = _calendar(external_services, "calendars/primary/events", **params)
-        pages.append([event["summary"] for event in page["items"]])
-        token = page.get("nextPageToken")
-        if token is None:
-            break
+    first = _calendar(external_services, "calendars/primary/events", maxResults="5")
+    second = _calendar(external_services, "calendars/primary/events", maxResults="5", pageToken=first["nextPageToken"])
+    last = _calendar(external_services, "calendars/primary/events", maxResults="5", pageToken=second["nextPageToken"])
+    pages = [[event["summary"] for event in page["items"]] for page in (first, second, last)]
     malformed = _calendar_get(
         external_services, "calendars/primary/events", pageToken="CiAKGjBpNDd2Nmp2Zml2cXRwYjBpOXA"
     )
@@ -2547,6 +2542,7 @@ def test_calendar_pages_250_events_at_a_time_unless_asked_otherwise(
     # The package pages ten at a time; Calendar 250.
     assert len(whole["items"]) == 15 and "nextPageToken" not in whole
     assert [len(page) for page in pages] == [5, 5, 5]
+    assert "nextPageToken" not in last
     assert [summary for page in pages for summary in page] == [event["summary"] for event in whole["items"]]
     assert (malformed.status_code, malformed.json()["error"]["errors"][0]["location"]) == (400, "pageToken")
     assert (none_asked.status_code, none_asked.json()["error"]["errors"][0]["location"]) == (400, "maxResults")
