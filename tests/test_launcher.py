@@ -6,6 +6,7 @@ import email
 import json
 import time
 from collections.abc import Iterator
+from datetime import UTC
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -634,6 +635,183 @@ def test_search_finds_messages_by_text_and_channel(external_services: RunningExt
     assert found["messages"]["total"] == 2
     assert {match["channel"]["name"] for match in found["messages"]["matches"]} == {"eng-oncall"}
     assert _slack(external_services, "search.messages", query="latency in:#announcements")["messages"]["total"] == 0
+
+
+def _dms(services: RunningExternalServices) -> dict[str, dict[str, Any]]:
+    """The token's dms by kind: its im and its mpim."""
+    listed = _slack(services, "conversations.list", types="im,mpim")["channels"]
+    return {"im" if channel["is_im"] else "mpim": channel for channel in listed}
+
+
+def _slack_post(services: RunningExternalServices, method: str, **fields: str) -> dict[str, Any]:
+    return httpx2.post("{}/api/{}".format(services.slack_url, method), data=fields, headers=_SLACK_HEADERS).json()
+
+
+def _search(services: RunningExternalServices, query: str, **params: str) -> list[str]:
+    return [match["ts"] for match in _slack(services, "search.messages", query=query, **params)["messages"]["matches"]]
+
+
+def _day_after(ts: str) -> str:
+    return (datetime.fromtimestamp(float(ts), tz=UTC).date() + timedelta(days=1)).isoformat()
+
+
+def test_a_dm_is_listed_by_its_type_and_read_like_a_channel_by_its_members(
+    external_services: RunningExternalServices,
+) -> None:
+    user_ids = _user_ids(external_services)
+    dms = _dms(external_services)
+    im, mpim = dms["im"], dms["mpim"]
+
+    # A dm is listed under its own type alone, under Slack's id prefixes: D for an im, and the G
+    # mpims have long carried.
+    listed = _slack(external_services, "conversations.list", types="public_channel,private_channel")["channels"]
+    assert {channel["name"] for channel in listed} == {"announcements", "eng-oncall"}
+    assert (im["id"][0], mpim["id"][0], len(im["id"]), len(mpim["id"])) == ("D", "G", 11, 11)
+    assert (im["is_im"], im["is_mpim"], im["is_private"], im["user"]) == (True, False, True, user_ids["claire"])
+    assert (mpim["is_im"], mpim["is_mpim"], mpim["name"]) == (False, True, "mpdm-claire--morgan.reyes--pagerbot-1")
+    # An im was created at its first message, an mpim at the date its file states.
+    mpim_created = int(datetime.fromisoformat("2026-03-01T09:00:00+00:00").timestamp())
+    assert (im["created"], mpim["created"]) == (
+        _shifted_seconds("1773950000.000000"),
+        mpim_created + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS,
+    )
+    info = _slack(external_services, "conversations.info", channel=im["id"])["channel"]
+    assert (info["id"], info["is_im"], info["user"]) == (im["id"], True, user_ids["claire"])
+    members = _slack(external_services, "conversations.members", channel=mpim["id"])["members"]
+    assert sorted(members) == sorted(user_ids[name] for name in ("claire", "morgan.reyes", "pagerbot"))
+    # The im's reply is folded into its thread, and history takes oldest/latest/inclusive as for a channel.
+    parent = _shifted("1773950000.000000")
+    history = _slack(external_services, "conversations.history", channel=im["id"])["messages"]
+    assert [(message["ts"], message["reply_count"]) for message in history] == [(parent, 1)]
+    after_parent = _slack(external_services, "conversations.history", channel=im["id"], oldest=parent)
+    from_parent = _slack(external_services, "conversations.history", channel=im["id"], oldest=parent, inclusive="1")
+    assert (after_parent["messages"], [message["ts"] for message in from_parent["messages"]]) == ([], [parent])
+    replies = _slack(external_services, "conversations.replies", channel=im["id"], ts=parent)["messages"]
+    assert [message["ts"] for message in replies] == [parent, _shifted("1774000300.000000")]
+    # Search reaches a dm through in:@user and names it as Slack does.
+    found = _slack(external_services, "search.messages", query="latency in:@claire")["messages"]["matches"]
+    assert [(match["ts"], match["channel"]["id"], match["channel"]["is_im"]) for match in found] == [
+        (parent, im["id"], True)
+    ]
+    assert _search(external_services, "thursday") == [_shifted("1773980000.000000")]
+
+
+def test_search_finds_a_posted_message_and_reads_a_date_as_written(external_services: RunningExternalServices) -> None:
+    """A message posted in the trial is stamped with the box's clock, and a seed's under a time shift
+    with dates ending the day before the trial: both are found by the dates an agent reads off them,
+    with no shift applied to the query."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    posted = _slack_post(external_services, "chat.postMessage", channel=channel_id, text="latency latency postmortem")
+
+    assert posted["ok"], posted
+    assert _search(external_services, "postmortem") == [posted["ts"]]
+    assert _search(external_services, "postmortem after:{}".format(_day_after(posted["ts"]))) == []
+    posted_day = datetime.fromtimestamp(float(posted["ts"]), tz=UTC).date()
+    assert _search(external_services, "postmortem after:{}".format(posted_day - timedelta(days=1))) == [posted["ts"]]
+    assert _search(external_services, "postmortem on:{}".format(posted_day)) == [posted["ts"]]
+    on_the_19th = [_shifted(ts) for ts in ("1773950000.000000", "1773900600.000000", "1773900000.000000")]
+    assert _search(external_services, "on:{}".format(_shifted_date("2026-03-19")), sort="timestamp") == on_the_19th
+    assert _search(external_services, "during:{}".format(_shifted_date("2026-03-19"))) == _search(
+        external_services, "on:{}".format(_shifted_date("2026-03-19"))
+    )
+    after_the_19th = [_shifted(ts) for ts in ("1774000300.000000", "1774000000.000000", "1773980000.000000")]
+    assert (
+        _search(external_services, "after:{}".format(_shifted_date("2026-03-19")), sort="timestamp") == after_the_19th
+    )
+    # yesterday is the day before the trial's present, which the shifted seed's data ends on.
+    assert _search(external_services, "on:yesterday", sort="timestamp") == after_the_19th
+    before_the_19th = _search(external_services, "before:{}".format(_shifted_date("2026-03-19")), sort="timestamp")
+    assert before_the_19th == [_shifted("1769123456.000000"), posted["ts"]]
+    month = _shifted_date("2026-03-19")[:7]
+    assert len(_search(external_services, "during:{}".format(month))) == 6
+    # A date the fake cannot read matches nothing, and is counted as a gap.
+    assert _search(external_services, "latency during:march") == []
+    assert _control(external_services, "health")["unsupported_calls"] == {"slack:search.messages:during": 1}
+
+
+def test_search_sorts_by_score_or_timestamp_and_pages_as_slack_does(
+    external_services: RunningExternalServices,
+) -> None:
+    posted = _slack_post(
+        external_services,
+        "chat.postMessage",
+        channel=_channel_id(external_services, "eng-oncall"),
+        text="latency latency postmortem",
+    )
+    seeded = [_shifted(ts) for ts in ("1774000000.000000", "1773950000.000000", "1773900000.000000")]
+
+    # The posted message says latency twice and is the oldest of them, as the box's clock is ten
+    # years behind the shifted seed's.
+    assert _search(external_services, "latency") == [posted["ts"], *seeded]
+    assert _search(external_services, "latency", sort="timestamp") == [*seeded, posted["ts"]]
+    assert _search(external_services, "latency", sort="timestamp", sort_dir="asc") == [posted["ts"], *reversed(seeded)]
+    second = _slack(external_services, "search.messages", query="latency", sort="timestamp", count="3", page="2")
+    assert [match["ts"] for match in second["messages"]["matches"]] == [posted["ts"]]
+    assert second["messages"]["paging"] == {"count": 3, "total": 4, "page": 2, "pages": 2}
+    assert second["messages"]["pagination"] == {
+        "total_count": 4,
+        "page": 2,
+        "per_page": 3,
+        "page_count": 2,
+        "first": 4,
+        "last": 4,
+    }
+    # An operator the fake does not read matches nothing and is counted.
+    assert _search(external_services, "latency has:link") == []
+    assert _control(external_services, "health")["unsupported_calls"] == {"slack:search.messages:has": 1}
+
+
+def test_a_permalink_names_the_workspace_and_a_replys_thread(external_services: RunningExternalServices) -> None:
+    channel_id = _channel_id(external_services, "eng-oncall")
+    parent, reply = _shifted("1773900000.000000"), _shifted("1773900600.000000")
+    im_id = _dms(external_services)["im"]["id"]
+
+    top = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts=parent)
+    threaded = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts=reply)
+    in_im = _slack(external_services, "chat.getPermalink", channel=im_id, message_ts=_shifted("1773950000.000000"))
+
+    base = "https://redwood.slack.com/archives/{}/p".format(channel_id)
+    assert top == {"ok": True, "channel": channel_id, "permalink": base + parent.replace(".", "")}
+    assert threaded["permalink"] == "{}{}?thread_ts={}&cid={}".format(base, reply.replace(".", ""), parent, channel_id)
+    assert in_im["permalink"] == "https://redwood.slack.com/archives/{}/p{}".format(
+        im_id, _shifted("1773950000.000000").replace(".", "")
+    )
+    found = _slack(external_services, "search.messages", query="normalization")["messages"]["matches"]
+    assert [match["permalink"] for match in found] == [threaded["permalink"]]
+    missing = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts="1773900000.000000")
+    assert missing == {"ok": False, "error": "message_not_found"}
+
+
+def test_an_update_replies_into_a_seed_thread_named_by_the_seeds_ts(
+    external_services: RunningExternalServices,
+) -> None:
+    """A later step names a seed message's ts as the seed writes it, and the launcher shifts both alike."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    parent = _shifted("1773900000.000000")
+
+    added = _add(external_services, "slack", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "slack"))
+    posted = _slack_post(external_services, "chat.postMessage", channel=channel_id, thread_ts=parent, text="Ack.")
+
+    assert added.status_code == 200, added.text
+    olivia = _user_ids(external_services)["olivia_chen"]
+    replies = _slack(external_services, "conversations.replies", channel=channel_id, ts=parent)["messages"]
+    # The parent first, then its replies oldest first: the one posted, which the box's clock stamps
+    # ten years before the shifted seed, the seed's and the update's.
+    assert [message["ts"] for message in replies] == [
+        parent,
+        posted["ts"],
+        _shifted("1773900600.000000"),
+        _shifted("1774050600.000000"),
+    ]
+    assert (replies[0]["reply_count"], replies[0]["thread_ts"]) == (3, parent)
+    assert olivia in replies[0]["reply_users"]
+    history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
+    assert _shifted("1774050600.000000") not in [message["ts"] for message in history]
+    # A reply posted in the trial makes a message with none a thread's parent.
+    lone = _shifted("1774000000.000000")
+    _slack_post(external_services, "chat.postMessage", channel=channel_id, thread_ts=lone, text="Tracked in ENG-2.")
+    lone_parent = _slack(external_services, "conversations.replies", channel=channel_id, ts=lone)["messages"][0]
+    assert (lone_parent["ts"], lone_parent["thread_ts"], lone_parent["reply_count"]) == (lone, lone, 1)
 
 
 def test_linear_answers_a_nested_filter_ordered_by_update(external_services: RunningExternalServices) -> None:
@@ -1267,6 +1445,68 @@ def test_the_launcher_takes_each_way_of_naming_a_record_the_checks_accept(
     }
 
 
+def test_the_launcher_takes_each_dm_and_label_change_the_checks_accept(
+    external_services: RunningExternalServices,
+) -> None:
+    """A dm, its messages and a reply into a seeded dm's thread; a label change of a message the
+    same update adds and of a seeded one in another mailbox."""
+    updates: list[tuple[str, dict[str, Any]]] = [
+        (
+            "slack",
+            {
+                "users": [{"name": "olivia_chen"}],
+                "dms": [
+                    {"key": "dm-olivia", "members": ["olivia_chen", "morgan.reyes"]},
+                    {"key": "big-group", "members": ["olivia_chen", "morgan.reyes", "claire", "pagerbot"]},
+                ],
+                "messages": [
+                    {"channel": "dm-olivia", "user": "olivia_chen", "ts": "1774050000.000000", "text": "Hi."},
+                    {"channel": "big-group", "user": "claire", "ts": "1774050100.000000", "text": "All here."},
+                    {
+                        "channel": "dm-claire",
+                        "user": "claire",
+                        "ts": "1774050200.000000",
+                        "thread_ts": "1773950000",
+                        "text": "Thanks.",
+                    },
+                ],
+            },
+        ),
+        (
+            "google",
+            {
+                "messages": [_PLACEABLE_EMAIL],
+                "label_changes": [
+                    {"message": "placeable", "add": ["Vendors", "STARRED"], "remove": ["INBOX"]},
+                    {"message": "thomas-invoice-copy", "remove": ["UNREAD"]},
+                ],
+            },
+        ),
+    ]
+
+    for service_name, update in updates:
+        service = service_named(service_name)
+        known = parse_service_seed(
+            service, external_services_fixture_text(EXTERNAL_SERVICES_SEED_FIXTURE, service_name), "seed"
+        ).known
+        parse_service_update(service, json.dumps(update), known, "update")
+        added = _add(external_services, service_name, json.dumps(update))
+        assert added.status_code == 200, (update, added.text)
+
+    assert _control(external_services, "health")["counts"]["slack"]["dms"] == 4
+    listed = _slack(external_services, "conversations.list", types="im")["channels"]
+    claire = _user_ids(external_services)["claire"]
+    (dm_claire,) = [channel for channel in listed if channel["user"] == claire]
+    assert len(listed) == 2
+    replies = _slack(
+        external_services, "conversations.replies", channel=dm_claire["id"], ts=_shifted("1773950000.000000")
+    )
+    assert len(replies["messages"]) == 3
+    keys = _message_keys(external_services)
+    placed = _gmail(external_services, "me/messages/{}".format(keys["placeable"]), format="minimal")
+    assert sorted(placed["labelIds"]) == sorted(["STARRED", _vendors_id(external_services)])
+
+
 _PLACEABLE_ISSUE = {
     "identifier": "ENG-20",
     "team": "ENG",
@@ -1312,6 +1552,27 @@ _PLACEABLE_EVENT = {
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "user": "nobody"}]}),
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "thread_ts": "1.000000"}]}),
         ("slack", {"channels": [{"name": "leads", "is_private": True, "members": ["nobody"]}]}),
+        ("slack", {"dms": [{"key": "dm-pager", "members": ["morgan.reyes"]}]}),
+        ("slack", {"dms": [{"key": "dm-pager", "members": ["morgan.reyes", "nobody"]}]}),
+        # No token belongs to either member, so nothing could read the dm.
+        ("slack", {"dms": [{"key": "dm-pager", "members": ["claire", "pagerbot"]}]}),
+        ("slack", {"dms": [{"key": "again", "members": ["claire", "morgan.reyes"]}]}),
+        ("slack", {"dms": [{"key": "dm-claire", "members": ["morgan.reyes", "pagerbot"]}]}),
+        ("slack", {"dms": [{"key": "eng-oncall", "members": ["morgan.reyes", "pagerbot"]}]}),
+        ("slack", {"channels": [{"name": "dm-claire"}]}),
+        ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "channel": "dm-claire", "user": "pagerbot"}]}),
+        ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "ts": "1773899000.000000", "thread_ts": "1773900000.000000"}]}),
+        ("google", {"label_changes": [{"message": "no-such-message", "add": ["STARRED"]}]}),
+        ("google", {"label_changes": [{"message": "invoice-followup", "remove": ["No such label"]}]}),
+        ("google", {"label_changes": [{"message": "thomas-invoice-copy", "add": ["Vendors"]}]}),
+        ("google", {"label_changes": [{"message": "invoice-followup"}]}),
+        ("google", {"label_changes": [{"message": "invoice-followup", "add": ["STARRED"], "remove": ["STARRED"]}]}),
+        # A label change applies after the update's other records, so a message it adds may be named,
+        # and a refused change keeps that message out as well.
+        (
+            "google",
+            {"messages": [_PLACEABLE_EMAIL], "label_changes": [{"message": "placeable", "add": ["No such label"]}]},
+        ),
         ("linear", {"projects": [{"name": "Billing cleanup", "lead": "Nobody Here"}]}),
         ("google", {"messages": [{**_PLACEABLE_EMAIL, "mailbox": "nobody@redwood.example"}]}),
         ("google", {"messages": [{**_PLACEABLE_EMAIL, "in_reply_to": "no-such-message"}]}),

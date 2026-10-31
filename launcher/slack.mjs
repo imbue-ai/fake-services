@@ -441,6 +441,15 @@ export function create(seed, clock) {
     const parent = ss.messages.all().find((m) => m.channel_id === answer.channel && m.ts === thread_ts);
     if (parent) ss.messages.update(parent.id, { thread_ts: parent.ts, latest_reply: answer.ts });
   }
+  // Slack serves a thread's parent first, then its replies oldest first. The package orders all of
+  // them by ts, and a reply posted in a trial whose seed is shifted past the box's clock is stamped
+  // before its parent.
+  async function withParentFirst(res, ts) {
+    const answer = await answerOf(res);
+    if (!answer?.ok) return res;
+    answer.messages = [...answer.messages.filter((m) => m.ts === ts), ...answer.messages.filter((m) => m.ts !== ts)];
+    return Response.json(answer, { status: res.status });
+  }
   async function apiRoute(req, url) {
     const method = url.pathname.slice(5);
     const p = await params(req);
@@ -449,6 +458,7 @@ export function create(seed, clock) {
     const res = await (req.method === "GET" ? asPost(req, method, Object.fromEntries(url.searchParams)) : app.fetch(req));
     if (method in USER_ANSWERS) return withUpdated(res, USER_ANSWERS[method]);
     if (method === "chat.getPermalink") return withPermalink(res);
+    if (method === "conversations.replies") return withParentFirst(res, p.ts);
     if (method === "chat.postMessage") await markThreadParent(res);
     return res;
   }
