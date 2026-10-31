@@ -11,6 +11,7 @@ import crypto from "node:crypto";
 import { seedFromConfig } from "@emulators/google";
 import { googleError, isUnrouted, noSuchPath } from "./errors.mjs";
 
+export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com"]);
 export const prefixes = ["/gmail/v1/", "/upload/gmail/v1/"];
 const BASE_URL = "https://oauth2.googleapis.com";
 
@@ -221,6 +222,8 @@ function withMimeHeaders(resource, m, named) {
 //     it is given as "subject:March invoice" and matches the phrase whatever its case. The term's
 //     parentheses are dropped, as the package drops them anyway.
 //   - from:me and to:me name the mailbox's own address, which the package reads as the word "me"
+//   - in:anywhere searches SPAM and TRASH too: the term is dropped and the list is asked with
+//     includeSpamTrash, which the package reads
 //   - a date in after:, before: and their synonyms newer: and older: is midnight Pacific time, as
 //     Gmail reads it, given to the package in seconds, which it otherwise reads in the box's zone;
 //     newer_than:/older_than: in days are taken from the trial's present
@@ -249,6 +252,7 @@ function secondsOfDate(value) {
 }
 function rewriteQuery(q, email, nowMs) {
   const keys = [];
+  let anywhere = false;
   const terms = (q.match(/[^\s"]*"[^"]+"[^\s"]*|\S+/g) ?? []).map((term) => {
     if (term.startsWith('"')) return term;
     if (term === "OR" || term === "AROUND") return keys.push(term), term;
@@ -271,7 +275,8 @@ function rewriteQuery(q, email, nowMs) {
       quoted ? `"${negated ? "-" : ""}${operator}:${given}"` : `${negated ? "-" : ""}${open}${operator}:${given}${close}`;
     if (UNSUPPORTED_OPERATORS.has(name)) return keys.push(name), term;
     if ((name === "from" || name === "to") && lower === "me") return rebuilt(written, email);
-    if (name === "in" && (lower === "anywhere" || lower === "archive")) return keys.push(`in:${lower}`), term;
+    if (name === "in" && lower === "anywhere") return (anywhere = true), "";
+    if (name === "in" && lower === "archive") return keys.push("in:archive"), term;
     if (name === "has" && lower !== "attachment") return keys.push("has"), term;
     if (DATE_OPERATORS.has(name)) {
       const seconds = /^\d+$/.test(value) ? Number(value) : secondsOfDate(value);
@@ -285,7 +290,7 @@ function rewriteQuery(q, email, nowMs) {
     return quoted ? rebuilt(written, value) : term;
   });
   // A gap is counted once per request, however many of the query's terms meet it.
-  return { q: terms.join(" "), keys: [...new Set(keys)].map((k) => `google:gmail:q:${k}`) };
+  return { q: terms.filter(Boolean).join(" "), keys: [...new Set(keys)].map((k) => `google:gmail:q:${k}`), anywhere };
 }
 
 // The headers a metadata get may name, as the package spells them; Gmail matches the names whatever
@@ -493,6 +498,7 @@ export function create({ app, store, gs, clock }) {
         const rewritten = rewriteQuery(q, email, clock.now());
         keys.push(...rewritten.keys);
         target.searchParams.set("q", rewritten.q);
+        if (rewritten.anywhere) target.searchParams.set("includeSpamTrash", "true");
       }
     }
     if (target.searchParams.has("format")) target.searchParams.set("format", formatOf(url));

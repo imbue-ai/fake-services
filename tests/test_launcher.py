@@ -161,12 +161,22 @@ def _listed_ids(services: RunningExternalServices, kind: str = "messages", **par
 def _calendar_get(
     services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str
 ) -> httpx2.Response:
-    headers = {} if token is None else {"Authorization": "Bearer {}".format(token)}
+    # Calendar lives on www.googleapis.com alone, which the shim names for every request it routes.
+    headers = {"X-Forwarded-Host": "www.googleapis.com"}
+    if token is not None:
+        headers["Authorization"] = "Bearer {}".format(token)
     return httpx2.get("{}/calendar/v3/{}".format(services.google_url, path), params=params, headers=headers)
 
 
 def _headers(message: dict[str, Any]) -> dict[str, str]:
     return {header["name"]: header["value"] for header in message["payload"]["headers"]}
+
+
+def _userinfo(services: RunningExternalServices, token: str | None = _GOOGLE_TOKEN) -> httpx2.Response:
+    headers = {"X-Forwarded-Host": "openidconnect.googleapis.com"}
+    if token is not None:
+        headers["Authorization"] = "Bearer {}".format(token)
+    return httpx2.get("{}/v1/userinfo".format(services.google_url), headers=headers)
 
 
 def _shifted_ms(stamp: str) -> int:
@@ -1953,6 +1963,9 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
         httpx2.get("{}/".format(external_services.google_url)),
         httpx2.get("{}/o/oauth2/v2/auth".format(external_services.google_url)),
         httpx2.get("{}/oauth2/v2/userinfo".format(external_services.google_url)),
+        _userinfo(external_services),
+        _userinfo(external_services, token=None),
+        _userinfo(external_services, token="ya29.other"),
         httpx2.get(
             "{}/gmail/v1/users/me/profile".format(external_services.google_url),
             headers={"X-Forwarded-Host": "accounts.googleapis.com"},
@@ -2493,6 +2506,53 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
+def test_gmail_in_anywhere_searches_spam_and_trash_too(external_services: RunningExternalServices) -> None:
+    update = {
+        "messages": [
+            {
+                "key": key,
+                "mailbox": _MORGAN,
+                "from": "Promo <deals@promo.example>",
+                "to": _MORGAN,
+                "subject": "Invoice {} offer".format(label.lower()),
+                "date": date,
+                "body": "An offer.",
+                "labels": [label],
+            }
+            for key, label, date in (
+                ("spam-offer", "SPAM", "2026-03-17T10:00:00-07:00"),
+                ("trashed-offer", "TRASH", "2026-03-18T10:00:00-07:00"),
+            )
+        ]
+    }
+    added = _add(external_services, "google", json.dumps(update))
+    assert added.status_code == 200, added.text
+    keys = _message_keys(external_services)
+    question, reply, followup, newsletter, spam, trashed = (
+        keys[key]
+        for key in (
+            "invoice-question",
+            "invoice-reply",
+            "invoice-followup",
+            "newsletter",
+            "spam-offer",
+            "trashed-offer",
+        )
+    )
+
+    # Without it a search leaves SPAM and TRASH out; with it, it is a search of all mail, archived included.
+    assert _listed_ids(external_services, q="offer") == []
+    assert _listed_ids(external_services, q="in:anywhere") == [followup, trashed, spam, reply, question, newsletter]
+    assert _listed_ids(external_services, q="in:anywhere") == _listed_ids(external_services, includeSpamTrash="true")
+    assert _listed_ids(external_services, q="IN:Anywhere offer") == [trashed, spam]
+    assert _listed_ids(external_services, q="in:anywhere offer", includeSpamTrash="false") == [trashed, spam]
+    assert _listed_ids(external_services, "threads", q="in:anywhere offer") == [trashed, spam]
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+    # in:archive is still answered as the package answers it, and counted.
+    _gmail_get(external_services, "me/messages", q="in:archive")
+    assert _control(external_services, "health")["unsupported_calls"] == {"google:gmail:q:in:archive": 1}
+
+
 def test_gmail_reads_a_get_format_whatever_its_case(external_services: RunningExternalServices) -> None:
     keys = _message_keys(external_services)
 
@@ -2608,6 +2668,58 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
         None,
     )
     assert vacation_line["unsupported"] == "google:gmail:GET users/{userId}/settings/vacation"
+
+
+def test_userinfo_answers_each_tokens_own_account_as_openid_connect_does(
+    external_services: RunningExternalServices,
+) -> None:
+    users = _control(external_services, "state")["google"]["collections"]["google.users"]["items"]
+    account_ids = {user["email"]: user["uid"] for user in users}
+
+    morgan = _userinfo(external_services)
+    thomas = _userinfo(external_services, token=_THOMAS_GOOGLE_TOKEN)
+    anonymous = _userinfo(external_services, token=None)
+    unknown = _userinfo(external_services, token="ya29.other")
+    # Only openidconnect's v1 path is served: Google's other userinfo paths are not.
+    for path in ("oauth2/v2/userinfo", "oauth2/v3/userinfo"):
+        other = httpx2.get(
+            "{}/{}".format(external_services.google_url, path),
+            headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"},
+        )
+        assert other.status_code == 404, path
+
+    assert (morgan.status_code, morgan.json()) == (
+        200,
+        {
+            "sub": account_ids[_MORGAN],
+            "name": "Morgan Reyes",
+            "given_name": "Morgan",
+            "family_name": "Reyes",
+            "email": _MORGAN,
+            "email_verified": True,
+        },
+    )
+    assert len(account_ids[_MORGAN]) == 21 and account_ids[_MORGAN].isdigit()
+    assert (thomas.status_code, thomas.json()["sub"], thomas.json()["email"]) == (
+        200,
+        account_ids["thomas.baird@redwood.example"],
+        "thomas.baird@redwood.example",
+    )
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:path:/oauth2/v2": 1,
+        "google:path:/oauth2/v3": 1,
+    }
+
+
+def test_userinfo_names_an_account_only_when_its_seed_does(
+    unnamed_google_external_services: RunningExternalServices,
+) -> None:
+    answer = _userinfo(unnamed_google_external_services)
+
+    assert answer.status_code == 200, answer.text
+    assert set(answer.json()) == {"sub", "email", "email_verified"}
 
 
 def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:
@@ -2805,6 +2917,34 @@ def test_a_calendar_list_and_a_calendar_name_the_account_its_token_belongs_to(
     assert probe_identities(probe, json.dumps(calendar)) == (_MORGAN,)
 
 
+def test_calendar_settings_are_calendars_defaults_in_the_primary_calendars_zone(
+    external_services: RunningExternalServices,
+) -> None:
+    listed = _calendar(external_services, "users/me/settings")
+    timezone = _calendar(external_services, "users/me/settings/timezone")
+    week_start = _calendar(external_services, "users/me/settings/weekStart")
+    thomas = _calendar(external_services, "users/me/settings/timezone", token=_THOMAS_GOOGLE_TOKEN)
+    unknown = _calendar_get(external_services, "users/me/settings/noSuchSetting")
+
+    assert listed["kind"] == "calendar#settings" and "nextSyncToken" not in listed
+    assert {item["id"]: item["value"] for item in listed["items"]} == {
+        "dateFieldOrder": "MDY",
+        "format24HourTime": "false",
+        "hideWeekends": "false",
+        "locale": "en",
+        "showDeclinedEvents": "true",
+        "timezone": "Etc/GMT+7",
+        "weekStart": "0",
+    }
+    assert {item["kind"] for item in listed["items"]} == {"calendar#setting"}
+    assert timezone == next(item for item in listed["items"] if item["id"] == "timezone")
+    assert set(timezone) == {"kind", "etag", "id", "value"}
+    assert (week_start["id"], week_start["value"]) == ("weekStart", "0")
+    assert thomas["value"] == "UTC"
+    assert (unknown.status_code, unknown.json()) == (404, _calendar_error(404, "Not Found", "notFound"))
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
 def test_a_seeded_calendar_event_is_served_as_calendar_serves_one(external_services: RunningExternalServices) -> None:
     ids = _event_ids(external_services)
     event = _calendar(external_services, "calendars/primary/events/{}".format(ids["vendor-sync"]))
@@ -2979,7 +3119,7 @@ def test_calendar_pages_250_events_at_a_time_unless_asked_otherwise(
 def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
     external_services: RunningExternalServices,
 ) -> None:
-    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"}
     events_url = "{}/calendar/v3/calendars/primary/events".format(external_services.google_url)
     # A day between the finance review and the offsite, as the trial sees them; Los Angeles keeps
     # daylight time then, as the calendar's own -07:00 does.
@@ -3065,7 +3205,7 @@ def test_another_accounts_calendar_is_not_found(external_services: RunningExtern
 def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_served_and_counted(
     external_services: RunningExternalServices,
 ) -> None:
-    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"}
     base = "{}/calendar/v3".format(external_services.google_url)
     sync_id = _event_ids(external_services)["vendor-sync"]
     lacking = [
@@ -3074,7 +3214,7 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         httpx2.get("{}/calendars/primary/events/{}/instances".format(base, sync_id), headers=headers),
         httpx2.post("{}/freeBusy".format(base), headers=headers, json={}),
         httpx2.get("{}/colors".format(base), headers=headers),
-        httpx2.get("{}/users/me/settings/timezone".format(base), headers=headers),
+        httpx2.get("{}/calendars/primary/acl".format(base), headers=headers),
     ]
     with_parameters = [
         _calendar_get(external_services, "calendars/primary/events", syncToken="CPDAlvWDx70CEPDAlvWDx70CGAU="),
@@ -3088,7 +3228,7 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         assert answer.headers["content-type"] == "text/html; charset=UTF-8"
         assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
     assert [answer.status_code for answer in with_parameters] == [200] * 4
-    # A search is answered by the words in an event's text.
+    # A search is answered by the words in an event's text, and not counted.
     assert [event["summary"] for event in with_parameters[2].json()["items"]] == ["Northwind invoice sync"]
     assert _control(external_services, "health")["unsupported_calls"] == {
         "google:calendar:PATCH calendars/{calendarId}/events/{eventId}": 1,
@@ -3096,10 +3236,9 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         "google:calendar:GET calendars/{calendarId}/events/{eventId}/instances": 1,
         "google:calendar:POST freeBusy": 1,
         "google:calendar:GET colors": 1,
-        "google:calendar:GET users/me/settings/{setting}": 1,
+        "google:calendar:GET calendars/{calendarId}/acl": 1,
         "google:calendar:syncToken": 1,
         "google:calendar:iCalUID": 1,
-        "google:calendar:q": 1,
         "google:calendar:fields": 1,
     }
 
@@ -3130,7 +3269,9 @@ def test_a_burst_past_calendars_per_user_quota_is_refused_as_calendar_refuses_it
     external_services: RunningExternalServices,
 ) -> None:
     # Every request costs one of a user's 600 a minute: 600 fit, and the 601st does not.
-    with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
+    with httpx2.Client(
+        headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"}
+    ) as client:
         burst = [
             client.get("{}/calendar/v3/calendars/primary".format(external_services.google_url)) for _ in range(601)
         ]
