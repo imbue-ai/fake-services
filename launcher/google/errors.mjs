@@ -5,9 +5,6 @@ export function googleError(code, message, reason, status, { domain = "global", 
   return Response.json({ error: { code, message, errors: [{ message: entryMessage, domain, reason, ...extra }], status } }, { status: code });
 }
 
-// A record that is not there, as an API answers a method it has for an id it does not hold.
-export const notFound = () => googleError(404, "Requested entity was not found.", "notFound", "NOT_FOUND");
-
 // A path no API method takes is answered by Google's frontends rather than by an API: their HTML
 // 404 page, naming the path. This is its doctype, title and text, without the page's styling.
 const escapeHtml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
