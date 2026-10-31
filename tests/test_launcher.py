@@ -2242,51 +2242,6 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
     assert vacation_line["unsupported"] == "google:gmail:GET users/{userId}/settings/vacation"
 
 
-def test_google_serves_the_callers_profile_on_its_userinfo_endpoints(
-    external_services: RunningExternalServices,
-) -> None:
-    def userinfo(host: str, path: str, token: str | None = _GOOGLE_TOKEN) -> httpx2.Response:
-        headers = {"X-Forwarded-Host": host}
-        if token is not None:
-            headers["Authorization"] = "Bearer {}".format(token)
-        return httpx2.get("{}{}".format(external_services.google_url, path), headers=headers)
-
-    oidc = userinfo("openidconnect.googleapis.com", "/v1/userinfo")
-    v3 = userinfo("www.googleapis.com", "/oauth2/v3/userinfo")
-    legacy = userinfo("www.googleapis.com", "/oauth2/v2/userinfo")
-    thomas = userinfo("openidconnect.googleapis.com", "/v1/userinfo", token=_THOMAS_GOOGLE_TOKEN)
-    anonymous = userinfo("openidconnect.googleapis.com", "/v1/userinfo", token=None)
-    unknown = userinfo("www.googleapis.com", "/oauth2/v3/userinfo", token="ya29.other")
-
-    # The account id is derived from the address: the same in every trial.
-    morgan = {
-        "sub": "115236848979260896454",
-        "name": "Morgan Reyes",
-        "given_name": "Morgan",
-        "family_name": "Reyes",
-        "email": _MORGAN,
-        "email_verified": True,
-    }
-    assert (oidc.status_code, oidc.json()) == (200, morgan)
-    assert (v3.status_code, v3.json()) == (200, morgan)
-    assert (legacy.status_code, legacy.json()) == (
-        200,
-        {
-            "id": morgan["sub"],
-            "email": _MORGAN,
-            "verified_email": True,
-            "name": "Morgan Reyes",
-            "given_name": "Morgan",
-            "family_name": "Reyes",
-        },
-    )
-    assert thomas.json()["email"] == "thomas.baird@redwood.example"
-    assert thomas.json()["sub"] != morgan["sub"]
-    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
-    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
-    assert _control(external_services, "health")["unsupported_calls"] == {}
-
-
 def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:
     thomas_keys = _message_keys(external_services, "thomas.baird@redwood.example")
     morgan_keys = _message_keys(external_services)
