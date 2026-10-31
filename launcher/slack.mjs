@@ -2,7 +2,8 @@
 // direct messages and ids are inserted straight into the store, so they read the same in every trial;
 // channels, direct messages and users are dated, and channels peopled, from the seed's messages
 // (settle()); Slack methods answer GET; conversations.history takes oldest/latest/inclusive;
-// search.messages reads the live store; a permalink names the workspace's own domain. See
+// search.messages and search.all read the live store; users.conversations is conversations.list
+// narrowed to a user's memberships; a permalink names the workspace's own domain. See
 // launcher.mjs for the interface this module exports.
 import crypto from "node:crypto";
 import { Hono, Store, WebhookDispatcher, authMiddleware, cors, createApiErrorHandler, createErrorHandler } from "@emulators/core";
@@ -18,8 +19,8 @@ const DOCS = "https://api.slack.com/methods";
 // (docs.slack.dev/apis/web-api/rate-limits and each method's page, read 2026-10-29): Tier 1 "1+ per
 // minute", Tier 2 "20+", Tier 3 "50+", Tier 4 "100+". A tier allows its number within any minute plus
 // a burst, which Slack does not publish; BURST is the share added for it. The method pages state:
-// conversations.history, conversations.replies, conversations.info and users.lookupByEmail Tier 3;
-// conversations.list, users.list and search.messages Tier 2; users.info and conversations.members
+// conversations.history, conversations.replies, conversations.info, users.conversations and
+// users.lookupByEmail Tier 3; conversations.list, users.list, search.messages and search.all Tier 2; users.info and conversations.members
 // Tier 4; auth.test "special" ("hundreds of requests per minute"), held to Tier 4 here. Since
 // 2025-05-29 conversations.history and conversations.replies are Tier 1 for a commercially
 // distributed app outside the Slack Marketplace; an internal customer-built app keeps Tier 3, and a
@@ -35,7 +36,9 @@ const METHOD_TIERS = {
   "users.list": 2,
   "users.info": 4,
   "users.lookupByEmail": 3,
+  "users.conversations": 3,
   "search.messages": 2,
+  "search.all": 2,
   "auth.test": 4,
 };
 const tier = (n) => ({ limit: PER_MINUTE[n] + Math.ceil(PER_MINUTE[n] * BURST), windowSeconds: 60, algorithm: "window" });
@@ -354,7 +357,8 @@ export function create(seed, clock) {
   const unsupportedOf = new WeakMap();
   // search.messages over the live store, so a message posted in the trial is found as a seeded one
   // is. in:@user is the token's user's im with that user; after: and before: exclude the day they name.
-  async function search(req, p) {
+  // search.all answers the same messages beside its files and posts, of which the fake holds none.
+  async function search(req, p, method) {
     const auth = await (await asPost(req, "auth.test", {})).json();
     if (!auth.ok) return Response.json(auth);
     const keys = [];
@@ -363,7 +367,7 @@ export function create(seed, clock) {
     const words = [];
     const dated = (op, value, test) => {
       const span = spanOf(value);
-      if (!span) keys.push(`slack:search.messages:${op}`);
+      if (!span) keys.push(`slack:${method}:${op}`);
       preds.push((m) => span !== null && test(Number(m.ts), span));
     };
     for (const raw of String(p.query ?? "").match(/"[^"]+"|\S+/g) ?? []) {
@@ -372,7 +376,7 @@ export function create(seed, clock) {
       const op = raw.startsWith('"') ? null : lower.match(/^([a-z]+):(.+)$/);
       const shape = unreadShapeOf(raw);
       if (shape) {
-        keys.push(`slack:search.messages:${shape}`);
+        keys.push(`slack:${method}:${shape}`);
         preds.push(() => false);
       } else if (op?.[1] === "in") {
         const target = term.slice(3);
@@ -393,7 +397,7 @@ export function create(seed, clock) {
         // A thread parent and its replies carry thread_ts; a message nobody replied to carries none.
         preds.push((m) => Boolean(m.thread_ts));
       } else if (op && UNREAD_OPERATORS.has(op[1])) {
-        keys.push(`slack:search.messages:${op[1]}`);
+        keys.push(`slack:${method}:${op[1]}`);
         preds.push(() => false);
       } else {
         words.push(lower);
@@ -411,9 +415,11 @@ export function create(seed, clock) {
     const slice = hits.slice((page - 1) * count, page * count);
     const pages = Math.ceil(hits.length / count);
     const team = ss.teams.all()[0]?.team_id;
+    const none = { total: 0, paging: { count, total: 0, page, pages: 0 }, pagination: { total_count: 0, page, per_page: count, page_count: 0, first: 0, last: 0 }, matches: [] };
     return Response.json({
       ok: true,
       query: p.query ?? "",
+      ...(method === "search.all" ? { files: none, posts: { total: 0, matches: [] } } : {}),
       messages: {
         total: hits.length,
         paging: { count, total: hits.length, page, pages },
@@ -426,6 +432,29 @@ export function create(seed, clock) {
         }),
       },
     });
+  }
+  // users.conversations: the conversations of conversations.list (its `types`, by default public
+  // channels alone, and `exclude_archived`) that `user`, else the token's user, is a member of; a
+  // conversation that is not public is listed only when the token's user is in it too, as
+  // conversations.list lists it. Slack serves these without `is_member` and `num_members`.
+  async function userConversations(req, p) {
+    const auth = await (await asPost(req, "auth.test", {})).json();
+    if (!auth.ok) return Response.json(auth);
+    const member = p.user ?? auth.user_id;
+    const listed = [];
+    let cursor = "";
+    do {
+      const page = await (await asPost(req, "conversations.list", { types: p.types ?? "public_channel", exclude_archived: p.exclude_archived ?? "false", limit: "1000", cursor })).json();
+      if (!page.ok) return Response.json(page);
+      listed.push(...page.channels);
+      cursor = page.response_metadata?.next_cursor;
+    } while (cursor);
+    const held = listed.filter((ch) => ss.channels.findOneBy("channel_id", ch.id)?.members.includes(member)).map(({ is_member, num_members, ...ch }) => ch);
+    const limit = Math.min(Number(p.limit) || 100, 999);
+    const start = p.cursor ? held.findIndex((ch) => ch.id === p.cursor) : 0;
+    if (start < 0) return Response.json({ ok: false, error: "invalid_cursor" });
+    const next = start + limit < held.length ? held[start + limit].id : "";
+    return Response.json({ ok: true, channels: held.slice(start, start + limit), response_metadata: { next_cursor: next } });
   }
   // The emulator's user objects lack Slack's `updated`, which the answers of these methods gain from
   // the store (the date settle() gave the user), under the key each answer holds its users in.
@@ -469,7 +498,8 @@ export function create(seed, clock) {
   async function apiRoute(req, url) {
     const method = url.pathname.slice(5);
     const p = await params(req);
-    if (method === "search.messages") return search(req, p);
+    if (method === "search.messages" || method === "search.all") return search(req, p, method);
+    if (method === "users.conversations") return userConversations(req, p);
     if (method === "conversations.history" && (p.oldest || p.latest)) return history(req, p);
     const res = await (req.method === "GET" ? asPost(req, method, Object.fromEntries(url.searchParams)) : app.fetch(req));
     if (method in USER_ANSWERS) return withUpdated(res, USER_ANSWERS[method]);

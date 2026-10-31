@@ -696,6 +696,87 @@ def test_a_dm_is_listed_by_its_type_and_read_like_a_channel_by_its_members(
     assert _search(external_services, "thursday") == [_shifted("1773980000.000000")]
 
 
+def test_users_conversations_lists_the_conversations_the_tokens_user_is_in(
+    external_services: RunningExternalServices,
+) -> None:
+    user_ids = _user_ids(external_services)
+    dms = _dms(external_services)
+
+    default = _slack(external_services, "users.conversations")
+    with_im = _slack(external_services, "users.conversations", types="public_channel,im")
+    dms_only = _slack(external_services, "users.conversations", types="im,mpim")
+    first = _slack(external_services, "users.conversations", types="public_channel,im,mpim", limit="2")
+    rest = _slack(
+        external_services,
+        "users.conversations",
+        types="public_channel,im,mpim",
+        limit="2",
+        cursor=first["response_metadata"]["next_cursor"],
+    )
+    pagerbots = _slack(
+        external_services, "users.conversations", user=user_ids["pagerbot"], types="public_channel,mpim"
+    )
+
+    # Morgan posted in #eng-oncall and is no member of #announcements, which conversations.list lists too.
+    assert {channel["name"] for channel in _slack(external_services, "conversations.list")["channels"]} == {
+        "announcements",
+        "eng-oncall",
+    }
+    assert [channel["name"] for channel in default["channels"]] == ["eng-oncall"]
+    assert default["response_metadata"] == {"next_cursor": ""}
+    assert "is_member" not in default["channels"][0] and "num_members" not in default["channels"][0]
+    assert {channel["id"] for channel in with_im["channels"]} == {
+        _channel_id(external_services, "eng-oncall"),
+        dms["im"]["id"],
+    }
+    assert {channel["id"] for channel in dms_only["channels"]} == {dms["im"]["id"], dms["mpim"]["id"]}
+    assert len(first["channels"]) == 2 and first["response_metadata"]["next_cursor"]
+    assert {channel["id"] for channel in first["channels"] + rest["channels"]} == {
+        _channel_id(external_services, "eng-oncall"),
+        dms["im"]["id"],
+        dms["mpim"]["id"],
+    }
+    assert rest["response_metadata"] == {"next_cursor": ""}
+    assert {channel["id"] for channel in pagerbots["channels"]} == {
+        _channel_id(external_services, "eng-oncall"),
+        dms["mpim"]["id"],
+    }
+    assert _slack(external_services, "users.conversations", cursor="CNOSUCH") == {
+        "ok": False,
+        "error": "invalid_cursor",
+    }
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_search_all_answers_search_messages_messages_and_no_files(external_services: RunningExternalServices) -> None:
+    for params in ({"query": "latency"}, {"query": "latency", "sort": "timestamp", "count": "2", "page": "2"}):
+        messages = _slack(external_services, "search.messages", **params)
+        everything = _slack(external_services, "search.all", **params)
+
+        count, page = int(params.get("count", "20")), int(params.get("page", "1"))
+        assert everything == {
+            **messages,
+            "files": {
+                "total": 0,
+                "paging": {"count": count, "total": 0, "page": page, "pages": 0},
+                "pagination": {
+                    "total_count": 0,
+                    "page": page,
+                    "per_page": count,
+                    "page_count": 0,
+                    "first": 0,
+                    "last": 0,
+                },
+                "matches": [],
+            },
+            "posts": {"total": 0, "matches": []},
+        }
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+    # A gap of its query is counted under search.all.
+    _slack(external_services, "search.all", query="latency has:link")
+    assert _control(external_services, "health")["unsupported_calls"] == {"slack:search.all:has": 1}
+
+
 def test_search_finds_a_posted_message_and_reads_a_date_as_written(external_services: RunningExternalServices) -> None:
     """A message posted in the trial is stamped with the box's clock, and a seed's under a time shift
     with dates ending the day before the trial: both are found by the dates an agent reads off them,
