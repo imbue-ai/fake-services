@@ -21,6 +21,7 @@ from imbue.minds_evals.errors import TaskAuthoringError
 from imbue.minds_evals.external_services import SERVICES
 from imbue.minds_evals.external_services import parse_service_seed
 from imbue.minds_evals.external_services import parse_service_update
+from imbue.minds_evals.external_services import probe_identities
 from imbue.minds_evals.external_services import service_named
 from imbue.minds_evals.testing import EXTERNAL_SERVICES_REFUSED_UPDATE_FIXTURE
 from imbue.minds_evals.testing import EXTERNAL_SERVICES_SEED_FIXTURE
@@ -154,6 +155,13 @@ def _message_keys(services: RunningExternalServices, mailbox: str = _MORGAN) -> 
 
 def _listed_ids(services: RunningExternalServices, kind: str = "messages", **params: str) -> list[str]:
     return [entry["id"] for entry in _gmail(services, "me/{}".format(kind), **params).get(kind, [])]
+
+
+def _calendar_get(
+    services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str
+) -> httpx2.Response:
+    headers = {} if token is None else {"Authorization": "Bearer {}".format(token)}
+    return httpx2.get("{}/calendar/v3/{}".format(services.google_url, path), params=params, headers=headers)
 
 
 def _headers(message: dict[str, Any]) -> dict[str, str]:
@@ -1277,6 +1285,13 @@ _PLACEABLE_EMAIL = {
     "date": "2026-03-20T15:30:00-07:00",
     "body": "Noted.",
 }
+_PLACEABLE_EVENT = {
+    "key": "placeable-event",
+    "owner": "morgan.reyes@redwood.example",
+    "summary": "Noted",
+    "start": "2026-03-23T09:00:00-07:00",
+    "end": "2026-03-23T09:30:00-07:00",
+}
 
 
 @pytest.mark.parametrize(
@@ -1306,6 +1321,21 @@ _PLACEABLE_EMAIL = {
         ("google", {"labels": [{"mailbox": "morgan.reyes@redwood.example", "name": "vendors"}]}),
         ("google", {"labels": [{"mailbox": "nobody@redwood.example", "name": "Finance"}]}),
         ("google", {"users": [{"email": "thomas.baird@redwood.example"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "owner": "nobody@redwood.example"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "key": "vendor-sync"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "start": "2026-03-23T09:00:00"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "end": "2026-03-23T08:00:00-07:00"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "start": "2026-03-23", "end": "2026-03-23T10:00:00-07:00"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "start": "2026-03-23", "end": "2026-03-23"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "attendees": [{"name": "No address"}]}]}),
+        (
+            "google",
+            {"events": [{**_PLACEABLE_EVENT, "attendees": [{"email": "a@x.example", "response_status": "maybe"}]}]},
+        ),
+        (
+            "google",
+            {"events": [{**_PLACEABLE_EVENT, "attendees": [{"email": "a@x.example"}, {"email": "A@x.example"}]}]},
+        ),
         # Thomas has no Vendors label of his own: a label belongs to one mailbox.
         (
             "google",
@@ -1543,6 +1573,15 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
         _gmail_get(external_services, "me/labels"),
         _gmail_get(external_services, "me/settings/sendAs"),
         _gmail_get(external_services, "me/drafts"),
+        _calendar_get(external_services, "users/me/calendarList"),
+        _calendar_get(external_services, "calendars/primary"),
+        _calendar_get(external_services, "calendars/primary/events", maxResults="1"),
+        _calendar_get(external_services, "calendars/primary/events", orderBy="startTime"),
+        _calendar_get(external_services, "calendars/primary/events", timeMin="yesterday"),
+        _calendar_get(external_services, "calendars/primary/events", pageToken="x"),
+        _calendar_get(external_services, "calendars/primary/events/0000000000"),
+        _calendar_get(external_services, "calendars/thomas.baird@redwood.example/events"),
+        _calendar_get(external_services, "colors"),
         httpx2.get("{}/".format(external_services.google_url)),
         httpx2.get("{}/o/oauth2/v2/auth".format(external_services.google_url)),
         httpx2.get("{}/oauth2/v2/userinfo".format(external_services.google_url)),
@@ -1839,9 +1878,20 @@ def test_the_google_store_holds_the_seed_and_nothing_of_the_emulators_own(
         _MORGAN,
         "thomas.baird@redwood.example",
     ]
-    # No calendar, file or default mailbox of the package's own, and no record names it.
-    for collection in ("google.calendars", "google.calendar_events", "google.drive_items", "google.drafts"):
+    # No file or default mailbox of the package's own, one primary calendar per account, the seed's
+    # events, and no record names the package.
+    for collection in ("google.drive_items", "google.drafts"):
         assert dump.get(collection, {"items": []})["items"] == [], collection
+    assert sorted(calendar["google_id"] for calendar in dump["google.calendars"]["items"]) == [
+        _MORGAN,
+        "thomas.baird@redwood.example",
+    ]
+    assert sorted(event["seed_key"] for event in dump["google.calendar_events"]["items"]) == [
+        "finance-review",
+        "offsite",
+        "thomas-planning",
+        "vendor-sync",
+    ]
     assert "testuser" not in json.dumps(dump) and "emulate" not in json.dumps(dump).lower()
     assert [label["name"] for label in labels if label["type"] == "user"] == ["Vendors"]
     assert {label["id"] for label in labels} >= {"INBOX", "SENT", "UNREAD", "STARRED", "IMPORTANT"}
@@ -2101,10 +2151,6 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
     vacation_again = _gmail_get(external_services, _MORGAN + "/settings/vacation")
     no_such_setting = _gmail_get(external_services, "me/settings/doesnotexist")
     no_such_method = _gmail_get(external_services, "me/nothinghere")
-    calendar = httpx2.get(
-        "{}/calendar/v3/users/me/calendarList".format(external_services.google_url),
-        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
-    )
     drive = httpx2.get(
         "{}/drive/v3/files".format(external_services.google_url),
         headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
@@ -2125,7 +2171,7 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
     missing_message = _gmail_get(external_services, "me/messages/0000000000000000")
 
     # Google's frontends answer a path no API method takes with their HTML page, naming the path.
-    for answer in (vacation, vacation_again, no_such_setting, no_such_method, calendar, drive, oauth, other_host):
+    for answer in (vacation, vacation_again, no_such_setting, no_such_method, drive, oauth, other_host):
         assert answer.status_code == 404
         assert answer.headers["content-type"] == "text/html; charset=UTF-8"
         assert answer.text.startswith("<!DOCTYPE html>")
@@ -2148,7 +2194,6 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
         "google:gmail:GET users/{userId}/settings/vacation": 2,
         "google:gmail:GET users/{userId}/settings/doesnotexist": 1,
         "google:gmail:GET users/{userId}/nothinghere": 1,
-        "google:path:/calendar/v3": 1,
         "google:path:/drive/v3": 1,
         "google:path:/o/oauth2": 1,
         "google:host:people.googleapis.com": 1,
@@ -2210,7 +2255,7 @@ def test_a_gmail_update_lands_in_its_thread_as_newer_history(external_services: 
 
     assert (added.status_code, added.json()["added"]) == (
         200,
-        {"google_users": 1, "gmail_labels": 1, "gmail_messages": 1},
+        {"google_users": 1, "gmail_labels": 1, "gmail_messages": 1, "calendar_calendars": 1, "calendar_events": 1},
     )
     assert (after["messagesTotal"], after["threadsTotal"]) == (5, 2)
     assert int(after["historyId"]) > int(before["historyId"])
@@ -2255,3 +2300,420 @@ def test_a_burst_past_gmails_per_user_quota_is_refused_as_gmail_refuses_it(
     assert not {name for name in burst[0].headers if name.startswith(("x-ratelimit", "retry-after"))}
     assert (cheap.status_code, thomas.status_code) == (403, 200)
     assert _control(external_services, "health")["rate_limited"] == {"google:gmail_per_user": 2}
+
+
+_THOMAS = "thomas.baird@redwood.example"
+
+
+def _calendar(services: RunningExternalServices, path: str, token: str = _GOOGLE_TOKEN, **params: str) -> Any:
+    answer = _calendar_get(services, path, token=token, **params)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _event_ids(services: RunningExternalServices) -> dict[str, str]:
+    """Each seeded event's id by its key, as the state dump holds them."""
+    items = _control(services, "state")["google"]["collections"]["google.calendar_events"]["items"]
+    return {item["seed_key"]: item["google_id"] for item in items if item["seed_key"]}
+
+
+def _listed_summaries(services: RunningExternalServices, token: str = _GOOGLE_TOKEN, **params: str) -> list[str]:
+    return [
+        event["summary"] for event in _calendar(services, "calendars/primary/events", token=token, **params)["items"]
+    ]
+
+
+def _shifted_date_time(stamp: str) -> str:
+    """A seed's instant as Calendar serves an event's dateTime under the test's shift: in the offset
+    it was written in, to the second."""
+    moved = datetime.fromisoformat(stamp) + timedelta(seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS)
+    return moved.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _calendar_error(code: int, message: str, reason: str, **extra: str) -> dict[str, Any]:
+    return {
+        "error": {
+            "errors": [{"domain": "global", "reason": reason, "message": message, **extra}],
+            "code": code,
+            "message": message,
+        }
+    }
+
+
+def test_a_calendar_list_and_a_calendar_name_the_account_its_token_belongs_to(
+    external_services: RunningExternalServices,
+) -> None:
+    listed = _calendar(external_services, "users/me/calendarList")
+    by_primary = _calendar(external_services, "users/me/calendarList/primary")
+    by_address = _calendar(external_services, "users/me/calendarList/{}".format(_MORGAN))
+    calendar = _calendar(external_services, "calendars/primary")
+    thomas = _calendar(external_services, "calendars/primary", token=_THOMAS_GOOGLE_TOKEN)
+    probe = next(
+        credential.probe for credential in service_named("google").credentials if credential.name == "google-calendar"
+    )
+
+    assert (listed["kind"], [entry["id"] for entry in listed["items"]]) == ("calendar#calendarList", [_MORGAN])
+    (entry,) = listed["items"]
+    assert entry == by_primary == by_address
+    assert {key: entry[key] for key in ("kind", "summary", "timeZone", "accessRole", "primary", "selected")} == {
+        "kind": "calendar#calendarListEntry",
+        "summary": _MORGAN,
+        # Most of Morgan's events are written at -07:00, so Morgan's calendar keeps that zone.
+        "timeZone": "Etc/GMT+7",
+        "accessRole": "owner",
+        "primary": True,
+        "selected": True,
+    }
+    assert entry["defaultReminders"] == [{"method": "popup", "minutes": 10}]
+    assert {key: calendar[key] for key in ("kind", "id", "summary", "timeZone")} == {
+        "kind": "calendar#calendar",
+        "id": _MORGAN,
+        "summary": _MORGAN,
+        "timeZone": "Etc/GMT+7",
+    }
+    # Thomas's one event is written in UTC.
+    assert (thomas["id"], thomas["timeZone"]) == (_THOMAS, "UTC")
+    # The probe that shows a workspace reaches the fake reads the token's account off this answer.
+    assert probe_identities(probe, json.dumps(calendar)) == (_MORGAN,)
+
+
+def test_a_seeded_calendar_event_is_served_as_calendar_serves_one(external_services: RunningExternalServices) -> None:
+    ids = _event_ids(external_services)
+    event = _calendar(external_services, "calendars/primary/events/{}".format(ids["vendor-sync"]))
+    offsite = _calendar(external_services, "calendars/{}/events/{}".format(_MORGAN, ids["offsite"]))
+    listed = {item["id"]: item for item in _calendar(external_services, "calendars/primary/events")["items"]}
+
+    created = _shifted_iso("2026-03-17T17:00:00.000Z")
+    assert event == {
+        "kind": "calendar#event",
+        "etag": event["etag"],
+        "id": ids["vendor-sync"],
+        "status": "confirmed",
+        "htmlLink": event["htmlLink"],
+        "created": created,
+        "updated": created,
+        "summary": "Northwind invoice sync",
+        "description": "Walk through invoice 4411 with Priya.",
+        "location": "Room 4B",
+        "creator": {"email": _MORGAN, "self": True},
+        "organizer": {"email": _MORGAN, "self": True},
+        "start": {"dateTime": _shifted_date_time("2026-03-17T10:00:00-07:00"), "timeZone": "Etc/GMT+7"},
+        "end": {"dateTime": _shifted_date_time("2026-03-17T10:30:00-07:00"), "timeZone": "Etc/GMT+7"},
+        "iCalUID": "{}@google.com".format(ids["vendor-sync"]),
+        "sequence": 0,
+        # The organizer is a guest of an event that has guests.
+        "attendees": [
+            {"email": _MORGAN, "organizer": True, "self": True, "responseStatus": "accepted"},
+            {"email": "priya@northwind.example", "displayName": "Priya Shah", "responseStatus": "accepted"},
+            {"email": _THOMAS, "displayName": "Thomas Baird", "responseStatus": "tentative"},
+        ],
+        "reminders": {"useDefault": True},
+        "eventType": "default",
+    }
+    assert listed[ids["vendor-sync"]] == event
+    # Ids are lowercase base32hex, as Calendar's are, and the link names the event on its calendar.
+    assert all(
+        len(event_id) == 26 and set(event_id) <= set("0123456789abcdefghijklmnopqrstuv") for event_id in ids.values()
+    )
+    eid = event["htmlLink"].removeprefix("https://www.google.com/calendar/event?eid=")
+    assert base64.b64decode(eid + "=" * (-len(eid) % 4)).decode() == "{} {}".format(ids["vendor-sync"], _MORGAN)
+    assert event["etag"] == '"{}"'.format(_shifted_ms("2026-03-17T17:00:00+00:00") * 2000)
+    # An all-day event is its days, the end exclusive; it is after the seed's anchor, so it was
+    # created by the time the data ends.
+    assert (offsite["start"], offsite["end"]) == (
+        {"date": _shifted_date("2026-03-26")},
+        {"date": _shifted_date("2026-03-28")},
+    )
+    assert offsite["created"] == _shifted_iso("2026-03-21T00:00:00.000Z")
+    assert "attendees" not in offsite and "location" not in offsite
+
+
+def test_every_calendar_date_is_the_seeds_or_derived_from_it(external_services: RunningExternalServices) -> None:
+    morgan = _calendar(external_services, "calendars/primary/events")
+    thomas = _calendar(external_services, "calendars/primary/events", token=_THOMAS_GOOGLE_TOKEN)
+    calendars = _calendar(external_services, "users/me/calendarList")
+
+    # An event was created at the earlier of its start and the anchor.
+    assert {event["summary"]: event["created"] for event in morgan["items"] + thomas["items"]} == {
+        "Northwind invoice sync": _shifted_iso("2026-03-17T17:00:00.000Z"),
+        "Q1 finance review": _shifted_iso("2026-03-21T00:00:00.000Z"),
+        "Team offsite": _shifted_iso("2026-03-21T00:00:00.000Z"),
+        "Planning block": _shifted_iso("2026-03-18T09:00:00.000Z"),
+    }
+    # A calendar was last changed with its latest event; its account, and so the calendar itself,
+    # dates from the account's earliest record, Morgan's an email.
+    assert (morgan["updated"], thomas["updated"]) == (
+        _shifted_iso("2026-03-21T00:00:00.000Z"),
+        _shifted_iso("2026-03-18T09:00:00.000Z"),
+    )
+    assert calendars["items"][0]["etag"] == '"{}"'.format(_shifted_ms("2026-03-12T06:00:00+00:00") * 2000)
+    _assert_no_date_is_near_the_wall_clock(morgan, thomas)
+
+
+def test_calendar_lists_events_by_time_bounds_order_and_pages(external_services: RunningExternalServices) -> None:
+    shifted = _shifted_iso
+    everything = _calendar(external_services, "calendars/primary/events")
+    # timeMin bounds an event's end and timeMax its start, both exclusively.
+    after_sync = _listed_summaries(external_services, timeMin=shifted("2026-03-17T17:30:00.000Z"))
+    before_review = _listed_summaries(external_services, timeMax=shifted("2026-03-24T21:00:00.000Z"))
+    within = _listed_summaries(
+        external_services, timeMin=shifted("2026-03-20T00:00:00.000Z"), timeMax=shifted("2026-03-27T00:00:00.000Z")
+    )
+    by_start = _listed_summaries(external_services, orderBy="startTime", singleEvents="true")
+    by_update = _listed_summaries(external_services, orderBy="updated")
+    unordered = _calendar_get(external_services, "calendars/primary/events", orderBy="startTime")
+    empty_range = _calendar_get(
+        external_services,
+        "calendars/primary/events",
+        timeMin=shifted("2026-03-20T00:00:00.000Z"),
+        timeMax=shifted("2026-03-20T00:00:00.000Z"),
+    )
+    no_offset = _calendar_get(external_services, "calendars/primary/events", timeMin="2036-03-20T00:00:00")
+
+    assert set(everything) == {
+        "kind",
+        "etag",
+        "summary",
+        "updated",
+        "timeZone",
+        "accessRole",
+        "defaultReminders",
+        "items",
+    }
+    assert (everything["kind"], everything["summary"], everything["timeZone"], everything["accessRole"]) == (
+        "calendar#events",
+        _MORGAN,
+        "Etc/GMT+7",
+        "owner",
+    )
+    assert after_sync == ["Q1 finance review", "Team offsite"]
+    assert before_review == ["Northwind invoice sync"]
+    assert within == ["Q1 finance review", "Team offsite"]
+    assert by_start == ["Northwind invoice sync", "Q1 finance review", "Team offsite"]
+    # The two events created at the anchor tie on their update, and fall back to their start.
+    assert by_update == ["Northwind invoice sync", "Q1 finance review", "Team offsite"]
+    assert (unordered.status_code, unordered.json()) == (
+        400,
+        _calendar_error(400, "The requested ordering is not available for the particular query.", "badRequest"),
+    )
+    assert (empty_range.status_code, empty_range.json()["error"]["errors"][0]) == (
+        400,
+        {
+            "domain": "calendar",
+            "reason": "timeRangeEmpty",
+            "message": "The specified time range is empty.",
+            "locationType": "parameter",
+            "location": "timeMax",
+        },
+    )
+    assert (no_offset.status_code, no_offset.json()) == (400, _calendar_error(400, "Bad Request", "badRequest"))
+    # Calendar returns an empty list rather than leaving it out.
+    assert (
+        _calendar(external_services, "calendars/primary/events", timeMax=shifted("2026-01-01T00:00:00.000Z"))["items"]
+        == []
+    )
+
+
+def test_calendar_pages_250_events_at_a_time_unless_asked_otherwise(
+    external_services: RunningExternalServices,
+) -> None:
+    many = [
+        {
+            "key": "standup-{}".format(day),
+            "owner": _MORGAN,
+            "summary": "Standup {}".format(day),
+            "start": "2026-02-{:02d}T09:00:00-07:00".format(day),
+            "end": "2026-02-{:02d}T09:15:00-07:00".format(day),
+        }
+        for day in range(1, 13)
+    ]
+    assert _add(external_services, "google", json.dumps({"events": many})).status_code == 200
+
+    whole = _calendar(external_services, "calendars/primary/events")
+    pages: list[list[str]] = []
+    token: str | None = None
+    while True:
+        params = {"maxResults": "5", **({"pageToken": token} if token else {})}
+        page = _calendar(external_services, "calendars/primary/events", **params)
+        pages.append([event["summary"] for event in page["items"]])
+        token = page.get("nextPageToken")
+        if token is None:
+            break
+    malformed = _calendar_get(
+        external_services, "calendars/primary/events", pageToken="CiAKGjBpNDd2Nmp2Zml2cXRwYjBpOXA"
+    )
+    none_asked = _calendar_get(external_services, "calendars/primary/events", maxResults="0")
+
+    # The package pages ten at a time; Calendar 250.
+    assert len(whole["items"]) == 15 and "nextPageToken" not in whole
+    assert [len(page) for page in pages] == [5, 5, 5]
+    assert [summary for page in pages for summary in page] == [event["summary"] for event in whole["items"]]
+    assert (malformed.status_code, malformed.json()["error"]["errors"][0]["location"]) == (400, "pageToken")
+    assert (none_asked.status_code, none_asked.json()["error"]["errors"][0]["location"]) == (400, "maxResults")
+
+
+def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
+    external_services: RunningExternalServices,
+) -> None:
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
+    events_url = "{}/calendar/v3/calendars/primary/events".format(external_services.google_url)
+    # A day between the finance review and the offsite, as the trial sees them; Los Angeles keeps
+    # daylight time then, as the calendar's own -07:00 does.
+    day = _shifted_date("2026-03-25")
+    inserted = httpx2.post(
+        events_url,
+        headers=headers,
+        json={
+            "summary": "Invoice follow-up",
+            "start": {"dateTime": "{}T09:00:00".format(day), "timeZone": "America/Los_Angeles"},
+            "end": {"dateTime": "{}T16:30:00Z".format(day)},
+            "attendees": [{"email": "priya@northwind.example"}],
+            "recurrence": ["RRULE:FREQ=WEEKLY"],
+        },
+    )
+    assert inserted.status_code == 200, inserted.text
+    event = inserted.json()
+    got = _calendar(external_services, "calendars/primary/events/{}".format(event["id"]))
+    listed = _listed_summaries(external_services, orderBy="startTime", singleEvents="true")
+    sync_id = _event_ids(external_services)["vendor-sync"]
+    deleted = httpx2.delete("{}/{}".format(events_url, sync_id), headers=headers)
+    after_delete = _listed_summaries(external_services)
+    with_deleted = _calendar(external_services, "calendars/primary/events", showDeleted="true")["items"]
+    cancelled = _calendar(external_services, "calendars/primary/events/{}".format(sync_id))
+    deleted_again = httpx2.delete("{}/{}".format(events_url, sync_id), headers=headers)
+    no_end = httpx2.post(events_url, headers=headers, json={"summary": "x", "start": {"date": day}})
+
+    assert got == event
+    assert (event["start"], event["end"]) == (
+        {"dateTime": "{}T09:00:00-07:00".format(day), "timeZone": "America/Los_Angeles"},
+        {"dateTime": "{}T09:30:00-07:00".format(day), "timeZone": "Etc/GMT+7"},
+    )
+    assert [a["email"] for a in event["attendees"]] == [_MORGAN, "priya@northwind.example"]
+    assert listed == ["Northwind invoice sync", "Q1 finance review", "Invoice follow-up", "Team offsite"]
+    assert (deleted.status_code, deleted.text) == (204, "")
+    assert "Northwind invoice sync" not in after_delete
+    assert {e["summary"]: e["status"] for e in with_deleted}["Northwind invoice sync"] == "cancelled"
+    assert cancelled["status"] == "cancelled"
+    assert (deleted_again.status_code, deleted_again.json()) == (
+        410,
+        _calendar_error(410, "Resource has been deleted", "deleted"),
+    )
+    assert (no_end.status_code, no_end.json()) == (400, _calendar_error(400, "Missing end time.", "required"))
+    # The insert's recurrence is not kept, and that is counted.
+    assert _control(external_services, "health")["unsupported_calls"] == {"google:calendar:body:recurrence": 1}
+
+
+def test_another_accounts_calendar_is_not_found(external_services: RunningExternalServices) -> None:
+    """Calendar answers a calendar the caller has no access to as one that does not exist, with a 404
+    rather than a 403, so the fake does the same for another seeded account's calendar and for an
+    event on it."""
+    thomas_event = _event_ids(external_services)["thomas-planning"]
+    answers = [
+        _calendar_get(external_services, "calendars/{}/events".format(_THOMAS)),
+        _calendar_get(external_services, "calendars/{}".format(_THOMAS)),
+        _calendar_get(external_services, "users/me/calendarList/{}".format(_THOMAS)),
+        _calendar_get(external_services, "calendars/primary/events/{}".format(thomas_event)),
+        _calendar_get(external_services, "calendars/{}/events/{}".format(_THOMAS, thomas_event)),
+    ]
+    anonymous = _calendar_get(external_services, "calendars/primary", token=None)
+
+    for answer in answers:
+        assert (answer.status_code, answer.json()) == (404, _calendar_error(404, "Not Found", "notFound"))
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_served_and_counted(
+    external_services: RunningExternalServices,
+) -> None:
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
+    base = "{}/calendar/v3".format(external_services.google_url)
+    sync_id = _event_ids(external_services)["vendor-sync"]
+    lacking = [
+        httpx2.patch("{}/calendars/primary/events/{}".format(base, sync_id), headers=headers, json={"summary": "x"}),
+        httpx2.post("{}/calendars/primary/events/quickAdd".format(base), headers=headers, params={"text": "x"}),
+        httpx2.get("{}/calendars/primary/events/{}/instances".format(base, sync_id), headers=headers),
+        httpx2.post("{}/freeBusy".format(base), headers=headers, json={}),
+        httpx2.get("{}/colors".format(base), headers=headers),
+        httpx2.get("{}/users/me/settings/timezone".format(base), headers=headers),
+    ]
+    with_parameters = [
+        _calendar_get(external_services, "calendars/primary/events", syncToken="CPDAlvWDx70CEPDAlvWDx70CGAU="),
+        _calendar_get(external_services, "calendars/primary/events", iCalUID="x@google.com"),
+        _calendar_get(external_services, "calendars/primary/events", q="invoice", prettyPrint="false"),
+        _calendar_get(external_services, "calendars/primary/events", fields="items(summary)"),
+    ]
+
+    for answer in lacking:
+        assert answer.status_code == 404
+        assert answer.headers["content-type"] == "text/html; charset=UTF-8"
+        assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
+    assert [answer.status_code for answer in with_parameters] == [200] * 4
+    # A search is answered by words in an event's text, closer to Calendar's than ignoring it.
+    assert [event["summary"] for event in with_parameters[2].json()["items"]] == ["Northwind invoice sync"]
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:calendar:PATCH calendars/{calendarId}/events/{eventId}": 1,
+        "google:calendar:POST calendars/{calendarId}/events/quickAdd": 1,
+        "google:calendar:GET calendars/{calendarId}/events/{eventId}/instances": 1,
+        "google:calendar:POST freeBusy": 1,
+        "google:calendar:GET colors": 1,
+        "google:calendar:GET users/me/settings/{setting}": 1,
+        "google:calendar:syncToken": 1,
+        "google:calendar:iCalUID": 1,
+        "google:calendar:q": 1,
+        "google:calendar:fields": 1,
+    }
+
+
+def test_a_calendar_update_adds_its_events_with_the_seeds_shift(external_services: RunningExternalServices) -> None:
+    added = _add(
+        external_services, "google", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "google")
+    )
+    calendars = _control(external_services, "state")["google"]["collections"]["google.calendars"]["items"]
+    call = next(
+        event
+        for event in _calendar(external_services, "calendars/primary/events")["items"]
+        if event["summary"] == "Corrected invoice call"
+    )
+
+    assert added.status_code == 200, added.text
+    assert added.json()["added"]["calendar_events"] == 1
+    assert call["start"] == {"dateTime": _shifted_date_time("2026-03-23T09:00:00-07:00"), "timeZone": "Etc/GMT+7"}
+    assert call["id"] == _event_ids(external_services)["corrected-invoice-call"]
+    assert [a["email"] for a in call["attendees"]] == [_MORGAN, "olivia.chen@redwood.example"]
+    # The update's new account has its primary calendar too, in UTC with no event of its own.
+    assert {calendar["google_id"]: calendar["time_zone"] for calendar in calendars}[
+        "olivia.chen@redwood.example"
+    ] == "UTC"
+
+
+def test_a_burst_past_calendars_per_user_quota_is_refused_as_calendar_refuses_it(
+    external_services: RunningExternalServices,
+) -> None:
+    # Every request costs one of a user's 600 a minute: 600 fit, and the 601st does not.
+    with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
+        burst = [
+            client.get("{}/calendar/v3/calendars/primary".format(external_services.google_url)) for _ in range(601)
+        ]
+    # The quota is each user's own and Calendar's own: Thomas, and Morgan's Gmail, are still served.
+    thomas = _calendar_get(external_services, "calendars/primary", token=_THOMAS_GOOGLE_TOKEN)
+    gmail = _gmail_get(external_services, "me/profile")
+
+    assert [answer.status_code for answer in burst[:600]] == [200] * 600
+    refused = burst[600]
+    assert (refused.status_code, refused.json()) == (
+        403,
+        {
+            "error": {
+                "errors": [
+                    {"domain": "usageLimits", "reason": "userRateLimitExceeded", "message": "User Rate Limit Exceeded"}
+                ],
+                "code": 403,
+                "message": "User Rate Limit Exceeded",
+            }
+        },
+    )
+    assert 1 <= int(refused.headers["retry-after"]) <= 60
+    assert not {name for name in burst[0].headers if name.startswith(("x-ratelimit", "retry-after"))}
+    assert (thomas.status_code, gmail.status_code) == (200, 200)
+    assert _control(external_services, "health")["rate_limited"] == {"google:calendar_per_user": 1}
