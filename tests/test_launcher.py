@@ -2660,7 +2660,7 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         assert answer.headers["content-type"] == "text/html; charset=UTF-8"
         assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
     assert [answer.status_code for answer in with_parameters] == [200] * 4
-    # A search is answered by words in an event's text, closer to Calendar's than ignoring it.
+    # A search is answered by the words in an event's text.
     assert [event["summary"] for event in with_parameters[2].json()["items"]] == ["Northwind invoice sync"]
     assert _control(external_services, "health")["unsupported_calls"] == {
         "google:calendar:PATCH calendars/{calendarId}/events/{eventId}": 1,
