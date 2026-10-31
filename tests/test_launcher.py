@@ -756,11 +756,17 @@ def test_search_sorts_by_score_or_timestamp_and_pages_as_slack_does(
         "first": 4,
         "last": 4,
     }
+    # is:thread is a thread's parent and its replies, as Slack reads it; any other is: is a gap.
+    parent, reply = _shifted("1773900000.000000"), _shifted("1773900600.000000")
+    in_threads = _search(external_services, "is:thread in:#eng-oncall")
+    assert {parent, reply} <= set(in_threads) and _shifted("1774000000.000000") not in in_threads
+    assert _search(external_services, "latency is:starred") == []
     # An operator the fake does not read matches nothing and is counted.
     assert _search(external_services, "latency has:link") == []
     assert _search(external_services, "latency -postmortem") == []
     assert _search(external_services, "laten*") == []
     assert _control(external_services, "health")["unsupported_calls"] == {
+        "slack:search.messages:is": 1,
         "slack:search.messages:has": 1,
         "slack:search.messages:exclude": 1,
         "slack:search.messages:wildcard": 1,

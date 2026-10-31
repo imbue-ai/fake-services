@@ -341,7 +341,7 @@ export function create(seed, clock) {
     m = value.match(/^(\d{4})$/);
     return m ? [Date.UTC(+m[1], 0, 1) / 1000, Date.UTC(+m[1] + 1, 0, 1) / 1000] : null;
   }
-  // Slack's search operators the fake does not read. A term naming one, an excluded term (-word), a
+  // Slack's search operators the fake does not read (is:thread alone is read). A term naming one, an excluded term (-word), a
   // wildcard (word*) or a date the fake cannot read matches nothing and is counted as a gap.
   const UNREAD_OPERATORS = new Set(["to", "with", "has", "is"]);
   const unreadShapeOf = (raw) => {
@@ -387,7 +387,10 @@ export function create(seed, clock) {
       } else if (op?.[1] === "after") dated("after", term.slice(6), (ts, [, end]) => ts >= end);
       else if (op?.[1] === "before") dated("before", term.slice(7), (ts, [start]) => ts < start);
       else if (op?.[1] === "on" || op?.[1] === "during") dated(op[1], term.slice(op[1].length + 1), (ts, [start, end]) => ts >= start && ts < end);
-      else if (op && UNREAD_OPERATORS.has(op[1])) {
+      else if (op?.[1] === "is" && lower === "is:thread") {
+        // A thread parent and its replies carry thread_ts; a message nobody replied to carries none.
+        preds.push((m) => Boolean(m.thread_ts));
+      } else if (op && UNREAD_OPERATORS.has(op[1])) {
         keys.push(`slack:search.messages:${op[1]}`);
         preds.push(() => false);
       } else {
