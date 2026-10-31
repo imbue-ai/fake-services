@@ -160,6 +160,13 @@ def _headers(message: dict[str, Any]) -> dict[str, str]:
     return {header["name"]: header["value"] for header in message["payload"]["headers"]}
 
 
+def _userinfo(services: RunningExternalServices, token: str | None = _GOOGLE_TOKEN) -> httpx2.Response:
+    headers = {"X-Forwarded-Host": "openidconnect.googleapis.com"}
+    if token is not None:
+        headers["Authorization"] = "Bearer {}".format(token)
+    return httpx2.get("{}/v1/userinfo".format(services.google_url), headers=headers)
+
+
 def _shifted_ms(stamp: str) -> int:
     return round((datetime.fromisoformat(stamp).timestamp() + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS) * 1000)
 
@@ -1546,6 +1553,9 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
         httpx2.get("{}/".format(external_services.google_url)),
         httpx2.get("{}/o/oauth2/v2/auth".format(external_services.google_url)),
         httpx2.get("{}/oauth2/v2/userinfo".format(external_services.google_url)),
+        _userinfo(external_services),
+        _userinfo(external_services, token=None),
+        _userinfo(external_services, token="ya29.other"),
         httpx2.get(
             "{}/gmail/v1/users/me/profile".format(external_services.google_url),
             headers={"X-Forwarded-Host": "accounts.googleapis.com"},
@@ -2075,6 +2085,53 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
+def test_gmail_in_anywhere_searches_spam_and_trash_too(external_services: RunningExternalServices) -> None:
+    update = {
+        "messages": [
+            {
+                "key": key,
+                "mailbox": _MORGAN,
+                "from": "Promo <deals@promo.example>",
+                "to": _MORGAN,
+                "subject": "Invoice {} offer".format(label.lower()),
+                "date": date,
+                "body": "An offer.",
+                "labels": [label],
+            }
+            for key, label, date in (
+                ("spam-offer", "SPAM", "2026-03-17T10:00:00-07:00"),
+                ("trashed-offer", "TRASH", "2026-03-18T10:00:00-07:00"),
+            )
+        ]
+    }
+    added = _add(external_services, "google", json.dumps(update))
+    assert added.status_code == 200, added.text
+    keys = _message_keys(external_services)
+    question, reply, followup, newsletter, spam, trashed = (
+        keys[key]
+        for key in (
+            "invoice-question",
+            "invoice-reply",
+            "invoice-followup",
+            "newsletter",
+            "spam-offer",
+            "trashed-offer",
+        )
+    )
+
+    # Without it a search leaves SPAM and TRASH out; with it, it is a search of all mail, archived included.
+    assert _listed_ids(external_services, q="offer") == []
+    assert _listed_ids(external_services, q="in:anywhere") == [followup, trashed, spam, reply, question, newsletter]
+    assert _listed_ids(external_services, q="in:anywhere") == _listed_ids(external_services, includeSpamTrash="true")
+    assert _listed_ids(external_services, q="IN:Anywhere offer") == [trashed, spam]
+    assert _listed_ids(external_services, q="in:anywhere offer", includeSpamTrash="false") == [trashed, spam]
+    assert _listed_ids(external_services, "threads", q="in:anywhere offer") == [trashed, spam]
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+    # in:archive is still answered as the package answers it, and counted.
+    _gmail_get(external_services, "me/messages", q="in:archive")
+    assert _control(external_services, "health")["unsupported_calls"] == {"google:gmail:q:in:archive": 1}
+
+
 def test_gmail_reads_a_get_format_whatever_its_case(external_services: RunningExternalServices) -> None:
     keys = _message_keys(external_services)
 
@@ -2195,6 +2252,58 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
         None,
     )
     assert vacation_line["unsupported"] == "google:gmail:GET users/{userId}/settings/vacation"
+
+
+def test_userinfo_answers_each_tokens_own_account_as_openid_connect_does(
+    external_services: RunningExternalServices,
+) -> None:
+    users = _control(external_services, "state")["google"]["collections"]["google.users"]["items"]
+    account_ids = {user["email"]: user["uid"] for user in users}
+
+    morgan = _userinfo(external_services)
+    thomas = _userinfo(external_services, token=_THOMAS_GOOGLE_TOKEN)
+    anonymous = _userinfo(external_services, token=None)
+    unknown = _userinfo(external_services, token="ya29.other")
+    # Only openidconnect's v1 path is served: Google's other userinfo paths are not.
+    for path in ("oauth2/v2/userinfo", "oauth2/v3/userinfo"):
+        other = httpx2.get(
+            "{}/{}".format(external_services.google_url, path),
+            headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"},
+        )
+        assert other.status_code == 404, path
+
+    assert (morgan.status_code, morgan.json()) == (
+        200,
+        {
+            "sub": account_ids[_MORGAN],
+            "name": "Morgan Reyes",
+            "given_name": "Morgan",
+            "family_name": "Reyes",
+            "email": _MORGAN,
+            "email_verified": True,
+        },
+    )
+    assert len(account_ids[_MORGAN]) == 21 and account_ids[_MORGAN].isdigit()
+    assert (thomas.status_code, thomas.json()["sub"], thomas.json()["email"]) == (
+        200,
+        account_ids["thomas.baird@redwood.example"],
+        "thomas.baird@redwood.example",
+    )
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:path:/oauth2/v2": 1,
+        "google:path:/oauth2/v3": 1,
+    }
+
+
+def test_userinfo_names_an_account_only_when_its_seed_does(
+    unnamed_google_external_services: RunningExternalServices,
+) -> None:
+    answer = _userinfo(unnamed_google_external_services)
+
+    assert answer.status_code == 200, answer.text
+    assert set(answer.json()) == {"sub", "email", "email_verified"}
 
 
 def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:

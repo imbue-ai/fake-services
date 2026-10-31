@@ -1,12 +1,13 @@
 // The fake Google: one fake for every Google API a task reads, on @emulators/google's app and store,
-// served on each host those APIs live on and routed by path to a product module under google/.
-// A request for a path no product serves, or for a Google host the fake does not serve, is answered
+// served on each host those APIs live on and routed by host and path to a product module under
+// google/. A request for a path no product serves, or for a Google host the fake does not serve, is answered
 // with the HTML 404 page Google's frontends answer a path no API takes, and counted. The accounts (`users`) are Google's own,
 // shared by every product; each product seeds its own records for them. See launcher.mjs for the
 // interface this module exports.
 //
 // A product module exports:
-//   prefixes        the paths it serves, by prefix
+//   hosts           the Set of hosts it is served on
+//   prefixes        the paths it serves there, by prefix
 //   limits          {buckets, bucketOf(req, url, user), refuse(req, retryAfterSeconds, bucket, cost)}:
 //                   its part of the rate limit policy (see rate_limits.mjs), its bucket names its own
 //   create({app, store, gs, clock}) -> {
@@ -24,13 +25,17 @@ import { Hono, Store, WebhookDispatcher, authMiddleware } from "@emulators/core"
 import { getGoogleStore, googlePlugin, seedFromConfig } from "@emulators/google";
 import { credentialsInvalid, credentialsMissing, internalError, noSuchPath, unrouted } from "./google/errors.mjs";
 import * as gmail from "./google/gmail.mjs";
+import * as userinfo from "./google/userinfo.mjs";
 
 export const name = "google";
-export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com"]);
-const PRODUCTS = [gmail];
+// Every host a product is served on; the first is the one a request that names no host is for.
+export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com", "openidconnect.googleapis.com"]);
+const PRODUCTS = [gmail, userinfo];
 const BASE_URL = "https://oauth2.googleapis.com";
 
-const productOf = (url) => PRODUCTS.findIndex((p) => p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
+// The shim names the host a request was for.
+const hostOf = (req) => (req.headers.get("x-forwarded-host") ?? [...hosts][0]).toLowerCase();
+const productOf = (req, url) => PRODUCTS.findIndex((p) => p.hosts.has(hostOf(req)) && p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
 const tokenOf = (req) => (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
 
 // See rate_limits.mjs for what a policy holds. Each product limits its own requests; a request no
@@ -39,7 +44,7 @@ export const limits = {
   buckets: Object.assign({}, ...PRODUCTS.map((p) => p.limits.buckets)),
   bucketOf(req, url, service) {
     const user = service.tokenUsers.get(tokenOf(req));
-    const index = productOf(url);
+    const index = productOf(req, url);
     return user && index >= 0 ? PRODUCTS[index].limits.bucketOf(req, url, user) : [];
   },
   refuse: (req, retryAfterSeconds, bucket, cost) => PRODUCTS.find((p) => bucket in p.limits.buckets).limits.refuse(req, retryAfterSeconds, bucket, cost),
@@ -93,7 +98,7 @@ export function create(seed, clock) {
 
   const unsupportedOf = new WeakMap();
   async function route(req, url) {
-    const index = productOf(url);
+    const index = productOf(req, url);
     if (index < 0) {
       const [first = "", second = ""] = url.pathname.split("/").filter(Boolean);
       unsupportedOf.set(req, [`google:path:/${[first, second].filter(Boolean).join("/")}`]);
