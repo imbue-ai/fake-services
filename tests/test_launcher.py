@@ -810,6 +810,11 @@ def test_an_update_replies_into_a_seed_thread_named_by_the_seeds_ts(
         _shifted("1774050600.000000"),
     ]
     assert (replies[0]["reply_count"], replies[0]["thread_ts"]) == (3, parent)
+    # The posted reply is the thread's oldest, so the update's stays its latest.
+    stored = _control(external_services, "state")["slack"]["collections"]["slack.messages"]["items"]
+    assert [m["latest_reply"] for m in stored if m["channel_id"] == channel_id and m["ts"] == parent] == [
+        _shifted("1774050600.000000")
+    ]
     assert olivia in replies[0]["reply_users"]
     history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
     assert _shifted("1774050600.000000") not in [message["ts"] for message in history]

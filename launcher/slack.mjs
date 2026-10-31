@@ -87,6 +87,8 @@ export function create(seed, clock) {
   const tokenUsers = new Map((seed.tokens ?? []).map((entry) => [entry.token, entry.user]));
 
   const isoOfTs = (ts) => new Date(Number(ts) * 1000).toISOString();
+  // A thread's latest_reply is its newest reply, whatever order its replies are placed or posted in.
+  const newerTs = (held, ts) => (held && Number(held) > Number(ts) ? held : ts);
   const secondsOf = (iso) => Math.floor(Date.parse(iso) / 1000);
   const byTs = (a, b) => Number(a.ts) - Number(b.ts);
 
@@ -259,7 +261,7 @@ export function create(seed, clock) {
           thread_ts: p.ts,
           reply_count: p.reply_count + 1,
           reply_users: p.reply_users.includes(uid) ? p.reply_users : [...p.reply_users, uid],
-          latest_reply: ts,
+          latest_reply: newerTs(p.latest_reply, ts),
         });
       }
       n++;
@@ -441,13 +443,14 @@ export function create(seed, clock) {
     return Response.json(answer, { status: res.status });
   }
   // A reply posted in the trial makes its parent a thread's parent, which Slack serves with its own
-  // ts as thread_ts and the newest reply as latest_reply; the package counts the reply alone.
+  // ts as thread_ts; the package counts the reply alone. The store keeps its newest reply as
+  // latest_reply, which the package does not serve.
   async function markThreadParent(res) {
     const answer = await answerOf(res);
     const thread_ts = answer?.ok ? answer.message?.thread_ts : undefined;
     if (!thread_ts || thread_ts === answer.ts) return;
     const parent = ss.messages.all().find((m) => m.channel_id === answer.channel && m.ts === thread_ts);
-    if (parent) ss.messages.update(parent.id, { thread_ts: parent.ts, latest_reply: answer.ts });
+    if (parent) ss.messages.update(parent.id, { thread_ts: parent.ts, latest_reply: newerTs(parent.latest_reply, answer.ts) });
   }
   // Slack serves a thread's parent first, then its replies oldest first. The package orders all of
   // them by ts, and a reply posted in a trial whose seed is shifted past the box's clock is stamped
