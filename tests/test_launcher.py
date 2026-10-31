@@ -2089,6 +2089,12 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
     assert _listed_ids(external_services, q="from:me") == [reply]
     assert _listed_ids(external_services, q="label:Vendors is:unread") == [followup]
     assert _listed_ids(external_services, q='"corrected invoice"') == [followup]
+    # An operator's quoted value is a phrase, matched whatever its case.
+    for query in ('subject:"March invoice"', 'subject:"MARCH INVOICE"', '(subject:"march invoice")'):
+        assert _listed_ids(external_services, q=query) == [followup, reply, question], query
+    assert _listed_ids(external_services, q='subject:"invoice March"') == []
+    assert _listed_ids(external_services, q='from:"Priya Shah" label:"Vendors"') == [followup, question]
+    assert _listed_ids(external_services, q='subject:"March invoice" -label:"Vendors"') == [reply]
     # A date is midnight Pacific time, as Gmail reads it, and newer_than counts from the trial's present.
     day = _shifted_date("2026-03-16")
     next_day = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
@@ -2117,6 +2123,33 @@ def test_gmail_lists_and_searches_with_the_operators_it_supports(external_servic
         "resultSizeEstimate": 0
     }
     assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_gmail_reads_a_get_format_whatever_its_case(external_services: RunningExternalServices) -> None:
+    keys = _message_keys(external_services)
+
+    message, thread = "me/messages/{}".format(keys["invoice-reply"]), "me/threads/{}".format(keys["invoice-question"])
+    gets = [(message, name) for name in ("raw", "minimal", "metadata", "full")]
+    gets += [(thread, name) for name in ("minimal", "metadata", "full")]
+    for path, format_name in gets:
+        upper = _gmail(external_services, path, format=format_name.upper())
+        assert upper == _gmail(external_services, path, format=format_name), (path, format_name)
+    raw = _gmail(external_services, message, format="RAW")
+    assert "raw" in raw and "payload" not in raw
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_a_gmail_get_costs_what_its_format_costs_whatever_its_case(
+    external_services: RunningExternalServices,
+) -> None:
+    message_id = _message_keys(external_services)["invoice-question"]
+    # A RAW get costs 60 of a user's 6,000 units a minute, as raw does: 100 fit, and the 101st does not.
+    burst = [
+        _gmail_get(external_services, "me/messages/{}".format(message_id), format="RAW").status_code
+        for _ in range(101)
+    ]
+
+    assert burst == [200] * 100 + [403]
 
 
 def test_a_gmail_search_operator_the_fake_answers_wrongly_is_counted(
@@ -2207,6 +2240,51 @@ def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found
         None,
     )
     assert vacation_line["unsupported"] == "google:gmail:GET users/{userId}/settings/vacation"
+
+
+def test_google_serves_the_callers_profile_on_its_userinfo_endpoints(
+    external_services: RunningExternalServices,
+) -> None:
+    def userinfo(host: str, path: str, token: str | None = _GOOGLE_TOKEN) -> httpx2.Response:
+        headers = {"X-Forwarded-Host": host}
+        if token is not None:
+            headers["Authorization"] = "Bearer {}".format(token)
+        return httpx2.get("{}{}".format(external_services.google_url, path), headers=headers)
+
+    oidc = userinfo("openidconnect.googleapis.com", "/v1/userinfo")
+    v3 = userinfo("www.googleapis.com", "/oauth2/v3/userinfo")
+    legacy = userinfo("www.googleapis.com", "/oauth2/v2/userinfo")
+    thomas = userinfo("openidconnect.googleapis.com", "/v1/userinfo", token=_THOMAS_GOOGLE_TOKEN)
+    anonymous = userinfo("openidconnect.googleapis.com", "/v1/userinfo", token=None)
+    unknown = userinfo("www.googleapis.com", "/oauth2/v3/userinfo", token="ya29.other")
+
+    # The account id is derived from the address: the same in every trial.
+    morgan = {
+        "sub": "115236848979260896454",
+        "name": "Morgan Reyes",
+        "given_name": "Morgan",
+        "family_name": "Reyes",
+        "email": _MORGAN,
+        "email_verified": True,
+    }
+    assert (oidc.status_code, oidc.json()) == (200, morgan)
+    assert (v3.status_code, v3.json()) == (200, morgan)
+    assert (legacy.status_code, legacy.json()) == (
+        200,
+        {
+            "id": morgan["sub"],
+            "email": _MORGAN,
+            "verified_email": True,
+            "name": "Morgan Reyes",
+            "given_name": "Morgan",
+            "family_name": "Reyes",
+        },
+    )
+    assert thomas.json()["email"] == "thomas.baird@redwood.example"
+    assert thomas.json()["sub"] != morgan["sub"]
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
+    assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
 def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:

@@ -23,7 +23,10 @@ const BASE_URL = "https://oauth2.googleapis.com";
 // A refusal is Gmail's userRateLimitExceeded (developers.google.com/workspace/gmail/api/guides/
 // handle-errors, read 2026-10-29): a 403 in the usageLimits domain. Gmail documents no rate limit
 // headers, so an answer carries none.
+// Gmail reads `format` whatever its case (measured 2026-10-31: RAW answers as raw does), so it is
+// costed, and given to the package, in lower case.
 const PER_USER_PER_MINUTE = 6000;
+const formatOf = (url) => (url.searchParams.get("format") ?? "full").toLowerCase();
 const FULL_FORMATS = new Set(["full", "raw", "html"]);
 // "<method> <path after users/{userId}/>" -> [cost, cost of a full get]
 const COSTS = new Map(
@@ -116,7 +119,7 @@ export const limits = {
     const costs = userId === null ? undefined : COSTS.get(`${req.method} ${template}`);
     if (!costs) return [];
     const [cost, fullCost] = costs;
-    const format = url.searchParams.get("format") ?? "full";
+    const format = formatOf(url);
     return [{ bucket: BUCKET, scope: user, cost: fullCost !== undefined && FULL_FORMATS.has(format) ? fullCost : cost }];
   },
   refuse: () => googleError(403, "User Rate Limit Exceeded", "userRateLimitExceeded", "PERMISSION_DENIED", { domain: "usageLimits" }),
@@ -212,6 +215,10 @@ function withMimeHeaders(resource, m, named) {
 
 // Search. The package's own parser takes from:, to:, subject:, label:, -label:, in:, is:, after: and
 // before: in epoch seconds, has:attachment and words and phrases. Each term is checked here first:
+//   - an operator's quoted value (subject:"March invoice") is one term, as Gmail reads it. The
+//     package would split it at its spaces, but reads a quoted term that holds the operator too, so
+//     it is given as "subject:March invoice" and matches the phrase whatever its case. The term's
+//     parentheses are dropped, as the package drops them anyway.
 //   - from:me and to:me name the mailbox's own address, which the package reads as the word "me"
 //   - a date in after:, before: and their synonyms newer: and older: is midnight Pacific time, as
 //     Gmail reads it, given to the package in seconds, which it otherwise reads in the box's zone;
@@ -241,7 +248,7 @@ function secondsOfDate(value) {
 }
 function rewriteQuery(q, email, nowMs) {
   const keys = [];
-  const terms = (q.match(/"[^"]+"|\S+/g) ?? []).map((term) => {
+  const terms = (q.match(/[^\s"]*"[^"]+"[^\s"]*|\S+/g) ?? []).map((term) => {
     if (term.startsWith('"')) return term;
     if (term === "OR" || term === "AROUND") return keys.push(term), term;
     if (term !== "AND" && /^(or|and)$/i.test(term)) return keys.push(`${term.toLowerCase()}-word`), term;
@@ -252,12 +259,15 @@ function rewriteQuery(q, email, nowMs) {
     const op = core.match(/^([A-Za-z_]+):(.*)$/);
     if (negated && op?.[1].toLowerCase() !== "label") return keys.push("-"), term;
     if (!op) return term;
-    const [, written, value] = op;
+    const [, written, operand] = op;
     const name = written.toLowerCase();
     if (!OPERATORS.has(name)) return term;
+    if (operand.startsWith("(")) return keys.push(`${name}:()`), term;
+    const quoted = operand.match(/^"(.*)"$/);
+    const value = quoted ? quoted[1] : operand;
     const lower = value.toLowerCase();
-    const rebuilt = (operator, operand) => `${negated ? "-" : ""}${open}${operator}:${operand}${close}`;
-    if (value.startsWith("(")) return keys.push(`${name}:()`), term;
+    const rebuilt = (operator, given) =>
+      quoted ? `"${negated ? "-" : ""}${operator}:${given}"` : `${negated ? "-" : ""}${open}${operator}:${given}${close}`;
     if (UNSUPPORTED_OPERATORS.has(name)) return keys.push(name), term;
     if ((name === "from" || name === "to") && lower === "me") return rebuilt(written, email);
     if (name === "in" && (lower === "anywhere" || lower === "archive")) return keys.push(`in:${lower}`), term;
@@ -271,7 +281,7 @@ function rewriteQuery(q, email, nowMs) {
       if (!days) return keys.push(name), term;
       return rebuilt(name === "newer_than" ? "after" : "before", Math.floor(nowMs / 1000) - Number(days[1]) * 86400);
     }
-    return term;
+    return quoted ? rebuilt(written, value) : term;
   });
   // A gap is counted once per request, however many of the query's terms meet it.
   return { q: terms.join(" "), keys: [...new Set(keys)].map((k) => `google:gmail:q:${k}`) };
@@ -445,6 +455,7 @@ export function create({ app, store, gs, clock }) {
         target.searchParams.set("q", rewritten.q);
       }
     }
+    if (target.searchParams.has("format")) target.searchParams.set("format", formatOf(url));
     const named = target.searchParams.getAll("metadataHeaders");
     if (named.length) {
       target.searchParams.delete("metadataHeaders");
@@ -466,7 +477,7 @@ export function create({ app, store, gs, clock }) {
     }
     // A message the fake placed is shown with the headers of the raw form it was given; one the
     // package made keeps the package's.
-    const format = url.searchParams.get("format") ?? "full";
+    const format = formatOf(url);
     if (path.rest.length === 2 && (path.rest[0] === "messages" || path.rest[0] === "threads") && (format === "full" || format === "metadata")) {
       const placed = new Map(owned(email).filter((m) => m.seed_key).map((m) => [m.gmail_id, m]));
       const asked = format === "metadata" ? url.searchParams.getAll("metadataHeaders") : [];
