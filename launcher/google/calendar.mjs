@@ -72,7 +72,6 @@ function offsetMinutesOf(stamp) {
   return m[1].toUpperCase() === "Z" ? 0 : (m[2] === "-" ? -1 : 1) * (Number(m[3]) * 60 + Number(m[4]));
 }
 const zoneOfOffset = (minutes) => (minutes === 0 || minutes % 60 !== 0 ? "UTC" : `Etc/GMT${minutes < 0 ? "+" : "-"}${Math.abs(minutes) / 60}`);
-// The offset a zone keeps at an instant.
 function zoneOffsetMinutes(zone, ms) {
   const name = new Intl.DateTimeFormat("en-US", { timeZone: zone, timeZoneName: "longOffset" }).formatToParts(new Date(ms)).find((p) => p.type === "timeZoneName").value;
   const m = name.match(/GMT([+-])(\d{2}):(\d{2})/);

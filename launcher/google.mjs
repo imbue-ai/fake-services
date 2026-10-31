@@ -3,9 +3,7 @@
 // A request for a path no product serves, or for a Google host the fake does not serve, is answered
 // with the HTML 404 page Google's frontends answer a path no API takes, and counted. The accounts
 // (`users`) are Google's own, shared by every product; each product seeds its own records for them.
-// The products are Gmail v1 (google/gmail.mjs: `labels`, `messages`) and Calendar v3
-// (google/calendar.mjs: `events`, on each account's one primary calendar). See launcher.mjs for the
-// interface this module exports.
+// See launcher.mjs for the interface this module exports.
 //
 // A product module exports:
 //   prefixes        the paths it serves, by prefix
