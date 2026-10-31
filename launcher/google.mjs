@@ -28,10 +28,11 @@ import { getGoogleStore, googlePlugin, seedFromConfig } from "@emulators/google"
 import { credentialsInvalid, credentialsMissing, internalError, noSuchPath, unrouted } from "./google/errors.mjs";
 import * as calendar from "./google/calendar.mjs";
 import * as gmail from "./google/gmail.mjs";
+import * as userinfo from "./google/userinfo.mjs";
 
 export const name = "google";
-export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com"]);
-const PRODUCTS = [gmail, calendar];
+export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com", "openidconnect.googleapis.com"]);
+const PRODUCTS = [gmail, calendar, userinfo];
 const BASE_URL = "https://oauth2.googleapis.com";
 
 const productOf = (url) => PRODUCTS.findIndex((p) => p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
