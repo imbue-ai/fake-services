@@ -2520,7 +2520,14 @@ def test_a_gmail_update_lands_in_its_thread_as_newer_history(external_services: 
 
     assert (added.status_code, added.json()["added"]) == (
         200,
-        {"google_users": 1, "gmail_labels": 1, "gmail_messages": 1, "gmail_label_changes": 1, "calendar_calendars": 1, "calendar_events": 1},
+        {
+            "google_users": 1,
+            "gmail_labels": 1,
+            "gmail_messages": 1,
+            "gmail_label_changes": 1,
+            "calendar_calendars": 1,
+            "calendar_events": 1,
+        },
     )
     assert (after["messagesTotal"], after["threadsTotal"]) == (5, 2)
     assert int(after["historyId"]) > int(before["historyId"])
