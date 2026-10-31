@@ -690,9 +690,9 @@ def test_a_dm_is_listed_by_its_type_and_read_like_a_channel_by_its_members(
     assert [message["ts"] for message in replies] == [parent, _shifted("1774000300.000000")]
     # Search reaches a dm through in:@user and names it as Slack does.
     found = _slack(external_services, "search.messages", query="latency in:@claire")["messages"]["matches"]
-    assert [(match["ts"], match["channel"]["id"], match["channel"]["is_im"]) for match in found] == [
-        (parent, im["id"], True)
-    ]
+    assert [
+        (match["ts"], match["channel"]["id"], match["channel"]["is_im"], match["channel"]["name"]) for match in found
+    ] == [(parent, im["id"], True, user_ids["claire"])]
     assert _search(external_services, "thursday") == [_shifted("1773980000.000000")]
 
 

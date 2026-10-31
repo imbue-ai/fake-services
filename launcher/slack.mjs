@@ -415,7 +415,8 @@ export function create(seed, clock) {
         pagination: { total_count: hits.length, page, per_page: count, page_count: pages, first: Math.min((page - 1) * count + 1, hits.length), last: Math.min(page * count, hits.length) },
         matches: slice.map((m) => {
           const ch = visible.get(m.channel_id);
-          const channel = { id: ch.channel_id, is_channel: Boolean(ch.is_channel), is_group: Boolean(ch.is_private && !isDm(ch)), is_im: Boolean(ch.is_im), is_mpim: Boolean(ch.is_mpim), is_private: Boolean(ch.is_private), is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false, pending_shared: [], name: ch.name };
+          // An im is named by its other party, as the searching user sees it.
+          const channel = { id: ch.channel_id, is_channel: Boolean(ch.is_channel), is_group: Boolean(ch.is_private && !isDm(ch)), is_im: Boolean(ch.is_im), is_mpim: Boolean(ch.is_mpim), is_private: Boolean(ch.is_private), is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false, pending_shared: [], name: ch.is_im ? ch.members.find((id) => id !== auth.user_id) ?? ch.name : ch.name };
           return { type: "message", channel, user: m.user, username: ss.users.findOneBy("user_id", m.user)?.name ?? "", ts: m.ts, text: m.text, team, permalink: permalinkOf(ch.channel_id, m) };
         }),
       },
