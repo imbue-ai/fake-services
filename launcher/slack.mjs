@@ -441,6 +441,7 @@ export function create(seed, clock) {
     const auth = await (await asPost(req, "auth.test", {})).json();
     if (!auth.ok) return Response.json(auth);
     const member = p.user ?? auth.user_id;
+    if (!ss.users.findOneBy("user_id", member)) return Response.json({ ok: false, error: "user_not_found" });
     const listed = [];
     let cursor = "";
     do {

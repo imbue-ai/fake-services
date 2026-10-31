@@ -755,6 +755,10 @@ def test_users_conversations_lists_the_conversations_the_tokens_user_is_in(
         "ok": False,
         "error": "invalid_cursor",
     }
+    assert _slack(external_services, "users.conversations", user="UNOSUCH") == {
+        "ok": False,
+        "error": "user_not_found",
+    }
     assert [
         channel["name"] for channel in _slack(external_services, "users.conversations", limit="-1")["channels"]
     ] == ["eng-oncall"]
