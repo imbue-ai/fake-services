@@ -151,8 +151,7 @@ export function create(seed, clock) {
   // A direct message is Slack's im between two members or its mpim among three or more, read by its
   // members alone, and one at most for a set of members, as Slack keeps it. It is listed only to a
   // token's user, so one with no such member could never be read and is refused. One the trial
-  // opened already (conversations.open) takes the dm's key and keeps its id. Each dm placed afresh
-  // goes into newConversationsOut and statedMembersOut, by channel id, for settle().
+  // opened already (conversations.open) takes the dm's key and keeps its id.
   function placeDms(dms, newConversationsOut, statedMembersOut) {
     const tokenIds = [...tokenUsers.values()].map(user).filter(Boolean);
     const team = ss.teams.all()[0];
@@ -343,8 +342,7 @@ export function create(seed, clock) {
     return m ? [Date.UTC(+m[1], 0, 1) / 1000, Date.UTC(+m[1] + 1, 0, 1) / 1000] : null;
   }
   // Slack's search operators the fake does not read. A term naming one, an excluded term (-word), a
-  // wildcard (word*) or a date the fake cannot read matches nothing and is counted under
-  // slack:search.messages:<operator>, exclude or wildcard.
+  // wildcard (word*) or a date the fake cannot read matches nothing and is counted as a gap.
   const UNREAD_OPERATORS = new Set(["to", "with", "has", "is"]);
   const unreadShapeOf = (raw) => {
     if (raw.startsWith('"') || raw.length < 2) return null;
@@ -353,12 +351,7 @@ export function create(seed, clock) {
   };
   const unsupportedOf = new WeakMap();
   // search.messages over the live store, so a message posted in the trial is found as a seeded one
-  // is. Words and phrases match the text without regard to case; in:#channel, in:<channel id> and
-  // in:@user (the token's user's im with them); from:user or from:<@id>; after:, before:, on: and
-  // during: over the dates spanOf() reads, after: and before: excluding the day they name. Sorted by
-  // score (the default: how many times the text holds the query's words and phrases, ties newest
-  // first) or by timestamp, in sort_dir (desc by default); count (20, at most 100) per page, page (at
-  // most 100).
+  // is. in:@user is the token's user's im with that user; after: and before: exclude the day they name.
   async function search(req, p) {
     const auth = await (await asPost(req, "auth.test", {})).json();
     if (!auth.ok) return Response.json(auth);

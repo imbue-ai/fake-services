@@ -395,11 +395,10 @@ export function create({ app, store, gs, clock }) {
       Object.assign(event, { created_at: rec.created_at, updated_at: rec.created_at });
     }
 
-    // A label change moves a message's labels as messages.modify does, after the file's own records
-    // (so it may name a message or a label the same file adds): a system label a seed may carry or one
-    // of the mailbox's user labels, removing INBOX archiving it and removing UNREAD reading it. Each
-    // change that moves a label is a history record newer than the file's messages, labelAdded and
-    // labelRemoved as Gmail records them; one that moves none records nothing, as with Gmail.
+    // A label change moves a message's labels as messages.modify does. It applies after the file's own
+    // records, so it may name a message or a label the same file adds. A change that moves a label is
+    // recorded as labelAdded/labelRemoved history newer than the file's messages; one that moves none
+    // records nothing, as with Gmail.
     let changed = 0;
     for (const change of cfg.label_changes ?? []) {
       const what = `label change of message ${change.message}`;
