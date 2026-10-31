@@ -727,7 +727,7 @@ def test_users_conversations_lists_the_conversations_the_tokens_user_is_in(
         external_services, "users.conversations", user=user_ids["pagerbot"], types="public_channel,mpim"
     )
 
-    # Morgan posted in #eng-oncall and is no member of #announcements, which conversations.list lists too.
+    # Morgan posted in eng-oncall and is no member of announcements, which conversations.list lists too.
     assert {channel["name"] for channel in _slack(external_services, "conversations.list")["channels"]} == {
         "announcements",
         "eng-oncall",
