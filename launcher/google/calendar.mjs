@@ -397,9 +397,11 @@ export function create({ gs, clock }) {
   }
 
   // What an insert's resource may state and this fake keeps; any other field is counted, under
-  // google:calendar:body:<field>, and not kept. A status is kept when it is one a new event can have
-  // here; any other is counted the same way and the event is confirmed.
+  // google:calendar:body:<field> (google:calendar:body:attendees.<field> for a guest's), and not
+  // kept. A status is kept when it is one a new event can have here; any other is counted the same
+  // way and the event is confirmed, as a guest's unknown responseStatus is counted and left needsAction.
   const INSERTED_FIELDS = new Set(["kind", "id", "status", "summary", "description", "location", "start", "end", "attendees"]);
+  const INSERTED_ATTENDEE_FIELDS = new Set(["email", "displayName", "responseStatus"]);
   const INSERTED_STATUSES = new Set(["confirmed", "tentative"]);
   async function insert(req, calendar, keys) {
     let body;
@@ -421,6 +423,10 @@ export function create({ gs, clock }) {
     for (const field of ["summary", "description", "location"]) if (body[field] != null && typeof body[field] !== "string") return invalidField(`Invalid value for: ${field}`);
     const attendees = body.attendees ?? [];
     if (!Array.isArray(attendees) || attendees.some((a) => typeof a?.email !== "string" || !a.email.includes("@"))) return invalidField("Invalid attendee email.");
+    if (attendees.some((a) => a.displayName != null && typeof a.displayName !== "string")) return invalidField("Invalid value for: displayName");
+    const unkeptAttendeeFields = new Set(attendees.flatMap((a) => Object.keys(a).filter((field) => !INSERTED_ATTENDEE_FIELDS.has(field))));
+    if (attendees.some((a) => a.responseStatus !== undefined && !RESPONSE_STATUSES.has(a.responseStatus))) unkeptAttendeeFields.add("responseStatus");
+    for (const field of unkeptAttendeeFields) keys.push(`google:calendar:body:attendees.${field}`);
     let id = body.id;
     if (id !== undefined) {
       if (typeof id !== "string" || !EVENT_ID.test(id)) return invalidField("Invalid resource id value.");

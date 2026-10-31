@@ -2563,7 +2563,7 @@ def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
             "summary": "Invoice follow-up",
             "start": {"dateTime": "{}T09:00:00".format(day), "timeZone": "America/Los_Angeles"},
             "end": {"dateTime": "{}T16:30:00Z".format(day)},
-            "attendees": [{"email": "priya@northwind.example"}],
+            "attendees": [{"email": "priya@northwind.example", "optional": True, "responseStatus": "maybe"}],
             "recurrence": ["RRULE:FREQ=WEEKLY"],
         },
     )
@@ -2589,7 +2589,10 @@ def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
         {"dateTime": "{}T09:00:00-07:00".format(day), "timeZone": "America/Los_Angeles"},
         {"dateTime": "{}T09:30:00-07:00".format(day), "timeZone": "Etc/GMT+7"},
     )
-    assert [a["email"] for a in event["attendees"]] == [_MORGAN, "priya@northwind.example"]
+    assert [(a["email"], a["responseStatus"]) for a in event["attendees"]] == [
+        (_MORGAN, "accepted"),
+        ("priya@northwind.example", "needsAction"),
+    ]
     assert listed == ["Northwind invoice sync", "Q1 finance review", "Invoice follow-up", "Team offsite"]
     assert (deleted.status_code, deleted.text) == (204, "")
     assert "Northwind invoice sync" not in after_delete
@@ -2601,9 +2604,12 @@ def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
     )
     assert (no_end.status_code, no_end.json()) == (400, _calendar_error(400, "Missing end time.", "required"))
     assert (tentative.json()["status"], born_cancelled.json()["status"]) == ("tentative", "confirmed")
-    # The insert's recurrence is not kept, nor is a status a new event cannot have, and both are counted.
+    # The insert's recurrence, a guest's optional flag and unknown response, and a status a new event
+    # cannot have are not kept, and each is counted.
     assert _control(external_services, "health")["unsupported_calls"] == {
         "google:calendar:body:recurrence": 1,
+        "google:calendar:body:attendees.optional": 1,
+        "google:calendar:body:attendees.responseStatus": 1,
         "google:calendar:body:status": 1,
     }
 
