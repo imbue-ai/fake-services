@@ -38,5 +38,12 @@
         }
       ]
     }
+  ],
+  "label_changes": [
+    {
+      "message": "invoice-followup",
+      "add": ["Finance"],
+      "remove": ["UNREAD", "INBOX"]
+    }
   ]
 }

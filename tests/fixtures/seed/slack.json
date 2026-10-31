@@ -42,6 +42,24 @@
       "name": "eng-oncall"
     }
   ],
+  "dms": [
+    {
+      "key": "dm-claire",
+      "members": [
+        "morgan.reyes",
+        "claire"
+      ]
+    },
+    {
+      "key": "leads-group",
+      "members": [
+        "claire",
+        "morgan.reyes",
+        "pagerbot"
+      ],
+      "created": "2026-03-01T09:00:00.000Z"
+    }
+  ],
   "messages": [
     {
       "channel": "announcements",
@@ -70,6 +88,27 @@
       "ts": "1774000000.000000",
       "thread_ts": null,
       "text": "Is the latency fix tracked anywhere?"
+    },
+    {
+      "channel": "dm-claire",
+      "user": "claire",
+      "ts": "1773950000.000000",
+      "thread_ts": null,
+      "text": "Can you take the latency follow-up with the customer?"
+    },
+    {
+      "channel": "dm-claire",
+      "user": "morgan.reyes",
+      "ts": "1774000300.000000",
+      "thread_ts": "1773950000.000000",
+      "text": "Yes, drafting the note now."
+    },
+    {
+      "channel": "leads-group",
+      "user": "claire",
+      "ts": "1773980000.000000",
+      "thread_ts": null,
+      "text": "Release review moves to Thursday."
     }
   ]
 }

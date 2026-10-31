@@ -729,9 +729,9 @@ def test_an_update_lands_on_its_own_service_with_the_seeds_shift(external_servic
         external_services, "linear", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "linear")
     )
 
-    assert (slack_added.status_code, slack_added.json()["added"]) == (200, {"slack_messages": 1})
+    assert (slack_added.status_code, slack_added.json()["added"]) == (200, {"slack_messages": 2})
     # Each service's update is its own request: Slack's left Linear holding what it was seeded with.
-    assert (after_slack["slack"]["messages"], after_slack["linear"]["issues"]) == (5, 2)
+    assert (after_slack["slack"]["messages"], after_slack["linear"]["issues"]) == (9, 2)
     assert (linear_added.status_code, linear_added.json()["added"]) == (
         200,
         {"linear_issues": 1, "linear_comments": 0},
@@ -1524,7 +1524,7 @@ def test_the_state_dump_redacts_every_token(external_services: RunningExternalSe
 
     assert _SLACK_TOKEN not in dump_text and _LINEAR_TOKEN not in dump_text
     assert "[redacted]" in dump_text
-    assert dump["counts"]["slack"] == {"users": 3, "channels": 2, "messages": 4}
+    assert dump["counts"]["slack"] == {"users": 3, "channels": 2, "dms": 2, "messages": 7}
     assert dump["counts"]["linear"]["issues"] == len(
         external_services_document(EXTERNAL_SERVICES_SEED_FIXTURE, "linear")["issues"]
     )
@@ -2243,6 +2243,10 @@ def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExt
     assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
 
 
+def _vendors_id(services: RunningExternalServices) -> str:
+    return next(label["id"] for label in _gmail(services, "me/labels")["labels"] if label["name"] == "Vendors")
+
+
 def test_a_gmail_update_lands_in_its_thread_as_newer_history(external_services: RunningExternalServices) -> None:
     before = _gmail(external_services, "me/profile")
 
@@ -2255,15 +2259,31 @@ def test_a_gmail_update_lands_in_its_thread_as_newer_history(external_services: 
 
     assert (added.status_code, added.json()["added"]) == (
         200,
-        {"google_users": 1, "gmail_labels": 1, "gmail_messages": 1, "calendar_calendars": 1, "calendar_events": 1},
+        {"google_users": 1, "gmail_labels": 1, "gmail_messages": 1, "gmail_label_changes": 1, "calendar_calendars": 1, "calendar_events": 1},
     )
     assert (after["messagesTotal"], after["threadsTotal"]) == (5, 2)
     assert int(after["historyId"]) > int(before["historyId"])
-    assert [entry["messagesAdded"][0]["message"]["id"] for entry in history["history"]] == [keys["corrected-invoice"]]
+    # The new message, then the label change of the seeded one, which the update lists after it.
+    finance = next(
+        label["id"] for label in _gmail(external_services, "me/labels")["labels"] if label["name"] == "Finance"
+    )
+    added_entry, changed_entry = history["history"]
+    assert [entry["message"]["id"] for entry in added_entry["messagesAdded"]] == [keys["corrected-invoice"]]
+    assert int(changed_entry["id"]) > int(added_entry["id"]) == int(after["historyId"]) - 1
+    assert [(entry["message"]["id"], entry["labelIds"]) for entry in changed_entry["labelsAdded"]] == [
+        (keys["invoice-followup"], [finance])
+    ]
+    assert [(entry["message"]["id"], sorted(entry["labelIds"])) for entry in changed_entry["labelsRemoved"]] == [
+        (keys["invoice-followup"], ["INBOX", "UNREAD"])
+    ]
+    followup = _gmail(external_services, "me/messages/{}".format(keys["invoice-followup"]), format="minimal")
+    assert sorted(followup["labelIds"]) == sorted(["STARRED", finance, _vendors_id(external_services)])
+    assert followup["historyId"] == changed_entry["id"] == after["historyId"]
     thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]), format="minimal")
     assert thread["messages"][-1]["id"] == keys["corrected-invoice"]
     assert thread["messages"][-1]["internalDate"] == str(_shifted_ms("2026-03-20T15:30:00-07:00"))
-    assert _listed_ids(external_services, q="label:Finance") == [keys["corrected-invoice"]]
+    assert _listed_ids(external_services, q="label:Finance") == [keys["corrected-invoice"], keys["invoice-followup"]]
+    assert keys["invoice-followup"] not in _listed_ids(external_services, q="is:unread")
     users = _control(external_services, "state")["google"]["collections"]["google.users"]["items"]
     assert "olivia.chen@redwood.example" in {user["email"] for user in users}
 

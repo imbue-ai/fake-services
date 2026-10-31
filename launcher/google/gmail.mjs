@@ -1,7 +1,8 @@
 // Gmail v1 for the fake Google: @emulators/google's Gmail routes and store, with what a trial needs on
 // top. Messages are inserted straight into the store, with ids, threads, Message-IDs and historyIds
 // derived from the seed, so they read the same in every trial; a message keeps the UTC offset its seed
-// states in its Date header, and its labels are derived from who sent it;
+// states in its Date header, and its labels are derived from who sent it, and a later file may move
+// them;
 // users.getProfile; a search operator the package answers wrongly is counted; a list leaves out an
 // empty list and refuses a malformed page token, a listed label carries no counts, and a message's
 // headers in every format are those of its MIME form, as Gmail does. See google.mjs for the product
@@ -394,6 +395,46 @@ export function create({ app, store, gs, clock }) {
       Object.assign(event, { created_at: rec.created_at, updated_at: rec.created_at });
     }
 
+    // A label change moves a message's labels as messages.modify does, after the file's own records
+    // (so it may name a message or a label the same file adds): a system label a seed may carry or one
+    // of the mailbox's user labels, removing INBOX archiving it and removing UNREAD reading it. Each
+    // change that moves a label is a history record newer than the file's messages, labelAdded and
+    // labelRemoved as Gmail records them; one that moves none records nothing, as with Gmail.
+    let changed = 0;
+    for (const change of cfg.label_changes ?? []) {
+      const what = `label change of message ${change.message}`;
+      const rec = byKey.has(change.message) ? gs.messages.get(byKey.get(change.message)) : null;
+      if (!rec) throw new Error(`gmail ${what}: no message has that key`);
+      const idsOf = (field) => {
+        const names = change[field] ?? [];
+        if (!Array.isArray(names)) throw new Error(`gmail ${what}: ${field} is not a list of label names`);
+        return names.map((name) => {
+          const id = labelIdFor(rec.user_email, name);
+          if (!id) throw new Error(`gmail ${what} names label ${name}, which is neither a system label nor one of ${rec.user_email}'s`);
+          return id;
+        });
+      };
+      const adding = idsOf("add");
+      const removing = idsOf("remove");
+      if (!adding.length && !removing.length) throw new Error(`gmail ${what} adds and removes no label`);
+      if (adding.some((id) => removing.includes(id))) throw new Error(`gmail ${what} both adds and removes one label`);
+      const labelIds = [...new Set([...rec.label_ids.filter((id) => !removing.includes(id)), ...adding])];
+      const gained = labelIds.filter((id) => !rec.label_ids.includes(id));
+      const lost = rec.label_ids.filter((id) => !labelIds.includes(id));
+      if (!gained.length && !lost.length) continue;
+      next += 1n;
+      const historyId = String(next);
+      gs.messages.update(rec.id, { label_ids: labelIds, history_id: historyId });
+      // Dated at the newest message the fake holds, as the box's clock dates no record.
+      const newest = new Date(Math.max(...gs.messages.all().map((m) => Number(m.internal_date)))).toISOString();
+      for (const [changeType, ids] of [["labelAdded", gained], ["labelRemoved", lost]]) {
+        if (!ids.length) continue;
+        const event = gs.history.insert({ gmail_id: historyId, user_email: rec.user_email, change_type: changeType, message_gmail_id: rec.gmail_id, thread_id: rec.thread_id, label_ids: ids });
+        Object.assign(event, { created_at: newest, updated_at: newest });
+      }
+      changed++;
+    }
+
     // A label new to the fake (a mailbox's system labels, or one the file lists) is dated at its
     // mailbox's earliest message, else the earliest the fake holds, else the anchor: the package dates
     // it with the wall clock.
@@ -403,7 +444,7 @@ export function create({ app, store, gs, clock }) {
       const iso = at === null ? clock.anchor : new Date(at).toISOString();
       Object.assign(label, { created_at: iso, updated_at: iso, dated: true });
     }
-    return { gmail_labels: labels.length, gmail_messages: inserted.length };
+    return { gmail_labels: labels.length, gmail_messages: inserted.length, gmail_label_changes: changed };
   }
 
   const unsupportedOf = new WeakMap();
