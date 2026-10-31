@@ -315,11 +315,13 @@ export function create(seed, clock) {
     const more = start + limit < kept.length;
     return Response.json({ ok: true, messages: kept.slice(start, start + limit), has_more: more, pin_count: 0, response_metadata: { next_cursor: more ? kept[start + limit].ts : "" } });
   }
-  // A message's permalink as Slack serves it: on the workspace's own domain, and a reply's naming its
-  // thread's parent and channel.
-  const permalinkOf = (channelId, m) => {
+  // A message's permalink as Slack serves it (measured 2026-10-31): on the workspace's own domain, and
+  // for any message in a thread, its parent included, naming the thread by `thread_ts`; chat.getPermalink
+  // adds the channel as `cid`, a search match does not.
+  const permalinkOf = (channelId, m, withChannel) => {
     const link = `https://${domain}.slack.com/archives/${channelId}/p${m.ts.replace(".", "")}`;
-    return m.thread_ts && m.thread_ts !== m.ts ? `${link}?${new URLSearchParams({ thread_ts: m.thread_ts, cid: channelId })}` : link;
+    if (!m.thread_ts) return link;
+    return `${link}?${new URLSearchParams(withChannel ? { thread_ts: m.thread_ts, cid: channelId } : { thread_ts: m.thread_ts })}`;
   };
   // A date of search's, as [start, end) in epoch seconds: a day (YYYY-MM-DD, today, yesterday), a
   // month (YYYY-MM) or a year (YYYY), read in UTC, which is the zone of every seeded user. today is
@@ -437,11 +439,12 @@ export function create(seed, clock) {
     headers.delete("content-length");
     return new Response(JSON.stringify(answer), { status: res.status, headers });
   }
-  // The package links a permalink to slack.com itself; Slack links it to the workspace's domain.
-  async function withPermalink(res) {
+  // The package links a permalink to slack.com itself and names no thread for a parent.
+  async function withPermalink(res, p) {
     const answer = await answerOf(res);
     if (!answer?.ok) return res;
-    answer.permalink = answer.permalink.replace(/^https:\/\/[^/]+/, `https://${domain}.slack.com`);
+    const m = ss.messages.all().find((x) => x.channel_id === answer.channel && x.ts === p.message_ts);
+    answer.permalink = m ? permalinkOf(answer.channel, m, true) : answer.permalink.replace(/^https:\/\/[^/]+/, `https://${domain}.slack.com`);
     return Response.json(answer, { status: res.status });
   }
   // A reply posted in the trial makes its parent a thread's parent, which Slack serves with its own
@@ -470,7 +473,7 @@ export function create(seed, clock) {
     if (method === "conversations.history" && (p.oldest || p.latest)) return history(req, p);
     const res = await (req.method === "GET" ? asPost(req, method, Object.fromEntries(url.searchParams)) : app.fetch(req));
     if (method in USER_ANSWERS) return withUpdated(res, USER_ANSWERS[method]);
-    if (method === "chat.getPermalink") return withPermalink(res);
+    if (method === "chat.getPermalink") return withPermalink(res, p);
     if (method === "conversations.replies") return withParentFirst(res, p.ts);
     if (method === "chat.postMessage") await markThreadParent(res);
     return res;

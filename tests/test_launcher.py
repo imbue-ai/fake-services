@@ -783,13 +783,22 @@ def test_a_permalink_names_the_workspace_and_a_replys_thread(external_services: 
     in_im = _slack(external_services, "chat.getPermalink", channel=im_id, message_ts=_shifted("1773950000.000000"))
 
     base = "https://redwood.slack.com/archives/{}/p".format(channel_id)
-    assert top == {"ok": True, "channel": channel_id, "permalink": base + parent.replace(".", "")}
+    # A thread's parent names the thread too, as Slack's permalinks do; a message in no thread does not.
+    assert top == {
+        "ok": True,
+        "channel": channel_id,
+        "permalink": "{}{}?thread_ts={}&cid={}".format(base, parent.replace(".", ""), parent, channel_id),
+    }
     assert threaded["permalink"] == "{}{}?thread_ts={}&cid={}".format(base, reply.replace(".", ""), parent, channel_id)
-    assert in_im["permalink"] == "https://redwood.slack.com/archives/{}/p{}".format(
-        im_id, _shifted("1773950000.000000").replace(".", "")
+    im_parent = _shifted("1773950000.000000")
+    assert in_im["permalink"] == "https://redwood.slack.com/archives/{}/p{}?thread_ts={}&cid={}".format(
+        im_id, im_parent.replace(".", ""), im_parent, im_id
     )
+    # A search match's permalink names the thread but not the channel, as Slack's do.
     found = _slack(external_services, "search.messages", query="normalization")["messages"]["matches"]
-    assert [match["permalink"] for match in found] == [threaded["permalink"]]
+    assert [match["permalink"] for match in found] == [
+        "{}{}?thread_ts={}".format(base, reply.replace(".", ""), parent)
+    ]
     missing = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts="1773900000.000000")
     assert missing == {"ok": False, "error": "message_not_found"}
 
