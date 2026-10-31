@@ -758,7 +758,13 @@ def test_search_sorts_by_score_or_timestamp_and_pages_as_slack_does(
     }
     # An operator the fake does not read matches nothing and is counted.
     assert _search(external_services, "latency has:link") == []
-    assert _control(external_services, "health")["unsupported_calls"] == {"slack:search.messages:has": 1}
+    assert _search(external_services, "latency -postmortem") == []
+    assert _search(external_services, "laten*") == []
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "slack:search.messages:has": 1,
+        "slack:search.messages:exclude": 1,
+        "slack:search.messages:wildcard": 1,
+    }
 
 
 def test_a_permalink_names_the_workspace_and_a_replys_thread(external_services: RunningExternalServices) -> None:

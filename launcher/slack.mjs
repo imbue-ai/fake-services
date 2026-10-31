@@ -335,9 +335,15 @@ export function create(seed, clock) {
     m = value.match(/^(\d{4})$/);
     return m ? [Date.UTC(+m[1], 0, 1) / 1000, Date.UTC(+m[1] + 1, 0, 1) / 1000] : null;
   }
-  // Slack's search operators the fake does not read. A term naming one, or a date the fake cannot
-  // read, matches nothing and is counted under slack:search.messages:<operator>.
+  // Slack's search operators the fake does not read. A term naming one, an excluded term (-word), a
+  // wildcard (word*) or a date the fake cannot read matches nothing and is counted under
+  // slack:search.messages:<operator>, exclude or wildcard.
   const UNREAD_OPERATORS = new Set(["to", "with", "has", "is"]);
+  const unreadShapeOf = (raw) => {
+    if (raw.startsWith('"') || raw.length < 2) return null;
+    if (raw.startsWith("-")) return "exclude";
+    return raw.endsWith("*") ? "wildcard" : null;
+  };
   const unsupportedOf = new WeakMap();
   // search.messages over the live store, so a message posted in the trial is found as a seeded one
   // is. Words and phrases match the text without regard to case; in:#channel, in:<channel id> and
@@ -362,7 +368,11 @@ export function create(seed, clock) {
       const term = raw.replace(/^"|"$/g, "");
       const lower = term.toLowerCase();
       const op = raw.startsWith('"') ? null : lower.match(/^([a-z]+):(.+)$/);
-      if (op?.[1] === "in") {
+      const shape = unreadShapeOf(raw);
+      if (shape) {
+        keys.push(`slack:search.messages:${shape}`);
+        preds.push(() => false);
+      } else if (op?.[1] === "in") {
         const target = term.slice(3);
         let ch;
         if (target.startsWith("@")) {
