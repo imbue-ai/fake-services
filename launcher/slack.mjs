@@ -437,9 +437,7 @@ export function create(seed, clock) {
   async function withPermalink(res) {
     const answer = await answerOf(res);
     if (!answer?.ok) return res;
-    const ch = ss.channels.findOneBy("channel_id", answer.channel);
-    const [, ts, query] = answer.permalink.match(/\/p(\d+)(\?.*)?$/);
-    answer.permalink = `https://${domain}.slack.com/archives/${ch.channel_id}/p${ts}${query ?? ""}`;
+    answer.permalink = answer.permalink.replace(/^https:\/\/[^/]+/, `https://${domain}.slack.com`);
     return Response.json(answer, { status: res.status });
   }
   // A reply posted in the trial makes its parent a thread's parent, which Slack serves with its own
