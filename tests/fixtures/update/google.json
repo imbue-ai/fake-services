@@ -23,5 +23,20 @@
       "labels": ["Finance", "UNREAD"],
       "in_reply_to": "invoice-followup"
     }
+  ],
+  "events": [
+    {
+      "key": "corrected-invoice-call",
+      "owner": "morgan.reyes@redwood.example",
+      "summary": "Corrected invoice call",
+      "start": "2026-03-23T09:00:00-07:00",
+      "end": "2026-03-23T09:15:00-07:00",
+      "attendees": [
+        {
+          "email": "olivia.chen@redwood.example",
+          "name": "Olivia Chen"
+        }
+      ]
+    }
   ]
 }

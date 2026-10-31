@@ -84,5 +84,55 @@
       "labels": ["UNREAD"],
       "message_id": "<4411-question@northwind.example>"
     }
+  ],
+  "events": [
+    {
+      "key": "vendor-sync",
+      "owner": "morgan.reyes@redwood.example",
+      "summary": "Northwind invoice sync",
+      "start": "2026-03-17T10:00:00-07:00",
+      "end": "2026-03-17T10:30:00-07:00",
+      "location": "Room 4B",
+      "description": "Walk through invoice 4411 with Priya.",
+      "attendees": [
+        {
+          "email": "priya@northwind.example",
+          "name": "Priya Shah",
+          "response_status": "accepted"
+        },
+        {
+          "email": "thomas.baird@redwood.example",
+          "name": "Thomas Baird",
+          "response_status": "tentative"
+        }
+      ]
+    },
+    {
+      "key": "finance-review",
+      "owner": "morgan.reyes@redwood.example",
+      "summary": "Q1 finance review",
+      "start": "2026-03-24T14:00:00-07:00",
+      "end": "2026-03-24T15:00:00-07:00",
+      "attendees": [
+        {
+          "email": "thomas.baird@redwood.example",
+          "response_status": "declined"
+        }
+      ]
+    },
+    {
+      "key": "offsite",
+      "owner": "morgan.reyes@redwood.example",
+      "summary": "Team offsite",
+      "start": "2026-03-26",
+      "end": "2026-03-28"
+    },
+    {
+      "key": "thomas-planning",
+      "owner": "thomas.baird@redwood.example",
+      "summary": "Planning block",
+      "start": "2026-03-18T09:00:00Z",
+      "end": "2026-03-18T09:30:00Z"
+    }
   ]
 }

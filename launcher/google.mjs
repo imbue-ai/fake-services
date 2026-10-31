@@ -1,8 +1,10 @@
 // The fake Google: one fake for every Google API a task reads, on @emulators/google's app and store,
 // served on each host those APIs live on and routed by path to a product module under google/.
 // A request for a path no product serves, or for a Google host the fake does not serve, is answered
-// with the HTML 404 page Google's frontends answer a path no API takes, and counted. The accounts (`users`) are Google's own,
-// shared by every product; each product seeds its own records for them. See launcher.mjs for the
+// with the HTML 404 page Google's frontends answer a path no API takes, and counted. The accounts
+// (`users`) are Google's own, shared by every product; each product seeds its own records for them.
+// The products are Gmail v1 (google/gmail.mjs: `labels`, `messages`) and Calendar v3
+// (google/calendar.mjs: `events`, on each account's one primary calendar). See launcher.mjs for the
 // interface this module exports.
 //
 // A product module exports:
@@ -17,17 +19,21 @@
 //     unsupportedKeys(req)
 //                    what the request asked for that the real API has and the product lacks
 //     earliest(email) the earliest date (epoch ms) of the account's records, or null
+//     settle(email, iso), optional
+//                    dates the records a new account has from the start (a primary calendar) with
+//                    the account's own date
 //     counts()       its record counts for health
 //   }
 import crypto from "node:crypto";
 import { Hono, Store, WebhookDispatcher, authMiddleware } from "@emulators/core";
 import { getGoogleStore, googlePlugin, seedFromConfig } from "@emulators/google";
 import { credentialsInvalid, credentialsMissing, internalError, noSuchPath, unrouted } from "./google/errors.mjs";
+import * as calendar from "./google/calendar.mjs";
 import * as gmail from "./google/gmail.mjs";
 
 export const name = "google";
 export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com"]);
-const PRODUCTS = [gmail];
+const PRODUCTS = [gmail, calendar];
 const BASE_URL = "https://oauth2.googleapis.com";
 
 const productOf = (url) => PRODUCTS.findIndex((p) => p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
@@ -76,6 +82,7 @@ export function create(seed, clock) {
       const at = earliestOf(email);
       const iso = Number.isFinite(at) ? new Date(at).toISOString() : Number.isFinite(floor) ? new Date(floor).toISOString() : clock.anchor;
       Object.assign(gs.users.findOneBy("email", email), { created_at: iso, updated_at: iso });
+      for (const product of products) product.settle?.(email, iso);
     }
   }
 
@@ -124,7 +131,7 @@ export function create(seed, clock) {
 
 function resultCount(json) {
   if (json == null || typeof json !== "object") return null;
-  for (const k of ["messages", "threads", "labels", "history", "drafts"]) if (Array.isArray(json[k])) return json[k].length;
-  // A list answer leaves out an empty list, as Google does.
+  for (const k of ["messages", "threads", "labels", "history", "drafts", "items"]) if (Array.isArray(json[k])) return json[k].length;
+  // A Gmail list answer leaves out an empty list, as Gmail does.
   return "resultSizeEstimate" in json ? 0 : null;
 }
