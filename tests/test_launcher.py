@@ -2578,6 +2578,11 @@ def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
     cancelled = _calendar(external_services, "calendars/primary/events/{}".format(sync_id))
     deleted_again = httpx2.delete("{}/{}".format(events_url, sync_id), headers=headers)
     no_end = httpx2.post(events_url, headers=headers, json={"summary": "x", "start": {"date": day}})
+    one_day = {"start": {"date": day}, "end": {"date": _shifted_date("2026-03-26")}}
+    tentative = httpx2.post(events_url, headers=headers, json={"summary": "Maybe", "status": "tentative", **one_day})
+    born_cancelled = httpx2.post(
+        events_url, headers=headers, json={"summary": "Gone", "status": "cancelled", **one_day}
+    )
 
     assert got == event
     assert (event["start"], event["end"]) == (
@@ -2595,8 +2600,12 @@ def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
         _calendar_error(410, "Resource has been deleted", "deleted"),
     )
     assert (no_end.status_code, no_end.json()) == (400, _calendar_error(400, "Missing end time.", "required"))
-    # The insert's recurrence is not kept, and that is counted.
-    assert _control(external_services, "health")["unsupported_calls"] == {"google:calendar:body:recurrence": 1}
+    assert (tentative.json()["status"], born_cancelled.json()["status"]) == ("tentative", "confirmed")
+    # The insert's recurrence is not kept, nor is a status a new event cannot have, and both are counted.
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:calendar:body:recurrence": 1,
+        "google:calendar:body:status": 1,
+    }
 
 
 def test_another_accounts_calendar_is_not_found(external_services: RunningExternalServices) -> None:
