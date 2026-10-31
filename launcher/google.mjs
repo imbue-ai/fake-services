@@ -24,10 +24,11 @@ import { Hono, Store, WebhookDispatcher, authMiddleware } from "@emulators/core"
 import { getGoogleStore, googlePlugin, seedFromConfig } from "@emulators/google";
 import { credentialsInvalid, credentialsMissing, internalError, noSuchPath, unrouted } from "./google/errors.mjs";
 import * as gmail from "./google/gmail.mjs";
+import * as userinfo from "./google/userinfo.mjs";
 
 export const name = "google";
-export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com"]);
-const PRODUCTS = [gmail];
+export const hosts = new Set(["gmail.googleapis.com", "www.googleapis.com", "openidconnect.googleapis.com"]);
+const PRODUCTS = [gmail, userinfo];
 const BASE_URL = "https://oauth2.googleapis.com";
 
 const productOf = (url) => PRODUCTS.findIndex((p) => p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
