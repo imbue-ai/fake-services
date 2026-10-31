@@ -20,11 +20,11 @@ const DOCS = "https://api.slack.com/methods";
 // minute", Tier 2 "20+", Tier 3 "50+", Tier 4 "100+". A tier allows its number within any minute plus
 // a burst, which Slack does not publish; BURST is the share added for it. The method pages state:
 // conversations.history, conversations.replies, conversations.info, users.conversations and
-// users.lookupByEmail Tier 3; conversations.list, users.list, search.messages and search.all Tier 2; users.info and conversations.members
-// Tier 4; auth.test "special" ("hundreds of requests per minute"), held to Tier 4 here. Since
-// 2025-05-29 conversations.history and conversations.replies are Tier 1 for a commercially
-// distributed app outside the Slack Marketplace; an internal customer-built app keeps Tier 3, and a
-// task's integration is one. Any other method is held to Tier 3.
+// users.lookupByEmail Tier 3; conversations.list, users.list, search.messages and search.all Tier 2;
+// users.info and conversations.members Tier 4; auth.test "special" ("hundreds of requests per
+// minute"), held to Tier 4 here. Since 2025-05-29 conversations.history and conversations.replies are
+// Tier 1 for a commercially distributed app outside the Slack Marketplace; an internal customer-built
+// app keeps Tier 3, and a task's integration is one. Any other method is held to Tier 3.
 const PER_MINUTE = { 1: 1, 2: 20, 3: 50, 4: 100 };
 const BURST = 0.2;
 const METHOD_TIERS = {
@@ -346,8 +346,9 @@ export function create(seed, clock) {
     m = value.match(/^(\d{4})$/);
     return m ? [Date.UTC(+m[1], 0, 1) / 1000, Date.UTC(+m[1] + 1, 0, 1) / 1000] : null;
   }
-  // Slack's search operators the fake does not read (is:thread alone is read). A term naming one, an excluded term (-word), a
-  // wildcard (word*) or a date the fake cannot read matches nothing and is counted as a gap.
+  // Slack's search operators the fake does not read (is:thread alone is read). A term naming one, an
+  // excluded term (-word), a wildcard (word*) or a date the fake cannot read matches nothing and is
+  // counted as a gap.
   const UNREAD_OPERATORS = new Set(["to", "with", "has", "is"]);
   const unreadShapeOf = (raw) => {
     if (raw.startsWith('"') || raw.length < 2) return null;
