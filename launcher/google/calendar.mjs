@@ -143,7 +143,7 @@ export function create({ gs, clock }) {
     const rec = gs.calendarEvents.insert({
       user_email: fields.owner,
       calendar_google_id: fields.owner,
-      status: "confirmed",
+      status: fields.status ?? "confirmed",
       summary: fields.summary ?? "",
       description: fields.description ?? null,
       location: fields.location ?? null,
@@ -397,8 +397,12 @@ export function create({ gs, clock }) {
   }
 
   // What an insert's resource may state and this fake keeps; any other field is counted, under
-  // google:calendar:body:<field>, and not kept.
+  // google:calendar:body:<field> (google:calendar:body:attendees.<field> for a guest's), and not
+  // kept. A status is kept when it is one a new event can have here; any other is counted the same
+  // way and the event is confirmed, as a guest's unknown responseStatus is counted and left needsAction.
   const INSERTED_FIELDS = new Set(["kind", "id", "status", "summary", "description", "location", "start", "end", "attendees"]);
+  const INSERTED_ATTENDEE_FIELDS = new Set(["email", "displayName", "responseStatus"]);
+  const INSERTED_STATUSES = new Set(["confirmed", "tentative"]);
   async function insert(req, calendar, keys) {
     let body;
     try {
@@ -408,6 +412,7 @@ export function create({ gs, clock }) {
     }
     if (!body || typeof body !== "object" || Array.isArray(body)) return calendarError(400, "Parse Error", "parseError");
     for (const field of Object.keys(body)) if (!INSERTED_FIELDS.has(field)) keys.push(`google:calendar:body:${field}`);
+    if (body.status !== undefined && !INSERTED_STATUSES.has(body.status)) keys.push("google:calendar:body:status");
     const zone = calendar.time_zone;
     const start = sideOfInsert(body.start, "start", zone);
     if (start instanceof Response) return start;
@@ -418,6 +423,10 @@ export function create({ gs, clock }) {
     for (const field of ["summary", "description", "location"]) if (body[field] != null && typeof body[field] !== "string") return invalidField(`Invalid value for: ${field}`);
     const attendees = body.attendees ?? [];
     if (!Array.isArray(attendees) || attendees.some((a) => typeof a?.email !== "string" || !a.email.includes("@"))) return invalidField("Invalid attendee email.");
+    if (attendees.some((a) => a.displayName != null && typeof a.displayName !== "string")) return invalidField("Invalid value for: displayName");
+    const unkeptAttendeeFields = new Set(attendees.flatMap((a) => Object.keys(a).filter((field) => !INSERTED_ATTENDEE_FIELDS.has(field))));
+    if (attendees.some((a) => a.responseStatus !== undefined && !RESPONSE_STATUSES.has(a.responseStatus))) unkeptAttendeeFields.add("responseStatus");
+    for (const field of unkeptAttendeeFields) keys.push(`google:calendar:body:attendees.${field}`);
     let id = body.id;
     if (id !== undefined) {
       if (typeof id !== "string" || !EVENT_ID.test(id)) return invalidField("Invalid resource id value.");
@@ -427,6 +436,7 @@ export function create({ gs, clock }) {
     const rec = insertEvent({
       owner: calendar.user_email,
       id,
+      status: INSERTED_STATUSES.has(body.status) ? body.status : undefined,
       summary: body.summary,
       description: body.description,
       location: body.location,
