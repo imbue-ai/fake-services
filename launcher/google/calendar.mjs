@@ -7,6 +7,7 @@
 import crypto from "node:crypto";
 import { noSuchPath } from "./errors.mjs";
 
+export const hosts = new Set(["www.googleapis.com"]);
 export const prefixes = ["/calendar/v3/"];
 
 // Calendar's limits, as its documentation states them (developers.google.com/workspace/calendar/api/
