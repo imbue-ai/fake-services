@@ -323,7 +323,7 @@ export function create({ gs, clock }) {
     return m && pageTokenOf(Number(m[1])) === token ? Number(m[1]) : null;
   }
 
-  function listEvents(url, calendar, keys) {
+  function listEvents(url, calendar) {
     const params = url.searchParams;
     const zone = calendar.time_zone;
     const bound = (name) => {
@@ -354,11 +354,10 @@ export function create({ gs, clock }) {
     if (timeMin !== null) events = events.filter((e) => endMs(e, zone) > timeMin);
     if (timeMax !== null) events = events.filter((e) => startMs(e, zone) < timeMax);
     // Calendar's search is over its full text, which this fake does not have: each word of q is
-    // looked for in an event's summary, description, location, guests and organizer, and the gap is
-    // counted.
+    // looked for in an event's summary, description, location, guests and organizer, an approximation
+    // of matching Calendar does not document.
     const q = params.get("q");
     if (q !== null) {
-      keys.push("google:calendar:q");
       const words = q.toLowerCase().split(/\s+/).filter(Boolean);
       const text = (e) => [e.summary, e.description ?? "", e.location ?? "", e.user_email, ...e.attendees.flatMap((a) => [a.email, a.display_name ?? ""])].join(" ").toLowerCase();
       events = events.filter((e) => words.every((w) => text(e).includes(w)));
@@ -446,6 +445,19 @@ export function create({ gs, clock }) {
     return Response.json(eventResource(rec));
   }
 
+  // The settings a client reads, at plain Calendar's defaults for a new account rather than anything a
+  // seed states; the time zone is the primary calendar's.
+  const settingsOf = (calendar) => ({
+    dateFieldOrder: "MDY",
+    format24HourTime: "false",
+    hideWeekends: "false",
+    locale: "en",
+    showDeclinedEvents: "true",
+    timezone: calendar.time_zone,
+    weekStart: "0",
+  });
+  const settingResource = (calendar, id, value) => ({ kind: "calendar#setting", etag: etagOf(Date.parse(calendar.created_at)), id, value });
+
   // A path under /calendar/v3/ as a template: the segment after a collection is a record's id, unless
   // it is one of the collection's own methods.
   const ID_OF = { calendars: "{calendarId}", calendarList: "{calendarId}", events: "{eventId}", acl: "{ruleId}", settings: "{setting}" };
@@ -464,6 +476,8 @@ export function create({ gs, clock }) {
   const SERVED_PARAMETERS = {
     "GET users/me/calendarList": ["maxResults", "pageToken", "showDeleted", "showHidden", "minAccessRole"],
     "GET users/me/calendarList/{calendarId}": [],
+    "GET users/me/settings": [],
+    "GET users/me/settings/{setting}": [],
     "GET calendars/{calendarId}": [],
     "GET calendars/{calendarId}/events": ["timeMin", "timeMax", "singleEvents", "orderBy", "maxResults", "pageToken", "showDeleted", "q"],
     "POST calendars/{calendarId}/events": ["sendUpdates", "sendNotifications"],
@@ -485,6 +499,16 @@ export function create({ gs, clock }) {
     }
     for (const name of new Set(url.searchParams.keys())) if (!served.includes(name) && !INERT_PARAMETERS.has(name)) keys.push(`google:calendar:${name}`);
 
+    if (action === "GET users/me/settings") {
+      const calendar = calendarOf(email);
+      const items = Object.entries(settingsOf(calendar)).map(([id, value]) => settingResource(calendar, id, value));
+      return Response.json({ kind: "calendar#settings", etag: etagOf(Date.parse(calendar.created_at)), items });
+    }
+    if (action === "GET users/me/settings/{setting}") {
+      const calendar = calendarOf(email);
+      const settings = settingsOf(calendar);
+      return Object.hasOwn(settings, segments[3]) ? Response.json(settingResource(calendar, segments[3], settings[segments[3]])) : notFound();
+    }
     if (action === "GET users/me/calendarList") return Response.json({ kind: "calendar#calendarList", etag: etagOf(Date.parse(calendarOf(email).created_at)), items: [calendarListEntry(calendarOf(email))] });
     const calendar = calendarNamed(segments[segments[0] === "users" ? 3 : 1], email);
     if (!calendar) return notFound();
@@ -498,7 +522,7 @@ export function create({ gs, clock }) {
         timeZone: calendar.time_zone,
         conferenceProperties: { allowedConferenceSolutionTypes: ["hangoutsMeet"] },
       });
-    if (action === "GET calendars/{calendarId}/events") return listEvents(url, calendar, keys);
+    if (action === "GET calendars/{calendarId}/events") return listEvents(url, calendar);
     if (action === "POST calendars/{calendarId}/events") return insert(req, calendar, keys);
     const event = eventsOf(email).find((e) => e.google_id === segments[3]);
     if (!event) return notFound();

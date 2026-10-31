@@ -2410,6 +2410,34 @@ def test_a_calendar_list_and_a_calendar_name_the_account_its_token_belongs_to(
     assert probe_identities(probe, json.dumps(calendar)) == (_MORGAN,)
 
 
+def test_calendar_settings_are_calendars_defaults_in_the_primary_calendars_zone(
+    external_services: RunningExternalServices,
+) -> None:
+    listed = _calendar(external_services, "users/me/settings")
+    timezone = _calendar(external_services, "users/me/settings/timezone")
+    week_start = _calendar(external_services, "users/me/settings/weekStart")
+    thomas = _calendar(external_services, "users/me/settings/timezone", token=_THOMAS_GOOGLE_TOKEN)
+    unknown = _calendar_get(external_services, "users/me/settings/noSuchSetting")
+
+    assert listed["kind"] == "calendar#settings" and "nextSyncToken" not in listed
+    assert {item["id"]: item["value"] for item in listed["items"]} == {
+        "dateFieldOrder": "MDY",
+        "format24HourTime": "false",
+        "hideWeekends": "false",
+        "locale": "en",
+        "showDeclinedEvents": "true",
+        "timezone": "Etc/GMT+7",
+        "weekStart": "0",
+    }
+    assert {item["kind"] for item in listed["items"]} == {"calendar#setting"}
+    assert timezone == next(item for item in listed["items"] if item["id"] == "timezone")
+    assert set(timezone) == {"kind", "etag", "id", "value"}
+    assert (week_start["id"], week_start["value"]) == ("weekStart", "0")
+    assert thomas["value"] == "UTC"
+    assert (unknown.status_code, unknown.json()) == (404, _calendar_error(404, "Not Found", "notFound"))
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
 def test_a_seeded_calendar_event_is_served_as_calendar_serves_one(external_services: RunningExternalServices) -> None:
     ids = _event_ids(external_services)
     event = _calendar(external_services, "calendars/primary/events/{}".format(ids["vendor-sync"]))
@@ -2679,7 +2707,7 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         httpx2.get("{}/calendars/primary/events/{}/instances".format(base, sync_id), headers=headers),
         httpx2.post("{}/freeBusy".format(base), headers=headers, json={}),
         httpx2.get("{}/colors".format(base), headers=headers),
-        httpx2.get("{}/users/me/settings/timezone".format(base), headers=headers),
+        httpx2.get("{}/calendars/primary/acl".format(base), headers=headers),
     ]
     with_parameters = [
         _calendar_get(external_services, "calendars/primary/events", syncToken="CPDAlvWDx70CEPDAlvWDx70CGAU="),
@@ -2693,7 +2721,7 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         assert answer.headers["content-type"] == "text/html; charset=UTF-8"
         assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
     assert [answer.status_code for answer in with_parameters] == [200] * 4
-    # A search is answered by the words in an event's text.
+    # A search is answered by the words in an event's text, and not counted.
     assert [event["summary"] for event in with_parameters[2].json()["items"]] == ["Northwind invoice sync"]
     assert _control(external_services, "health")["unsupported_calls"] == {
         "google:calendar:PATCH calendars/{calendarId}/events/{eventId}": 1,
@@ -2701,10 +2729,9 @@ def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_s
         "google:calendar:GET calendars/{calendarId}/events/{eventId}/instances": 1,
         "google:calendar:POST freeBusy": 1,
         "google:calendar:GET colors": 1,
-        "google:calendar:GET users/me/settings/{setting}": 1,
+        "google:calendar:GET calendars/{calendarId}/acl": 1,
         "google:calendar:syncToken": 1,
         "google:calendar:iCalUID": 1,
-        "google:calendar:q": 1,
         "google:calendar:fields": 1,
     }
 
