@@ -2924,6 +2924,20 @@ def test_a_calendar_list_and_a_calendar_name_the_account_its_token_belongs_to(
     assert probe_identities(probe, json.dumps(calendar)) == (_MORGAN,)
 
 
+def test_calendar_on_a_google_host_other_than_www_is_a_counted_path_no_api_takes(
+    external_services: RunningExternalServices,
+) -> None:
+    on_gmail_host = httpx2.get(
+        "{}/calendar/v3/calendars/primary".format(external_services.google_url),
+        headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "gmail.googleapis.com"},
+    )
+
+    assert on_gmail_host.status_code == 404
+    assert on_gmail_host.headers["content-type"] == "text/html; charset=UTF-8"
+    assert "<code>/calendar/v3/calendars/primary</code> was not found on this server." in on_gmail_host.text
+    assert _control(external_services, "health")["unsupported_calls"] == {"google:path:/calendar/v3": 1}
+
+
 def test_calendar_settings_are_calendars_defaults_in_the_primary_calendars_zone(
     external_services: RunningExternalServices,
 ) -> None:
