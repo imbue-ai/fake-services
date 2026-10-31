@@ -450,7 +450,7 @@ export function create(seed, clock) {
       cursor = page.response_metadata?.next_cursor;
     } while (cursor);
     const held = listed.filter((ch) => ss.channels.findOneBy("channel_id", ch.id)?.members.includes(member)).map(({ is_member, num_members, ...ch }) => ch);
-    const limit = Math.min(Number(p.limit) || 100, 999);
+    const limit = Math.min(Math.max(Number(p.limit) || 100, 1), 999);
     const start = p.cursor ? held.findIndex((ch) => ch.id === p.cursor) : 0;
     if (start < 0) return Response.json({ ok: false, error: "invalid_cursor" });
     const next = start + limit < held.length ? held[start + limit].id : "";
