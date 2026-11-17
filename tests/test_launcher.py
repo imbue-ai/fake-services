@@ -4,6 +4,7 @@ packages (`just minds-evals-external-services-install`)."""
 import json
 import time
 from collections.abc import Iterator
+from datetime import UTC
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -581,6 +582,45 @@ def test_search_finds_messages_by_text_and_channel(external_services: RunningExt
     assert found["messages"]["total"] == 2
     assert {match["channel"]["name"] for match in found["messages"]["matches"]} == {"eng-oncall"}
     assert _slack(external_services, "search.messages", query="latency in:#announcements")["messages"]["total"] == 0
+
+
+def test_search_finds_a_threads_messages_by_channel_id_and_names_a_replys_thread(
+    external_services: RunningExternalServices,
+) -> None:
+    """The query datalib's reply search sends: `is:thread`, the channel as `in:<#id>`, and whole-day
+    bounds two days past each end of the stretch it searches. A reply's permalink names its thread,
+    which is how datalib tells a reply from a root."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    root_ts = _shifted("1773900000.000000")
+    reply_ts = _shifted("1773900600.000000")
+    root_day = datetime.fromtimestamp(int(root_ts.split(".")[0]), tz=UTC).date()
+    query = "is:thread in:<#{}> after:{} before:{}".format(
+        channel_id, root_day - timedelta(days=2), root_day + timedelta(days=2)
+    )
+    found = _slack(
+        external_services, "search.messages", query=query, sort="timestamp", sort_dir="desc", count="100", page="1"
+    )
+
+    reply, root = found["messages"]["matches"]
+    assert (reply["ts"], root["ts"]) == (reply_ts, root_ts)
+    assert reply["permalink"].endswith(
+        "/p{}?thread_ts={}&cid={}".format(reply_ts.replace(".", ""), root_ts, channel_id)
+    )
+    assert "?" not in root["permalink"]
+    # The channel's third message has no replies, so it is in no thread; the `<#id|name>` form names the
+    # channel too.
+    assert (
+        _slack(external_services, "search.messages", query="is:thread in:<#{}>".format(channel_id))["messages"][
+            "total"
+        ]
+        == 2
+    )
+    assert (
+        _slack(external_services, "search.messages", query="in:<#{}|eng-oncall>".format(channel_id))["messages"][
+            "total"
+        ]
+        == 3
+    )
 
 
 def test_linear_answers_a_nested_filter_ordered_by_update(external_services: RunningExternalServices) -> None:

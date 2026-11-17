@@ -1,7 +1,8 @@
 // The fake Slack: @emulators/slack's app and store, with what a trial needs on top. Messages, threads
 // and ids are inserted straight into the store, so they read the same in every trial; channels and
 // users are dated, and channels peopled, from the seed's messages (settle()); Slack methods answer
-// GET; conversations.history takes oldest/latest/inclusive; a basic search.messages. See launcher.mjs
+// GET; conversations.history takes oldest/latest/inclusive; a basic search.messages (text, `in:` by
+// channel name or id, `from:`, `is:thread`, `after:`, `before:`). See launcher.mjs
 // for the interface this module exports.
 import crypto from "node:crypto";
 import { Hono, Store, WebhookDispatcher, authMiddleware, cors, createApiErrorHandler, createErrorHandler } from "@emulators/core";
@@ -243,9 +244,12 @@ export function create(seed, clock) {
       const term = raw.replace(/^"|"$/g, "");
       const lower = term.toLowerCase();
       if (lower.startsWith("in:")) {
-        const ch = ss.channels.findOneBy("name", term.slice(3).replace(/^#/, ""));
+        // Slack takes a channel as `in:#name`, `in:name`, `in:<#C123>` or `in:<#C123|name>`.
+        const ref = term.slice(3).replace(/^<#|>$/g, "").replace(/\|.*$/, "").replace(/^#/, "");
+        const ch = ss.channels.findOneBy("name", ref) ?? ss.channels.findOneBy("channel_id", ref);
         preds.push((m) => m.channel_id === ch?.channel_id);
-      } else if (lower.startsWith("from:")) {
+      } else if (lower === "is:thread") preds.push((m) => Boolean(m.thread_ts));
+      else if (lower.startsWith("from:")) {
         const who = term.slice(5).replace(/^[<@]+|>$/g, "");
         const u = ss.users.all().find((x) => x.name === who) ?? ss.users.findOneBy("user_id", who);
         preds.push((m) => m.user === u?.user_id);
@@ -267,7 +271,9 @@ export function create(seed, clock) {
         paging: { count, total: hits.length, page, pages: Math.ceil(hits.length / count) },
         matches: slice.map((m) => {
           const ch = visible.get(m.channel_id);
-          return { type: "message", channel: { id: ch.channel_id, name: ch.name }, user: m.user, username: ss.users.findOneBy("user_id", m.user)?.name ?? "", ts: m.ts, text: m.text, permalink: `https://${domain}.slack.com/archives/${ch.channel_id}/p${m.ts.replace(".", "")}` };
+          // A reply's permalink names its thread, as Slack's does; a root's does not.
+          const thread = m.thread_ts && m.thread_ts !== m.ts ? `?thread_ts=${m.thread_ts}&cid=${ch.channel_id}` : "";
+          return { type: "message", channel: { id: ch.channel_id, name: ch.name }, user: m.user, username: ss.users.findOneBy("user_id", m.user)?.name ?? "", ts: m.ts, text: m.text, permalink: `https://${domain}.slack.com/archives/${ch.channel_id}/p${m.ts.replace(".", "")}${thread}` };
         }),
       },
     });
