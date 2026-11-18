@@ -1,6 +1,8 @@
 """The real launcher on small seeds. Skipped on a machine without node or the launcher's npm
 packages (`just minds-evals-external-services-install`)."""
 
+import base64
+import email
 import json
 import time
 from collections.abc import Iterator
@@ -20,6 +22,7 @@ from imbue.minds_evals.errors import TaskAuthoringError
 from imbue.minds_evals.external_services import SERVICES
 from imbue.minds_evals.external_services import parse_service_seed
 from imbue.minds_evals.external_services import parse_service_update
+from imbue.minds_evals.external_services import probe_identities
 from imbue.minds_evals.external_services import service_named
 from imbue.minds_evals.testing import EXTERNAL_SERVICES_REFUSED_UPDATE_FIXTURE
 from imbue.minds_evals.testing import EXTERNAL_SERVICES_SEED_FIXTURE
@@ -125,6 +128,66 @@ _LINEAR_DATES_QUERY = (
 
 def _by(nodes: list[dict[str, Any]], key: str) -> dict[str, tuple[str, str]]:
     return {node[key]: (node["createdAt"], node["updatedAt"]) for node in nodes}
+
+
+_GOOGLE_TOKEN = "ya29.fake-redwood-google-token-morgan"
+_THOMAS_GOOGLE_TOKEN = "ya29.fake-redwood-google-token-thomas"
+_MORGAN = "morgan.reyes@redwood.example"
+
+
+def _gmail_get(
+    services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str
+) -> httpx2.Response:
+    headers = {} if token is None else {"Authorization": "Bearer {}".format(token)}
+    return httpx2.get("{}/gmail/v1/users/{}".format(services.google_url, path), params=params, headers=headers)
+
+
+def _gmail(services: RunningExternalServices, path: str, **params: str) -> Any:
+    answer = _gmail_get(services, path, **params)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _message_keys(services: RunningExternalServices, mailbox: str = _MORGAN) -> dict[str, str]:
+    """Each seeded message's Gmail id by its key, as the state dump holds them."""
+    items = _control(services, "state")["google"]["collections"]["google.messages"]["items"]
+    return {item["seed_key"]: item["gmail_id"] for item in items if item["user_email"] == mailbox}
+
+
+def _listed_ids(services: RunningExternalServices, kind: str = "messages", **params: str) -> list[str]:
+    return [entry["id"] for entry in _gmail(services, "me/{}".format(kind), **params).get(kind, [])]
+
+
+def _calendar_get(
+    services: RunningExternalServices, path: str, token: str | None = _GOOGLE_TOKEN, **params: str
+) -> httpx2.Response:
+    # Calendar lives on www.googleapis.com alone, which the shim names for every request it routes.
+    headers = {"X-Forwarded-Host": "www.googleapis.com"}
+    if token is not None:
+        headers["Authorization"] = "Bearer {}".format(token)
+    return httpx2.get("{}/calendar/v3/{}".format(services.google_url, path), params=params, headers=headers)
+
+
+def _headers(message: dict[str, Any]) -> dict[str, str]:
+    return {header["name"]: header["value"] for header in message["payload"]["headers"]}
+
+
+def _userinfo(services: RunningExternalServices, token: str | None = _GOOGLE_TOKEN) -> httpx2.Response:
+    headers = {"X-Forwarded-Host": "openidconnect.googleapis.com"}
+    if token is not None:
+        headers["Authorization"] = "Bearer {}".format(token)
+    return httpx2.get("{}/v1/userinfo".format(services.google_url), headers=headers)
+
+
+def _shifted_ms(stamp: str) -> int:
+    return round((datetime.fromisoformat(stamp).timestamp() + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS) * 1000)
+
+
+def _shifted_date_header(stamp: str) -> str:
+    """A seed's date as a Date header serves it under the test's shift: in the offset the seed states,
+    with the day unpadded as Gmail writes it."""
+    moment = datetime.fromisoformat(stamp) + timedelta(seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS)
+    return "{:%a}, {} {:%b %Y %H:%M:%S %z}".format(moment, moment.day, moment)
 
 
 def test_the_stores_hold_the_seed_and_nothing_of_the_emulators_own(external_services: RunningExternalServices) -> None:
@@ -584,12 +647,11 @@ def test_search_finds_messages_by_text_and_channel(external_services: RunningExt
     assert _slack(external_services, "search.messages", query="latency in:#announcements")["messages"]["total"] == 0
 
 
-def test_search_finds_a_threads_messages_by_channel_id_and_names_a_replys_thread(
-    external_services: RunningExternalServices,
-) -> None:
-    """The query datalib's reply search sends: `is:thread`, the channel as `in:<#id>`, and whole-day
-    bounds two days past each end of the stretch it searches. A reply's permalink names its thread,
-    which is how datalib tells a reply from a root."""
+def test_search_answers_datalibs_reply_search_query(external_services: RunningExternalServices) -> None:
+    """The query datalib's reply search sends: `is:thread`, the channel as `in:<#id>`, whole-day bounds
+    two days past each end of the stretch it searches, and a page sorted by timestamp. It reads a
+    reply's thread off the permalink's `thread_ts`, and tells a reply from a parent by that value
+    differing from the match's own `ts`."""
     channel_id = _channel_id(external_services, "eng-oncall")
     root_ts = _shifted("1773900000.000000")
     reply_ts = _shifted("1773900600.000000")
@@ -603,24 +665,305 @@ def test_search_finds_a_threads_messages_by_channel_id_and_names_a_replys_thread
 
     reply, root = found["messages"]["matches"]
     assert (reply["ts"], root["ts"]) == (reply_ts, root_ts)
-    assert reply["permalink"].endswith(
-        "/p{}?thread_ts={}&cid={}".format(reply_ts.replace(".", ""), root_ts, channel_id)
+    assert reply["permalink"].endswith("/p{}?thread_ts={}".format(reply_ts.replace(".", ""), root_ts))
+    assert root["permalink"].endswith("/p{}?thread_ts={}".format(root_ts.replace(".", ""), root_ts))
+    # The `<#id|name>` form names the channel as the `#name` form does, and nothing in the query is a
+    # gap the fake counts.
+    assert _search(external_services, "in:<#{}|eng-oncall>".format(channel_id)) == _search(
+        external_services, "in:#eng-oncall"
     )
-    assert "?" not in root["permalink"]
-    # The channel's third message has no replies, so it is in no thread; the `<#id|name>` form names the
-    # channel too.
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def _dms(services: RunningExternalServices) -> dict[str, dict[str, Any]]:
+    """The token's dms by kind: its im and its mpim."""
+    listed = _slack(services, "conversations.list", types="im,mpim")["channels"]
+    return {"im" if channel["is_im"] else "mpim": channel for channel in listed}
+
+
+def _slack_post(services: RunningExternalServices, method: str, **fields: str) -> dict[str, Any]:
+    return httpx2.post("{}/api/{}".format(services.slack_url, method), data=fields, headers=_SLACK_HEADERS).json()
+
+
+def _search(services: RunningExternalServices, query: str, **params: str) -> list[str]:
+    return [match["ts"] for match in _slack(services, "search.messages", query=query, **params)["messages"]["matches"]]
+
+
+def _day_after(ts: str) -> str:
+    return (datetime.fromtimestamp(float(ts), tz=UTC).date() + timedelta(days=1)).isoformat()
+
+
+def test_a_dm_is_listed_by_its_type_and_read_like_a_channel_by_its_members(
+    external_services: RunningExternalServices,
+) -> None:
+    user_ids = _user_ids(external_services)
+    dms = _dms(external_services)
+    im, mpim = dms["im"], dms["mpim"]
+
+    # A dm is listed under its own type alone, under Slack's id prefixes: D for an im, and the G
+    # mpims have long carried.
+    listed = _slack(external_services, "conversations.list", types="public_channel,private_channel")["channels"]
+    assert {channel["name"] for channel in listed} == {"announcements", "eng-oncall"}
+    assert (im["id"][0], mpim["id"][0], len(im["id"]), len(mpim["id"])) == ("D", "G", 11, 11)
+    assert (im["is_im"], im["is_mpim"], im["is_private"], im["user"]) == (True, False, True, user_ids["claire"])
+    assert (mpim["is_im"], mpim["is_mpim"], mpim["name"]) == (False, True, "mpdm-claire--morgan.reyes--pagerbot-1")
+    # An im was created at its first message, an mpim at the date its file states.
+    mpim_created = int(datetime.fromisoformat("2026-03-01T09:00:00+00:00").timestamp())
+    assert (im["created"], mpim["created"]) == (
+        _shifted_seconds("1773950000.000000"),
+        mpim_created + EXTERNAL_SERVICES_TEST_SHIFT_SECONDS,
+    )
+    info = _slack(external_services, "conversations.info", channel=im["id"])["channel"]
+    assert (info["id"], info["is_im"], info["user"]) == (im["id"], True, user_ids["claire"])
+    members = _slack(external_services, "conversations.members", channel=mpim["id"])["members"]
+    assert sorted(members) == sorted(user_ids[name] for name in ("claire", "morgan.reyes", "pagerbot"))
+    # The im's reply is folded into its thread, and history takes oldest/latest/inclusive as for a channel.
+    parent = _shifted("1773950000.000000")
+    history = _slack(external_services, "conversations.history", channel=im["id"])["messages"]
+    assert [(message["ts"], message["reply_count"]) for message in history] == [(parent, 1)]
+    after_parent = _slack(external_services, "conversations.history", channel=im["id"], oldest=parent)
+    from_parent = _slack(external_services, "conversations.history", channel=im["id"], oldest=parent, inclusive="1")
+    assert (after_parent["messages"], [message["ts"] for message in from_parent["messages"]]) == ([], [parent])
+    replies = _slack(external_services, "conversations.replies", channel=im["id"], ts=parent)["messages"]
+    assert [message["ts"] for message in replies] == [parent, _shifted("1774000300.000000")]
+    # Search reaches a dm through in:@user and names it as Slack does.
+    found = _slack(external_services, "search.messages", query="latency in:@claire")["messages"]["matches"]
+    assert [
+        (match["ts"], match["channel"]["id"], match["channel"]["is_im"], match["channel"]["name"]) for match in found
+    ] == [(parent, im["id"], True, user_ids["claire"])]
+    assert _search(external_services, "thursday") == [_shifted("1773980000.000000")]
+
+
+def test_users_conversations_lists_the_conversations_the_tokens_user_is_in(
+    external_services: RunningExternalServices,
+) -> None:
+    user_ids = _user_ids(external_services)
+    dms = _dms(external_services)
+
+    default = _slack(external_services, "users.conversations")
+    with_im = _slack(external_services, "users.conversations", types="public_channel,im")
+    dms_only = _slack(external_services, "users.conversations", types="im,mpim")
+    first = _slack(external_services, "users.conversations", types="public_channel,im,mpim", limit="2")
+    rest = _slack(
+        external_services,
+        "users.conversations",
+        types="public_channel,im,mpim",
+        limit="2",
+        cursor=first["response_metadata"]["next_cursor"],
+    )
+    pagerbots = _slack(
+        external_services, "users.conversations", user=user_ids["pagerbot"], types="public_channel,mpim"
+    )
+
+    # Morgan posted in eng-oncall and is no member of announcements, which conversations.list lists too.
+    assert {channel["name"] for channel in _slack(external_services, "conversations.list")["channels"]} == {
+        "announcements",
+        "eng-oncall",
+    }
+    assert [channel["name"] for channel in default["channels"]] == ["eng-oncall"]
+    assert default["response_metadata"] == {"next_cursor": ""}
+    assert "is_member" not in default["channels"][0] and "num_members" not in default["channels"][0]
+    assert {channel["id"] for channel in with_im["channels"]} == {
+        _channel_id(external_services, "eng-oncall"),
+        dms["im"]["id"],
+    }
+    assert {channel["id"] for channel in dms_only["channels"]} == {dms["im"]["id"], dms["mpim"]["id"]}
+    assert len(first["channels"]) == 2 and first["response_metadata"]["next_cursor"]
+    assert {channel["id"] for channel in first["channels"] + rest["channels"]} == {
+        _channel_id(external_services, "eng-oncall"),
+        dms["im"]["id"],
+        dms["mpim"]["id"],
+    }
+    assert rest["response_metadata"] == {"next_cursor": ""}
+    assert {channel["id"] for channel in pagerbots["channels"]} == {
+        _channel_id(external_services, "eng-oncall"),
+        dms["mpim"]["id"],
+    }
+    assert _slack(external_services, "users.conversations", cursor="CNOSUCH") == {
+        "ok": False,
+        "error": "invalid_cursor",
+    }
+    assert _slack(external_services, "users.conversations", user="UNOSUCH") == {
+        "ok": False,
+        "error": "user_not_found",
+    }
+    assert [
+        channel["name"] for channel in _slack(external_services, "users.conversations", limit="-1")["channels"]
+    ] == ["eng-oncall"]
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_search_all_answers_search_messages_messages_and_no_files(external_services: RunningExternalServices) -> None:
+    for params in ({"query": "latency"}, {"query": "latency", "sort": "timestamp", "count": "2", "page": "2"}):
+        messages = _slack(external_services, "search.messages", **params)
+        everything = _slack(external_services, "search.all", **params)
+
+        count, page = int(params.get("count", "20")), int(params.get("page", "1"))
+        assert everything == {
+            **messages,
+            "files": {
+                "total": 0,
+                "paging": {"count": count, "total": 0, "page": page, "pages": 0},
+                "pagination": {
+                    "total_count": 0,
+                    "page": page,
+                    "per_page": count,
+                    "page_count": 0,
+                    "first": 0,
+                    "last": 0,
+                },
+                "matches": [],
+            },
+            "posts": {"total": 0, "matches": []},
+        }
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+    # A gap of its query is counted under search.all.
+    _slack(external_services, "search.all", query="latency has:link")
+    assert _control(external_services, "health")["unsupported_calls"] == {"slack:search.all:has": 1}
+
+
+def test_search_finds_a_posted_message_and_reads_a_date_as_written(external_services: RunningExternalServices) -> None:
+    """A message posted in the trial is stamped with the box's clock, and a seed's under a time shift
+    with dates ending the day before the trial: both are found by the dates an agent reads off them,
+    with no shift applied to the query."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    posted = _slack_post(external_services, "chat.postMessage", channel=channel_id, text="latency latency postmortem")
+
+    assert posted["ok"], posted
+    assert _search(external_services, "postmortem") == [posted["ts"]]
+    assert _search(external_services, "postmortem after:{}".format(_day_after(posted["ts"]))) == []
+    posted_day = datetime.fromtimestamp(float(posted["ts"]), tz=UTC).date()
+    assert _search(external_services, "postmortem after:{}".format(posted_day - timedelta(days=1))) == [posted["ts"]]
+    assert _search(external_services, "postmortem on:{}".format(posted_day)) == [posted["ts"]]
+    on_the_19th = [_shifted(ts) for ts in ("1773950000.000000", "1773900600.000000", "1773900000.000000")]
+    assert _search(external_services, "on:{}".format(_shifted_date("2026-03-19")), sort="timestamp") == on_the_19th
+    assert _search(external_services, "during:{}".format(_shifted_date("2026-03-19"))) == _search(
+        external_services, "on:{}".format(_shifted_date("2026-03-19"))
+    )
+    after_the_19th = [_shifted(ts) for ts in ("1774000300.000000", "1774000000.000000", "1773980000.000000")]
     assert (
-        _slack(external_services, "search.messages", query="is:thread in:<#{}>".format(channel_id))["messages"][
-            "total"
-        ]
-        == 2
+        _search(external_services, "after:{}".format(_shifted_date("2026-03-19")), sort="timestamp") == after_the_19th
     )
-    assert (
-        _slack(external_services, "search.messages", query="in:<#{}|eng-oncall>".format(channel_id))["messages"][
-            "total"
-        ]
-        == 3
+    # yesterday is the day before the trial's present, which the shifted seed's data ends on.
+    assert _search(external_services, "on:yesterday", sort="timestamp") == after_the_19th
+    before_the_19th = _search(external_services, "before:{}".format(_shifted_date("2026-03-19")), sort="timestamp")
+    assert before_the_19th == [_shifted("1769123456.000000"), posted["ts"]]
+    month = _shifted_date("2026-03-19")[:7]
+    assert len(_search(external_services, "during:{}".format(month))) == 6
+    # A date the fake cannot read matches nothing, and is counted as a gap.
+    assert _search(external_services, "latency during:march") == []
+    assert _control(external_services, "health")["unsupported_calls"] == {"slack:search.messages:during": 1}
+
+
+def test_search_sorts_by_score_or_timestamp_and_pages_as_slack_does(
+    external_services: RunningExternalServices,
+) -> None:
+    posted = _slack_post(
+        external_services,
+        "chat.postMessage",
+        channel=_channel_id(external_services, "eng-oncall"),
+        text="latency latency postmortem",
     )
+    seeded = [_shifted(ts) for ts in ("1774000000.000000", "1773950000.000000", "1773900000.000000")]
+
+    # The posted message says latency twice and is the oldest of them, as the box's clock is ten
+    # years behind the shifted seed's.
+    assert _search(external_services, "latency") == [posted["ts"], *seeded]
+    assert _search(external_services, "latency", sort="timestamp") == [*seeded, posted["ts"]]
+    assert _search(external_services, "latency", sort="timestamp", sort_dir="asc") == [posted["ts"], *reversed(seeded)]
+    second = _slack(external_services, "search.messages", query="latency", sort="timestamp", count="3", page="2")
+    assert [match["ts"] for match in second["messages"]["matches"]] == [posted["ts"]]
+    assert second["messages"]["paging"] == {"count": 3, "total": 4, "page": 2, "pages": 2}
+    assert second["messages"]["pagination"] == {
+        "total_count": 4,
+        "page": 2,
+        "per_page": 3,
+        "page_count": 2,
+        "first": 4,
+        "last": 4,
+    }
+    # is:thread is a thread's parent and its replies, as Slack reads it; any other is: is a gap.
+    parent, reply = _shifted("1773900000.000000"), _shifted("1773900600.000000")
+    in_threads = _search(external_services, "is:thread in:#eng-oncall")
+    assert {parent, reply} <= set(in_threads) and _shifted("1774000000.000000") not in in_threads
+    assert _search(external_services, "latency is:starred") == []
+    # An operator the fake does not read matches nothing and is counted.
+    assert _search(external_services, "latency has:link") == []
+    assert _search(external_services, "latency -postmortem") == []
+    assert _search(external_services, "laten*") == []
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "slack:search.messages:is": 1,
+        "slack:search.messages:has": 1,
+        "slack:search.messages:exclude": 1,
+        "slack:search.messages:wildcard": 1,
+    }
+
+
+def test_a_permalink_names_the_workspace_and_a_replys_thread(external_services: RunningExternalServices) -> None:
+    channel_id = _channel_id(external_services, "eng-oncall")
+    parent, reply = _shifted("1773900000.000000"), _shifted("1773900600.000000")
+    im_id = _dms(external_services)["im"]["id"]
+
+    top = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts=parent)
+    threaded = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts=reply)
+    in_im = _slack(external_services, "chat.getPermalink", channel=im_id, message_ts=_shifted("1773950000.000000"))
+
+    base = "https://redwood.slack.com/archives/{}/p".format(channel_id)
+    # A thread's parent names the thread too, as Slack's permalinks do; a message in no thread does not.
+    assert top == {
+        "ok": True,
+        "channel": channel_id,
+        "permalink": "{}{}?thread_ts={}&cid={}".format(base, parent.replace(".", ""), parent, channel_id),
+    }
+    assert threaded["permalink"] == "{}{}?thread_ts={}&cid={}".format(base, reply.replace(".", ""), parent, channel_id)
+    im_parent = _shifted("1773950000.000000")
+    assert in_im["permalink"] == "https://redwood.slack.com/archives/{}/p{}?thread_ts={}&cid={}".format(
+        im_id, im_parent.replace(".", ""), im_parent, im_id
+    )
+    # A search match's permalink names the thread but not the channel, as Slack's do.
+    found = _slack(external_services, "search.messages", query="normalization")["messages"]["matches"]
+    assert [match["permalink"] for match in found] == [
+        "{}{}?thread_ts={}".format(base, reply.replace(".", ""), parent)
+    ]
+    missing = _slack(external_services, "chat.getPermalink", channel=channel_id, message_ts="1773900000.000000")
+    assert missing == {"ok": False, "error": "message_not_found"}
+
+
+def test_an_update_replies_into_a_seed_thread_named_by_the_seeds_ts(
+    external_services: RunningExternalServices,
+) -> None:
+    """A later step names a seed message's ts as the seed writes it, and the launcher shifts both alike."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    parent = _shifted("1773900000.000000")
+
+    added = _add(external_services, "slack", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "slack"))
+    posted = _slack_post(external_services, "chat.postMessage", channel=channel_id, thread_ts=parent, text="Ack.")
+
+    assert added.status_code == 200, added.text
+    olivia = _user_ids(external_services)["olivia_chen"]
+    replies = _slack(external_services, "conversations.replies", channel=channel_id, ts=parent)["messages"]
+    # The parent first, then its replies oldest first: the one posted, which the box's clock stamps
+    # ten years before the shifted seed, the seed's and the update's.
+    assert [message["ts"] for message in replies] == [
+        parent,
+        posted["ts"],
+        _shifted("1773900600.000000"),
+        _shifted("1774050600.000000"),
+    ]
+    assert (replies[0]["reply_count"], replies[0]["thread_ts"]) == (3, parent)
+    # The posted reply is the thread's oldest, so the update's stays its latest.
+    stored = _control(external_services, "state")["slack"]["collections"]["slack.messages"]["items"]
+    assert [m["latest_reply"] for m in stored if m["channel_id"] == channel_id and m["ts"] == parent] == [
+        _shifted("1774050600.000000")
+    ]
+    assert olivia in replies[0]["reply_users"]
+    history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
+    assert _shifted("1774050600.000000") not in [message["ts"] for message in history]
+    # A reply posted in the trial makes a message with none a thread's parent.
+    lone = _shifted("1774000000.000000")
+    _slack_post(external_services, "chat.postMessage", channel=channel_id, thread_ts=lone, text="Tracked in ENG-2.")
+    lone_parent = _slack(external_services, "conversations.replies", channel=channel_id, ts=lone)["messages"][0]
+    assert (lone_parent["ts"], lone_parent["thread_ts"], lone_parent["reply_count"]) == (lone, lone, 1)
 
 
 def test_linear_answers_a_nested_filter_ordered_by_update(external_services: RunningExternalServices) -> None:
@@ -716,9 +1059,9 @@ def test_an_update_lands_on_its_own_service_with_the_seeds_shift(external_servic
         external_services, "linear", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "linear")
     )
 
-    assert (slack_added.status_code, slack_added.json()["added"]) == (200, {"slack_messages": 1})
+    assert (slack_added.status_code, slack_added.json()["added"]) == (200, {"slack_messages": 2})
     # Each service's update is its own request: Slack's left Linear holding what it was seeded with.
-    assert (after_slack["slack"]["messages"], after_slack["linear"]["issues"]) == (5, 2)
+    assert (after_slack["slack"]["messages"], after_slack["linear"]["issues"]) == (9, 2)
     assert (linear_added.status_code, linear_added.json()["added"]) == (
         200,
         {"linear_issues": 1, "linear_comments": 0},
@@ -800,7 +1143,7 @@ def test_the_control_endpoints_are_on_the_control_port_only(external_services: R
     after = _control(external_services, "health")["counts"]
     assert (after["slack"], after["linear"]) == (before["slack"], before["linear"])
     # Unlike a request to the control port, each of these reached a fake and is in its log.
-    assert after["requests"] == {"slack": 4, "linear": 3}
+    assert after["requests"] == {"slack": 4, "linear": 3, "google": 0}
 
 
 def test_a_directory_holding_one_seed_serves_that_service_alone(
@@ -1254,6 +1597,68 @@ def test_the_launcher_takes_each_way_of_naming_a_record_the_checks_accept(
     }
 
 
+def test_the_launcher_takes_each_dm_and_label_change_the_checks_accept(
+    external_services: RunningExternalServices,
+) -> None:
+    """A dm, its messages and a reply into a seeded dm's thread; a label change of a message the
+    same update adds and of a seeded one in another mailbox."""
+    updates: list[tuple[str, dict[str, Any]]] = [
+        (
+            "slack",
+            {
+                "users": [{"name": "olivia_chen"}],
+                "dms": [
+                    {"key": "dm-olivia", "members": ["olivia_chen", "morgan.reyes"]},
+                    {"key": "big-group", "members": ["olivia_chen", "morgan.reyes", "claire", "pagerbot"]},
+                ],
+                "messages": [
+                    {"channel": "dm-olivia", "user": "olivia_chen", "ts": "1774050000.000000", "text": "Hi."},
+                    {"channel": "big-group", "user": "claire", "ts": "1774050100.000000", "text": "All here."},
+                    {
+                        "channel": "dm-claire",
+                        "user": "claire",
+                        "ts": "1774050200.000000",
+                        "thread_ts": "1773950000",
+                        "text": "Thanks.",
+                    },
+                ],
+            },
+        ),
+        (
+            "google",
+            {
+                "messages": [_PLACEABLE_EMAIL],
+                "label_changes": [
+                    {"message": "placeable", "add": ["Vendors", "STARRED"], "remove": ["INBOX"]},
+                    {"message": "thomas-invoice-copy", "remove": ["UNREAD"]},
+                ],
+            },
+        ),
+    ]
+
+    for service_name, update in updates:
+        service = service_named(service_name)
+        known = parse_service_seed(
+            service, external_services_fixture_text(EXTERNAL_SERVICES_SEED_FIXTURE, service_name), "seed"
+        ).known
+        parse_service_update(service, json.dumps(update), known, "update")
+        added = _add(external_services, service_name, json.dumps(update))
+        assert added.status_code == 200, (update, added.text)
+
+    assert _control(external_services, "health")["counts"]["slack"]["dms"] == 4
+    listed = _slack(external_services, "conversations.list", types="im")["channels"]
+    claire = _user_ids(external_services)["claire"]
+    (dm_claire,) = [channel for channel in listed if channel["user"] == claire]
+    assert len(listed) == 2
+    replies = _slack(
+        external_services, "conversations.replies", channel=dm_claire["id"], ts=_shifted("1773950000.000000")
+    )
+    assert len(replies["messages"]) == 3
+    keys = _message_keys(external_services)
+    placed = _gmail(external_services, "me/messages/{}".format(keys["placeable"]), format="minimal")
+    assert sorted(placed["labelIds"]) == sorted(["STARRED", _vendors_id(external_services)])
+
+
 _PLACEABLE_ISSUE = {
     "identifier": "ENG-20",
     "team": "ENG",
@@ -1263,6 +1668,22 @@ _PLACEABLE_ISSUE = {
 }
 _PLACEABLE_COMMENT = {"issue": "ENG-1", "body": "Noted.", "created_at": "2026-03-20T22:00:00.000Z"}
 _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "1774060000.000000", "text": "Noted."}
+_PLACEABLE_EMAIL = {
+    "key": "placeable",
+    "mailbox": "morgan.reyes@redwood.example",
+    "from": "Priya Shah <priya@northwind.example>",
+    "to": "morgan.reyes@redwood.example",
+    "subject": "Noted",
+    "date": "2026-03-20T15:30:00-07:00",
+    "body": "Noted.",
+}
+_PLACEABLE_EVENT = {
+    "key": "placeable-event",
+    "owner": "morgan.reyes@redwood.example",
+    "summary": "Noted",
+    "start": "2026-03-23T09:00:00-07:00",
+    "end": "2026-03-23T09:30:00-07:00",
+}
 
 
 @pytest.mark.parametrize(
@@ -1283,7 +1704,56 @@ _PLACEABLE_MESSAGE = {"channel": "eng-oncall", "user": "claire", "ts": "17740600
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "user": "nobody"}]}),
         ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "thread_ts": "1.000000"}]}),
         ("slack", {"channels": [{"name": "leads", "is_private": True, "members": ["nobody"]}]}),
+        ("slack", {"dms": [{"key": "dm-pager", "members": ["morgan.reyes"]}]}),
+        ("slack", {"dms": [{"key": "dm-pager", "members": ["morgan.reyes", "nobody"]}]}),
+        # No token belongs to either member, so nothing could read the dm.
+        ("slack", {"dms": [{"key": "dm-pager", "members": ["claire", "pagerbot"]}]}),
+        ("slack", {"dms": [{"key": "again", "members": ["claire", "morgan.reyes"]}]}),
+        ("slack", {"dms": [{"key": "dm-claire", "members": ["morgan.reyes", "pagerbot"]}]}),
+        ("slack", {"dms": [{"key": "eng-oncall", "members": ["morgan.reyes", "pagerbot"]}]}),
+        ("slack", {"channels": [{"name": "dm-claire"}]}),
+        ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "channel": "dm-claire", "user": "pagerbot"}]}),
+        ("slack", {"messages": [{**_PLACEABLE_MESSAGE, "ts": "1773899000.000000", "thread_ts": "1773900000.000000"}]}),
+        ("google", {"label_changes": [{"message": "no-such-message", "add": ["STARRED"]}]}),
+        ("google", {"label_changes": [{"message": "invoice-followup", "remove": ["No such label"]}]}),
+        ("google", {"label_changes": [{"message": "thomas-invoice-copy", "add": ["Vendors"]}]}),
+        ("google", {"label_changes": [{"message": "invoice-followup"}]}),
+        ("google", {"label_changes": [{"message": "invoice-followup", "add": ["STARRED"], "remove": ["STARRED"]}]}),
+        # A label change applies after the update's other records, so a message it adds may be named,
+        # and a refused change keeps that message out as well.
+        (
+            "google",
+            {"messages": [_PLACEABLE_EMAIL], "label_changes": [{"message": "placeable", "add": ["No such label"]}]},
+        ),
         ("linear", {"projects": [{"name": "Billing cleanup", "lead": "Nobody Here"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "mailbox": "nobody@redwood.example"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "in_reply_to": "no-such-message"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "labels": ["Vendors", "No such label"]}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "key": "invoice-question"}]}),
+        ("google", {"messages": [{**_PLACEABLE_EMAIL, "date": "2026-03-20T15:30:00"}]}),
+        ("google", {"labels": [{"mailbox": "morgan.reyes@redwood.example", "name": "vendors"}]}),
+        ("google", {"labels": [{"mailbox": "nobody@redwood.example", "name": "Finance"}]}),
+        ("google", {"users": [{"email": "thomas.baird@redwood.example"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "owner": "nobody@redwood.example"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "key": "vendor-sync"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "start": "2026-03-23T09:00:00"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "end": "2026-03-23T08:00:00-07:00"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "start": "2026-03-23", "end": "2026-03-23T10:00:00-07:00"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "start": "2026-03-23", "end": "2026-03-23"}]}),
+        ("google", {"events": [{**_PLACEABLE_EVENT, "attendees": [{"name": "No address"}]}]}),
+        (
+            "google",
+            {"events": [{**_PLACEABLE_EVENT, "attendees": [{"email": "a@x.example", "response_status": "maybe"}]}]},
+        ),
+        (
+            "google",
+            {"events": [{**_PLACEABLE_EVENT, "attendees": [{"email": "a@x.example"}, {"email": "A@x.example"}]}]},
+        ),
+        # Thomas has no Vendors label of his own: a label belongs to one mailbox.
+        (
+            "google",
+            {"messages": [{**_PLACEABLE_EMAIL, "mailbox": "thomas.baird@redwood.example", "labels": ["Vendors"]}]},
+        ),
         # A user or a cycle listed again under what the fake already keeps one by is not added, so
         # the name or number only the second entry gives is no record's to refer to.
         (
@@ -1382,7 +1852,7 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     """The verification flows drive the agent's own app, whose requests look like any other: the
     phase the driver marks is what tells them from the ones the app made while the agent worked."""
     assert _control(external_services, "health")["phases"] == {
-        "agent": {"requests": {"slack": 0, "linear": 0}, "unsupported_calls": {}, "rate_limited": {}}
+        "agent": {"requests": {"slack": 0, "linear": 0, "google": 0}, "unsupported_calls": {}, "rate_limited": {}}
     }
     _slack(external_services, "auth.test")
     httpx2.get("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
@@ -1405,17 +1875,17 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     assert [line["phase"] for line in file_lines] == [line["phase"] for line in log_lines]
     health = _control(external_services, "health")
     # The totals keep their shape, and each phase's counts sit beside them.
-    assert health["counts"]["requests"] == {"slack": 4, "linear": 1}
+    assert health["counts"]["requests"] == {"slack": 4, "linear": 1, "google": 0}
     assert health["unsupported_calls"] == {"slack:admin.users.list": 2}
     assert health["phase"] == "verification"
     assert health["phases"] == {
         "agent": {
-            "requests": {"slack": 2, "linear": 0},
+            "requests": {"slack": 2, "linear": 0, "google": 0},
             "unsupported_calls": {"slack:admin.users.list": 1},
             "rate_limited": {},
         },
         "verification": {
-            "requests": {"slack": 2, "linear": 1},
+            "requests": {"slack": 2, "linear": 1, "google": 0},
             "unsupported_calls": {"slack:admin.users.list": 1},
             "rate_limited": {},
         },
@@ -1426,7 +1896,11 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     # A later step's conversation is the agent's again, and adds to the agent's counts.
     _mark_phase(external_services, {"name": "agent"})
     _slack(external_services, "auth.test")
-    assert _control(external_services, "health")["phases"]["agent"]["requests"] == {"slack": 3, "linear": 0}
+    assert _control(external_services, "health")["phases"]["agent"]["requests"] == {
+        "slack": 3,
+        "linear": 0,
+        "google": 0,
+    }
     assert _control(external_services, "log")[-1]["phase"] == "agent"
 
 
@@ -1451,7 +1925,7 @@ def test_a_phase_named_like_an_object_key_is_counted_like_any_other(
     assert answered["ok"] is True
     phases = _control(external_services, "health")["phases"]
     assert phases["constructor"] == {
-        "requests": {"slack": 1, "linear": 0},
+        "requests": {"slack": 1, "linear": 0, "google": 0},
         "unsupported_calls": {},
         "rate_limited": {},
     }
@@ -1463,7 +1937,7 @@ def test_the_state_dump_redacts_every_token(external_services: RunningExternalSe
 
     assert _SLACK_TOKEN not in dump_text and _LINEAR_TOKEN not in dump_text
     assert "[redacted]" in dump_text
-    assert dump["counts"]["slack"] == {"users": 3, "channels": 2, "messages": 4}
+    assert dump["counts"]["slack"] == {"users": 3, "channels": 2, "dms": 2, "messages": 7}
     assert dump["counts"]["linear"]["issues"] == len(
         external_services_document(EXTERNAL_SERVICES_SEED_FIXTURE, "linear")["issues"]
     )
@@ -1498,6 +1972,39 @@ def test_no_answer_says_what_is_serving_it(external_services: RunningExternalSer
         ),
         httpx2.get("{}/_control/health".format(external_services.slack_url), headers=_SLACK_HEADERS),
         httpx2.get("{}/_control/state".format(external_services.linear_url), headers={"Authorization": _LINEAR_TOKEN}),
+        _gmail_get(external_services, "me/settings/vacation"),
+        _gmail_get(external_services, "me/messages/0000000000000000"),
+        _gmail_get(external_services, "me/profile", token=None),
+        _gmail_get(external_services, "me/profile", token="ya29.other"),
+        _gmail_get(external_services, "thomas.baird@redwood.example/profile"),
+        _gmail_get(external_services, "me/messages", pageToken="x"),
+        _gmail_get(external_services, "me/messages", q="nothing-says-this"),
+        _gmail_get(external_services, "me/threads", q="invoice"),
+        _gmail_get(external_services, "me/messages/8b5677a1c796501d", format="raw"),
+        _gmail_get(external_services, "me/threads/8b5677a1c796501d"),
+        _gmail_get(external_services, "me/history", startHistoryId="1"),
+        _gmail_get(external_services, "me/labels"),
+        _gmail_get(external_services, "me/settings/sendAs"),
+        _gmail_get(external_services, "me/drafts"),
+        _calendar_get(external_services, "users/me/calendarList"),
+        _calendar_get(external_services, "calendars/primary"),
+        _calendar_get(external_services, "calendars/primary/events", maxResults="1"),
+        _calendar_get(external_services, "calendars/primary/events", orderBy="startTime"),
+        _calendar_get(external_services, "calendars/primary/events", timeMin="yesterday"),
+        _calendar_get(external_services, "calendars/primary/events", pageToken="x"),
+        _calendar_get(external_services, "calendars/primary/events/0000000000"),
+        _calendar_get(external_services, "calendars/thomas.baird@redwood.example/events"),
+        _calendar_get(external_services, "colors"),
+        httpx2.get("{}/".format(external_services.google_url)),
+        httpx2.get("{}/o/oauth2/v2/auth".format(external_services.google_url)),
+        httpx2.get("{}/oauth2/v2/userinfo".format(external_services.google_url)),
+        _userinfo(external_services),
+        _userinfo(external_services, token=None),
+        _userinfo(external_services, token="ya29.other"),
+        httpx2.get(
+            "{}/gmail/v1/users/me/profile".format(external_services.google_url),
+            headers={"X-Forwarded-Host": "accounts.googleapis.com"},
+        ),
     ]
 
     for answer in answers:
@@ -1759,6 +2266,8 @@ def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: Run
     assert _control(external_services, "log")[-1]["rate_limited"] == "linear:complexity"
 
 
+# 2,500 requests take about 6 seconds alone, and longer beside a parallel suite.
+@pytest.mark.timeout(30)
 def test_linear_refuses_a_user_past_its_hourly_requests(external_services: RunningExternalServices) -> None:
     answers, elapsed_seconds = _linear_until_refused(external_services, "{ viewer { id } }", 3000)
     refused = answers[-1]
@@ -1771,3 +2280,1069 @@ def test_linear_refuses_a_user_past_its_hourly_requests(external_services: Runni
     # One request drains away every 1.44 seconds.
     assert 1 <= int(refused.headers["retry-after"]) <= 2
     assert _control(external_services, "health")["rate_limited"] == {"linear:requests": 1}
+
+
+def test_the_google_store_holds_the_seed_and_nothing_of_the_emulators_own(
+    external_services: RunningExternalServices,
+) -> None:
+    profile = _gmail(external_services, "me/profile")
+    labels = _gmail(external_services, "me/labels")["labels"]
+    dump = _control(external_services, "state")["google"]["collections"]
+
+    assert profile == {"emailAddress": _MORGAN, "messagesTotal": 4, "threadsTotal": 2, "historyId": "1000005"}
+    assert sorted(user["email"] for user in dump["google.users"]["items"]) == [
+        _MORGAN,
+        "thomas.baird@redwood.example",
+    ]
+    # No file or default mailbox of the package's own, one primary calendar per account, the seed's
+    # events, and no record names the package.
+    for collection in ("google.drive_items", "google.drafts"):
+        assert dump.get(collection, {"items": []})["items"] == [], collection
+    assert sorted(calendar["google_id"] for calendar in dump["google.calendars"]["items"]) == [
+        _MORGAN,
+        "thomas.baird@redwood.example",
+    ]
+    assert sorted(event["seed_key"] for event in dump["google.calendar_events"]["items"]) == [
+        "finance-review",
+        "offsite",
+        "thomas-planning",
+        "vendor-sync",
+    ]
+    assert "testuser" not in json.dumps(dump) and "emulate" not in json.dumps(dump).lower()
+    assert [label["name"] for label in labels if label["type"] == "user"] == ["Vendors"]
+    assert {label["id"] for label in labels} >= {"INBOX", "SENT", "UNREAD", "STARRED", "IMPORTANT"}
+    # Every record is dated from the seed's messages, never by the box's clock.
+    stamps = [
+        datetime.fromisoformat(item[key].replace("Z", "+00:00")).timestamp()
+        for collection in dump.values()
+        for item in collection["items"]
+        for key in ("created_at", "updated_at")
+    ]
+    assert stamps
+    for stamp in stamps:
+        assert abs(stamp - time.time()) > 24 * 60 * 60, datetime.fromtimestamp(stamp).isoformat()
+
+
+def test_a_gmail_message_keeps_its_seeds_date_and_offset_shifted_to_the_trial(
+    external_services: RunningExternalServices,
+) -> None:
+    keys = _message_keys(external_services)
+
+    question = _gmail(external_services, "me/messages/{}".format(keys["invoice-question"]))
+    reply = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="metadata")
+
+    # 200 days after 2026-03-16, in the offset each sender's clock kept.
+    assert _headers(question)["Date"] == _shifted_date_header("2026-03-16T09:15:00-07:00")
+    assert _headers(reply)["Date"] == _shifted_date_header("2026-03-16T17:40:00+01:00")
+    assert question["internalDate"] == str(_shifted_ms("2026-03-16T09:15:00-07:00"))
+    assert reply["internalDate"] == str(_shifted_ms("2026-03-16T17:40:00+01:00"))
+    for message in (question, reply):
+        assert abs(int(message["internalDate"]) / 1000 - time.time()) > 24 * 60 * 60
+
+
+def test_a_gmail_thread_holds_its_replies_with_their_headers_and_derived_labels(
+    external_services: RunningExternalServices,
+) -> None:
+    keys = _message_keys(external_services)
+    vendors = next(
+        label["id"] for label in _gmail(external_services, "me/labels")["labels"] if label["name"] == "Vendors"
+    )
+
+    thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]))
+    raw = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="raw")
+
+    # A thread takes the id of its first message, and holds its replies oldest first.
+    assert thread["id"] == keys["invoice-question"]
+    messages = thread["messages"]
+    assert [message["id"] for message in messages] == [
+        keys["invoice-question"],
+        keys["invoice-reply"],
+        keys["invoice-followup"],
+    ]
+    # Received mail is in the INBOX and sent mail is SENT; the rest is what the seed states.
+    assert [message["labelIds"] for message in messages] == [
+        ["INBOX", vendors, "IMPORTANT"],
+        ["SENT"],
+        ["INBOX", vendors, "UNREAD", "STARRED"],
+    ]
+    question_headers, reply_headers, followup_headers = (_headers(message) for message in messages)
+    assert question_headers["Message-ID"] == "<4411-question@northwind.example>"
+    assert reply_headers["In-Reply-To"] == "<4411-question@northwind.example>"
+    assert reply_headers["Message-ID"].endswith("@redwood.example>")
+    assert followup_headers["In-Reply-To"] == reply_headers["Message-ID"]
+    assert followup_headers["References"] == "<4411-question@northwind.example> {}".format(reply_headers["Message-ID"])
+    # A message with HTML serves both its parts, and its raw form is a well-formed MIME message.
+    assert [part["mimeType"] for part in messages[1]["payload"]["parts"]] == ["text/plain", "text/html"]
+    decoded = base64.urlsafe_b64decode(raw["raw"] + "==").decode()
+    parsed = email.message_from_string(decoded)
+    assert (parsed["Date"], parsed.get_content_type()) == (
+        _shifted_date_header("2026-03-16T17:40:00+01:00"),
+        "multipart/alternative",
+    )
+    assert [part.get_payload() for part in parsed.walk() if not part.is_multipart()] == [
+        "Checking with finance and will get back to you.",
+        "<p>Checking with <b>finance</b> and will get back to you.</p>",
+    ]
+    # Ids and Message-IDs are derived from the seed: the same in every trial.
+    assert keys["invoice-question"] == "8b5677a1c796501d"
+
+
+def test_a_gmail_message_shows_the_mime_headers_of_its_raw_form(external_services: RunningExternalServices) -> None:
+    keys = _message_keys(external_services)
+
+    question = _gmail(external_services, "me/messages/{}".format(keys["invoice-question"]))
+    reply = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]))
+    reply_metadata = _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="metadata")
+    named = _gmail(
+        external_services,
+        "me/messages/{}".format(keys["invoice-reply"]),
+        format="metadata",
+        metadataHeaders="content-type",
+    )
+    thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]), format="metadata")
+    reply_raw = email.message_from_bytes(
+        base64.urlsafe_b64decode(
+            _gmail(external_services, "me/messages/{}".format(keys["invoice-reply"]), format="raw")["raw"] + "=="
+        )
+    )
+
+    # A single-part message, in the order Gmail serves its headers.
+    assert [header["name"] for header in question["payload"]["headers"]] == [
+        "MIME-Version",
+        "Date",
+        "Message-ID",
+        "Subject",
+        "From",
+        "To",
+        "Cc",
+        "Content-Type",
+        "Content-Transfer-Encoding",
+    ]
+    assert (_headers(question)["MIME-Version"], _headers(question)["Content-Type"]) == (
+        "1.0",
+        'text/plain; charset="UTF-8"',
+    )
+    # A message with HTML is multipart/alternative, on the boundary its raw form uses, and each part
+    # names its own type.
+    assert [header["name"] for header in reply["payload"]["headers"]] == [
+        "MIME-Version",
+        "Date",
+        "References",
+        "In-Reply-To",
+        "Message-ID",
+        "Subject",
+        "From",
+        "To",
+        "Content-Type",
+    ]
+    content_type = 'multipart/alternative; boundary="{}"'.format(reply_raw.get_boundary())
+    assert (reply["payload"]["mimeType"], _headers(reply)["Content-Type"]) == ("multipart/alternative", content_type)
+    assert _headers(reply)["Content-Type"] == reply_raw["Content-Type"]
+    assert [part["headers"] for part in reply["payload"]["parts"]] == [
+        [
+            {"name": "Content-Type", "value": 'text/{}; charset="UTF-8"'.format(subtype)},
+            {"name": "Content-Transfer-Encoding", "value": "8bit"},
+        ]
+        for subtype in ("plain", "html")
+    ]
+    assert [dict(part.items()) for part in reply_raw.walk() if not part.is_multipart()] == [
+        {header["name"]: header["value"] for header in part["headers"]} for part in reply["payload"]["parts"]
+    ]
+    # metadata shows the same headers, or those it names whatever their case.
+    assert (reply_metadata["payload"]["mimeType"], reply_metadata["payload"]["headers"]) == (
+        "multipart/alternative",
+        reply["payload"]["headers"],
+    )
+    assert named["payload"]["headers"] == [{"name": "Content-Type", "value": content_type}]
+    assert [message["payload"]["headers"][0] for message in thread["messages"]] == [
+        {"name": "MIME-Version", "value": "1.0"}
+    ] * 3
+
+
+def test_a_gmail_label_list_carries_no_counts_and_a_label_get_does(
+    external_services: RunningExternalServices,
+) -> None:
+    labels = _gmail(external_services, "me/labels")["labels"]
+    inbox = _gmail(external_services, "me/labels/INBOX")
+
+    for label in labels:
+        assert set(label) <= {"id", "name", "messageListVisibility", "labelListVisibility", "type", "color"}, label
+        assert {"id", "name", "type"} <= set(label), label
+    hidden = {"messageListVisibility": "hide", "labelListVisibility": "labelHide"}
+    visibility = {
+        label["id"]: {key: value for key, value in label.items() if key.endswith("Visibility")}
+        for label in labels
+        if label["type"] == "system"
+    }
+    assert {label: visibility[label] for label in ("INBOX", "SENT", "STARRED", "UNREAD", "IMPORTANT", "SPAM")} == {
+        "INBOX": {},
+        "SENT": {},
+        "STARRED": {},
+        "UNREAD": {},
+        "IMPORTANT": hidden,
+        "SPAM": hidden,
+    }
+    assert inbox == {
+        "id": "INBOX",
+        "name": "INBOX",
+        "type": "system",
+        "messagesTotal": 2,
+        "messagesUnread": 1,
+        "threadsTotal": 1,
+        "threadsUnread": 1,
+    }
+
+
+def test_gmail_lists_and_searches_with_the_operators_it_supports(external_services: RunningExternalServices) -> None:
+    keys = _message_keys(external_services)
+    question, reply, followup, newsletter = (
+        keys[key] for key in ("invoice-question", "invoice-reply", "invoice-followup", "newsletter")
+    )
+
+    # Newest first; an archived message is listed, and only the mailbox's own.
+    assert _listed_ids(external_services) == [followup, reply, question, newsletter]
+    assert _listed_ids(external_services, labelIds="INBOX") == [followup, question]
+    assert _listed_ids(external_services, q="from:me") == [reply]
+    assert _listed_ids(external_services, q="label:Vendors is:unread") == [followup]
+    assert _listed_ids(external_services, q='"corrected invoice"') == [followup]
+    # An operator's quoted value is a phrase, matched whatever its case.
+    for query in ('subject:"March invoice"', 'subject:"MARCH INVOICE"', '(subject:"march invoice")'):
+        assert _listed_ids(external_services, q=query) == [followup, reply, question], query
+    assert _listed_ids(external_services, q='subject:"invoice March"') == []
+    assert _listed_ids(external_services, q='from:"Priya Shah" label:"Vendors"') == [followup, question]
+    assert _listed_ids(external_services, q='subject:"March invoice" -label:"Vendors"') == [reply]
+    # A date is midnight Pacific time, as Gmail reads it, and newer_than counts from the trial's present.
+    day = _shifted_date("2026-03-16")
+    next_day = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    assert _listed_ids(
+        external_services, q="after:{} before:{}".format(day.replace("-", "/"), next_day.replace("-", "/"))
+    ) == [reply, question]
+    assert _listed_ids(external_services, q="newer_than:3d") == [followup]
+    assert _listed_ids(external_services, "threads") == [question, newsletter]
+    # Gmail leaves an empty list out, and refuses a malformed page token.
+    assert _gmail(external_services, "me/messages", q="nothing-says-this") == {"resultSizeEstimate": 0}
+    assert _gmail(external_services, "me/threads", q="nothing-says-this") == {"resultSizeEstimate": 0}
+    paged = _gmail(external_services, "me/messages", maxResults="2")
+    assert (len(paged["messages"]), _listed_ids(external_services, pageToken=paged["nextPageToken"])) == (
+        2,
+        [question, newsletter],
+    )
+    bad_token = _gmail_get(external_services, "me/messages", pageToken="not-a-token")
+    assert (bad_token.status_code, bad_token.json()["error"]["status"]) == (400, "INVALID_ARGUMENT")
+    # A metadata header is matched whatever its case, as Gmail matches it.
+    metadata = _gmail(
+        external_services, "me/messages/{}".format(question), format="metadata", metadataHeaders="subject"
+    )
+    assert metadata["payload"]["headers"] == [{"name": "Subject", "value": "March invoice question"}]
+    # A word with a colon that names no Gmail operator is a word to Gmail, and no gap of the fake's.
+    assert _gmail(external_services, "me/messages", q="see:(notes) constructor:x https://northwind.example") == {
+        "resultSizeEstimate": 0
+    }
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_gmail_in_anywhere_searches_spam_and_trash_too(external_services: RunningExternalServices) -> None:
+    update = {
+        "messages": [
+            {
+                "key": key,
+                "mailbox": _MORGAN,
+                "from": "Promo <deals@promo.example>",
+                "to": _MORGAN,
+                "subject": "Invoice {} offer".format(label.lower()),
+                "date": date,
+                "body": "An offer.",
+                "labels": [label],
+            }
+            for key, label, date in (
+                ("spam-offer", "SPAM", "2026-03-17T10:00:00-07:00"),
+                ("trashed-offer", "TRASH", "2026-03-18T10:00:00-07:00"),
+            )
+        ]
+    }
+    added = _add(external_services, "google", json.dumps(update))
+    assert added.status_code == 200, added.text
+    keys = _message_keys(external_services)
+    question, reply, followup, newsletter, spam, trashed = (
+        keys[key]
+        for key in (
+            "invoice-question",
+            "invoice-reply",
+            "invoice-followup",
+            "newsletter",
+            "spam-offer",
+            "trashed-offer",
+        )
+    )
+
+    # Without it a search leaves SPAM and TRASH out; with it, it is a search of all mail, archived included.
+    assert _listed_ids(external_services, q="offer") == []
+    assert _listed_ids(external_services, q="in:anywhere") == [followup, trashed, spam, reply, question, newsletter]
+    assert _listed_ids(external_services, q="in:anywhere") == _listed_ids(external_services, includeSpamTrash="true")
+    assert _listed_ids(external_services, q="IN:Anywhere offer") == [trashed, spam]
+    assert _listed_ids(external_services, q="in:anywhere offer", includeSpamTrash="false") == [trashed, spam]
+    assert _listed_ids(external_services, "threads", q="in:anywhere offer") == [trashed, spam]
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+    # in:archive is still answered as the package answers it, and counted.
+    _gmail_get(external_services, "me/messages", q="in:archive")
+    assert _control(external_services, "health")["unsupported_calls"] == {"google:gmail:q:in:archive": 1}
+
+
+def test_gmail_reads_a_get_format_whatever_its_case(external_services: RunningExternalServices) -> None:
+    keys = _message_keys(external_services)
+
+    message, thread = "me/messages/{}".format(keys["invoice-reply"]), "me/threads/{}".format(keys["invoice-question"])
+    gets = [(message, name) for name in ("raw", "minimal", "metadata", "full")]
+    gets += [(thread, name) for name in ("minimal", "metadata", "full")]
+    for path, format_name in gets:
+        upper = _gmail(external_services, path, format=format_name.upper())
+        assert upper == _gmail(external_services, path, format=format_name), (path, format_name)
+    raw = _gmail(external_services, message, format="RAW")
+    assert "raw" in raw and "payload" not in raw
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_a_gmail_get_costs_what_its_format_costs_whatever_its_case(
+    external_services: RunningExternalServices,
+) -> None:
+    message_id = _message_keys(external_services)["invoice-question"]
+    # A RAW get costs 60 of a user's 6,000 units a minute, as raw does: 100 fit, and the 101st does not.
+    burst = [
+        _gmail_get(external_services, "me/messages/{}".format(message_id), format="RAW").status_code
+        for _ in range(101)
+    ]
+
+    assert burst == [200] * 100 + [403]
+
+
+def test_a_gmail_search_operator_the_fake_answers_wrongly_is_counted(
+    external_services: RunningExternalServices,
+) -> None:
+    for query in ("invoice OR newsletter", "-from:priya", "cc:thomas", "{invoice newsletter}", "older_than:1y"):
+        assert _gmail_get(external_services, "me/messages", q=query).status_code == 200
+    # Gmail reads `or` and `and` in anything but capitals as words; AND is its implicit AND.
+    for query in ("invoice or newsletter", "invoice Or newsletter", "and", "invoice AND question"):
+        assert _gmail_get(external_services, "me/messages", q=query).status_code == 200
+    _gmail_get(external_services, "me/threads", q="subject:(invoice question) has:drive")
+
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:gmail:q:OR": 1,
+        "google:gmail:q:or-word": 2,
+        "google:gmail:q:and-word": 1,
+        "google:gmail:q:-": 1,
+        "google:gmail:q:cc": 1,
+        "google:gmail:q:{}": 1,
+        "google:gmail:q:older_than": 1,
+        "google:gmail:q:subject:()": 1,
+        "google:gmail:q:has": 1,
+    }
+    assert [line["unsupported"] for line in _control(external_services, "log")][-1] == "google:gmail:q:subject:()"
+
+
+def test_a_google_path_or_host_the_fake_does_not_serve_is_googles_html_not_found_and_counted(
+    external_services: RunningExternalServices,
+) -> None:
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}
+    vacation = _gmail_get(external_services, "me/settings/vacation")
+    vacation_again = _gmail_get(external_services, _MORGAN + "/settings/vacation")
+    no_such_setting = _gmail_get(external_services, "me/settings/doesnotexist")
+    no_such_method = _gmail_get(external_services, "me/nothinghere")
+    drive = httpx2.get(
+        "{}/drive/v3/files".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    oauth = httpx2.get(
+        "{}/o/oauth2/v2/auth".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    other_host = httpx2.get(
+        "{}/gmail/v1/users/me/profile".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "people.googleapis.com"},
+    )
+    # Gmail is served on both of its hosts.
+    on_www = httpx2.get(
+        "{}/gmail/v1/users/me/profile".format(external_services.google_url),
+        headers={**headers, "X-Forwarded-Host": "www.googleapis.com"},
+    )
+    missing_message = _gmail_get(external_services, "me/messages/0000000000000000")
+
+    # Google's frontends answer a path no API method takes with their HTML page, naming the path.
+    for answer in (vacation, vacation_again, no_such_setting, no_such_method, drive, oauth, other_host):
+        assert answer.status_code == 404
+        assert answer.headers["content-type"] == "text/html; charset=UTF-8"
+        assert answer.text.startswith("<!DOCTYPE html>")
+        assert "<title>Error 404 (Not Found)!!1</title>" in answer.text
+        assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
+    assert (on_www.status_code, on_www.json()["emailAddress"]) == (200, _MORGAN)
+    # A message that is not there is the caller's mistake, as it is against Gmail, and not counted.
+    assert (missing_message.status_code, missing_message.json()) == (
+        404,
+        {
+            "error": {
+                "code": 404,
+                "message": "Requested entity was not found.",
+                "errors": [{"message": "Requested entity was not found.", "domain": "global", "reason": "notFound"}],
+                "status": "NOT_FOUND",
+            }
+        },
+    )
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:gmail:GET users/{userId}/settings/vacation": 2,
+        "google:gmail:GET users/{userId}/settings/doesnotexist": 1,
+        "google:gmail:GET users/{userId}/nothinghere": 1,
+        "google:path:/drive/v3": 1,
+        "google:path:/o/oauth2": 1,
+        "google:host:people.googleapis.com": 1,
+    }
+    # The access log reads an answer that is not JSON as neither ok nor an error, and keeps its gap.
+    vacation_line = _control(external_services, "log")[0]
+    assert (vacation_line["status"], vacation_line["ok"], vacation_line["error"], vacation_line["result_count"]) == (
+        404,
+        None,
+        None,
+        None,
+    )
+    assert vacation_line["unsupported"] == "google:gmail:GET users/{userId}/settings/vacation"
+
+
+def test_userinfo_answers_each_tokens_own_account_as_openid_connect_does(
+    external_services: RunningExternalServices,
+) -> None:
+    users = _control(external_services, "state")["google"]["collections"]["google.users"]["items"]
+    account_ids = {user["email"]: user["uid"] for user in users}
+
+    morgan = _userinfo(external_services)
+    thomas = _userinfo(external_services, token=_THOMAS_GOOGLE_TOKEN)
+    anonymous = _userinfo(external_services, token=None)
+    unknown = _userinfo(external_services, token="ya29.other")
+    # Only openidconnect's v1 path is served: Google's other userinfo paths are not.
+    for path in ("oauth2/v2/userinfo", "oauth2/v3/userinfo"):
+        other = httpx2.get(
+            "{}/{}".format(external_services.google_url, path),
+            headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"},
+        )
+        assert other.status_code == 404, path
+
+    assert (morgan.status_code, morgan.json()) == (
+        200,
+        {
+            "sub": account_ids[_MORGAN],
+            "name": "Morgan Reyes",
+            "given_name": "Morgan",
+            "family_name": "Reyes",
+            "email": _MORGAN,
+            "email_verified": True,
+        },
+    )
+    assert len(account_ids[_MORGAN]) == 21 and account_ids[_MORGAN].isdigit()
+    assert (thomas.status_code, thomas.json()["sub"], thomas.json()["email"]) == (
+        200,
+        account_ids["thomas.baird@redwood.example"],
+        "thomas.baird@redwood.example",
+    )
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:path:/oauth2/v2": 1,
+        "google:path:/oauth2/v3": 1,
+    }
+
+
+def test_userinfo_names_an_account_only_when_its_seed_does(
+    unnamed_google_external_services: RunningExternalServices,
+) -> None:
+    answer = _userinfo(unnamed_google_external_services)
+
+    assert answer.status_code == 200, answer.text
+    assert set(answer.json()) == {"sub", "email", "email_verified"}
+
+
+def test_a_google_token_reads_only_its_own_mailbox(external_services: RunningExternalServices) -> None:
+    thomas_keys = _message_keys(external_services, "thomas.baird@redwood.example")
+    morgan_keys = _message_keys(external_services)
+
+    thomas = _gmail(external_services, "me/profile", token=_THOMAS_GOOGLE_TOKEN)
+    thomas_listed = _gmail(external_services, "me/messages", token=_THOMAS_GOOGLE_TOKEN)
+    across = _gmail_get(external_services, "me/messages/{}".format(thomas_keys["thomas-invoice-copy"]))
+    delegated = _gmail_get(external_services, "thomas.baird@redwood.example/messages")
+    anonymous = _gmail_get(external_services, "me/profile", token=None)
+    unknown = _gmail_get(external_services, "me/profile", token="ya29.other")
+
+    assert (thomas["emailAddress"], thomas["messagesTotal"]) == ("thomas.baird@redwood.example", 1)
+    assert [entry["id"] for entry in thomas_listed["messages"]] == [thomas_keys["thomas-invoice-copy"]]
+    # Thomas's copy of the question is cc'd mail in his INBOX, a message of his own apart from Morgan's.
+    assert thomas_keys["thomas-invoice-copy"] not in morgan_keys.values()
+    assert across.status_code == 404
+    # Gmail names the caller's own address, not the mailbox it asked for.
+    assert (delegated.status_code, delegated.json()) == (
+        403,
+        {
+            "error": {
+                "code": 403,
+                "message": "Delegation denied for {}".format(_MORGAN),
+                "errors": [
+                    {"message": "Delegation denied for {}".format(_MORGAN), "domain": "global", "reason": "forbidden"}
+                ],
+                "status": "PERMISSION_DENIED",
+            }
+        },
+    )
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert (unknown.status_code, unknown.json()["error"]["errors"][0]["reason"]) == (401, "authError")
+
+
+def _vendors_id(services: RunningExternalServices) -> str:
+    return next(label["id"] for label in _gmail(services, "me/labels")["labels"] if label["name"] == "Vendors")
+
+
+def test_a_gmail_update_lands_in_its_thread_as_newer_history(external_services: RunningExternalServices) -> None:
+    before = _gmail(external_services, "me/profile")
+
+    added = _add(
+        external_services, "google", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "google")
+    )
+    after = _gmail(external_services, "me/profile")
+    keys = _message_keys(external_services)
+    history = _gmail(external_services, "me/history", startHistoryId=before["historyId"])
+
+    assert (added.status_code, added.json()["added"]) == (
+        200,
+        {
+            "google_users": 1,
+            "gmail_labels": 1,
+            "gmail_messages": 1,
+            "gmail_label_changes": 1,
+            "calendar_calendars": 1,
+            "calendar_events": 1,
+        },
+    )
+    assert (after["messagesTotal"], after["threadsTotal"]) == (5, 2)
+    assert int(after["historyId"]) > int(before["historyId"])
+    # The new message, then the label change of the seeded one, which the update lists after it.
+    finance = next(
+        label["id"] for label in _gmail(external_services, "me/labels")["labels"] if label["name"] == "Finance"
+    )
+    added_entry, changed_entry = history["history"]
+    assert [entry["message"]["id"] for entry in added_entry["messagesAdded"]] == [keys["corrected-invoice"]]
+    assert int(changed_entry["id"]) > int(added_entry["id"]) == int(after["historyId"]) - 1
+    assert [(entry["message"]["id"], entry["labelIds"]) for entry in changed_entry["labelsAdded"]] == [
+        (keys["invoice-followup"], [finance])
+    ]
+    assert [(entry["message"]["id"], sorted(entry["labelIds"])) for entry in changed_entry["labelsRemoved"]] == [
+        (keys["invoice-followup"], ["INBOX", "UNREAD"])
+    ]
+    followup = _gmail(external_services, "me/messages/{}".format(keys["invoice-followup"]), format="minimal")
+    assert sorted(followup["labelIds"]) == sorted(["STARRED", finance, _vendors_id(external_services)])
+    assert followup["historyId"] == changed_entry["id"] == after["historyId"]
+    thread = _gmail(external_services, "me/threads/{}".format(keys["invoice-question"]), format="minimal")
+    assert thread["messages"][-1]["id"] == keys["corrected-invoice"]
+    assert thread["messages"][-1]["internalDate"] == str(_shifted_ms("2026-03-20T15:30:00-07:00"))
+    assert _listed_ids(external_services, q="label:Finance") == [keys["corrected-invoice"], keys["invoice-followup"]]
+    assert keys["invoice-followup"] not in _listed_ids(external_services, q="is:unread")
+    users = _control(external_services, "state")["google"]["collections"]["google.users"]["items"]
+    assert "olivia.chen@redwood.example" in {user["email"] for user in users}
+
+
+def test_a_burst_past_gmails_per_user_quota_is_refused_as_gmail_refuses_it(
+    external_services: RunningExternalServices,
+) -> None:
+    message_id = _message_keys(external_services)["invoice-question"]
+    # A full get costs 60 of a user's 6,000 units a minute: 100 fit, and the 101st does not.
+    with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
+        burst = [
+            client.get("{}/gmail/v1/users/me/messages/{}".format(external_services.google_url, message_id))
+            for _ in range(101)
+        ]
+    # The quota is each user's own, and a cheaper call does not fit either once it is spent.
+    cheap = _gmail_get(external_services, "me/profile")
+    thomas = _gmail_get(external_services, "me/profile", token=_THOMAS_GOOGLE_TOKEN)
+
+    assert [answer.status_code for answer in burst[:100]] == [200] * 100
+    refused = burst[100]
+    assert refused.status_code == 403
+    assert refused.json() == {
+        "error": {
+            "code": 403,
+            "message": "User Rate Limit Exceeded",
+            "errors": [
+                {"message": "User Rate Limit Exceeded", "domain": "usageLimits", "reason": "userRateLimitExceeded"}
+            ],
+            "status": "PERMISSION_DENIED",
+        }
+    }
+    assert 1 <= int(refused.headers["retry-after"]) <= 60
+    # Gmail documents no rate limit headers, so an admitted answer carries none.
+    assert not {name for name in burst[0].headers if name.startswith(("x-ratelimit", "retry-after"))}
+    assert (cheap.status_code, thomas.status_code) == (403, 200)
+    assert _control(external_services, "health")["rate_limited"] == {"google:gmail_per_user": 2}
+
+
+_THOMAS = "thomas.baird@redwood.example"
+
+
+def _calendar(services: RunningExternalServices, path: str, token: str = _GOOGLE_TOKEN, **params: str) -> Any:
+    answer = _calendar_get(services, path, token=token, **params)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _event_ids(services: RunningExternalServices) -> dict[str, str]:
+    """Each seeded event's id by its key, as the state dump holds them."""
+    items = _control(services, "state")["google"]["collections"]["google.calendar_events"]["items"]
+    return {item["seed_key"]: item["google_id"] for item in items if item["seed_key"]}
+
+
+def _listed_summaries(services: RunningExternalServices, token: str = _GOOGLE_TOKEN, **params: str) -> list[str]:
+    return [
+        event["summary"] for event in _calendar(services, "calendars/primary/events", token=token, **params)["items"]
+    ]
+
+
+def _shifted_date_time(stamp: str) -> str:
+    """A seed's instant as Calendar serves an event's dateTime under the test's shift: in the offset
+    it was written in, to the second."""
+    moved = datetime.fromisoformat(stamp) + timedelta(seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS)
+    return moved.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _calendar_error(code: int, message: str, reason: str, **extra: str) -> dict[str, Any]:
+    return {
+        "error": {
+            "errors": [{"domain": "global", "reason": reason, "message": message, **extra}],
+            "code": code,
+            "message": message,
+        }
+    }
+
+
+def test_a_calendar_list_and_a_calendar_name_the_account_its_token_belongs_to(
+    external_services: RunningExternalServices,
+) -> None:
+    listed = _calendar(external_services, "users/me/calendarList")
+    by_primary = _calendar(external_services, "users/me/calendarList/primary")
+    by_address = _calendar(external_services, "users/me/calendarList/{}".format(_MORGAN))
+    calendar = _calendar(external_services, "calendars/primary")
+    thomas = _calendar(external_services, "calendars/primary", token=_THOMAS_GOOGLE_TOKEN)
+    probe = next(
+        credential.probe for credential in service_named("google").credentials if credential.name == "google-calendar"
+    )
+
+    assert (listed["kind"], [entry["id"] for entry in listed["items"]]) == ("calendar#calendarList", [_MORGAN])
+    (entry,) = listed["items"]
+    assert entry == by_primary == by_address
+    assert {key: entry[key] for key in ("kind", "summary", "timeZone", "accessRole", "primary", "selected")} == {
+        "kind": "calendar#calendarListEntry",
+        "summary": _MORGAN,
+        # Most of Morgan's events are written at -07:00, so Morgan's calendar keeps that zone.
+        "timeZone": "Etc/GMT+7",
+        "accessRole": "owner",
+        "primary": True,
+        "selected": True,
+    }
+    assert entry["defaultReminders"] == [{"method": "popup", "minutes": 10}]
+    assert {key: calendar[key] for key in ("kind", "id", "summary", "timeZone")} == {
+        "kind": "calendar#calendar",
+        "id": _MORGAN,
+        "summary": _MORGAN,
+        "timeZone": "Etc/GMT+7",
+    }
+    # Thomas's one event is written in UTC.
+    assert (thomas["id"], thomas["timeZone"]) == (_THOMAS, "UTC")
+    # The probe that shows a workspace reaches the fake reads the token's account off this answer.
+    assert probe_identities(probe, json.dumps(calendar)) == (_MORGAN,)
+
+
+def test_calendar_on_a_google_host_other_than_www_is_a_counted_path_no_api_takes(
+    external_services: RunningExternalServices,
+) -> None:
+    on_gmail_host = httpx2.get(
+        "{}/calendar/v3/calendars/primary".format(external_services.google_url),
+        headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "gmail.googleapis.com"},
+    )
+
+    assert on_gmail_host.status_code == 404
+    assert on_gmail_host.headers["content-type"] == "text/html; charset=UTF-8"
+    assert "<code>/calendar/v3/calendars/primary</code> was not found on this server." in on_gmail_host.text
+    assert _control(external_services, "health")["unsupported_calls"] == {"google:path:/calendar/v3": 1}
+
+
+def test_calendar_settings_are_calendars_defaults_in_the_primary_calendars_zone(
+    external_services: RunningExternalServices,
+) -> None:
+    listed = _calendar(external_services, "users/me/settings")
+    timezone = _calendar(external_services, "users/me/settings/timezone")
+    week_start = _calendar(external_services, "users/me/settings/weekStart")
+    thomas = _calendar(external_services, "users/me/settings/timezone", token=_THOMAS_GOOGLE_TOKEN)
+    unknown = _calendar_get(external_services, "users/me/settings/noSuchSetting")
+
+    assert listed["kind"] == "calendar#settings" and "nextSyncToken" not in listed
+    assert {item["id"]: item["value"] for item in listed["items"]} == {
+        "dateFieldOrder": "MDY",
+        "format24HourTime": "false",
+        "hideWeekends": "false",
+        "locale": "en",
+        "showDeclinedEvents": "true",
+        "timezone": "Etc/GMT+7",
+        "weekStart": "0",
+    }
+    assert {item["kind"] for item in listed["items"]} == {"calendar#setting"}
+    assert timezone == next(item for item in listed["items"] if item["id"] == "timezone")
+    assert set(timezone) == {"kind", "etag", "id", "value"}
+    assert (week_start["id"], week_start["value"]) == ("weekStart", "0")
+    assert thomas["value"] == "UTC"
+    assert (unknown.status_code, unknown.json()) == (404, _calendar_error(404, "Not Found", "notFound"))
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_a_seeded_calendar_event_is_served_as_calendar_serves_one(external_services: RunningExternalServices) -> None:
+    ids = _event_ids(external_services)
+    event = _calendar(external_services, "calendars/primary/events/{}".format(ids["vendor-sync"]))
+    offsite = _calendar(external_services, "calendars/{}/events/{}".format(_MORGAN, ids["offsite"]))
+    listed = {item["id"]: item for item in _calendar(external_services, "calendars/primary/events")["items"]}
+
+    created = _shifted_iso("2026-03-17T17:00:00.000Z")
+    assert event == {
+        "kind": "calendar#event",
+        "etag": event["etag"],
+        "id": ids["vendor-sync"],
+        "status": "confirmed",
+        "htmlLink": event["htmlLink"],
+        "created": created,
+        "updated": created,
+        "summary": "Northwind invoice sync",
+        "description": "Walk through invoice 4411 with Priya.",
+        "location": "Room 4B",
+        "creator": {"email": _MORGAN, "self": True},
+        "organizer": {"email": _MORGAN, "self": True},
+        "start": {"dateTime": _shifted_date_time("2026-03-17T10:00:00-07:00"), "timeZone": "Etc/GMT+7"},
+        "end": {"dateTime": _shifted_date_time("2026-03-17T10:30:00-07:00"), "timeZone": "Etc/GMT+7"},
+        "iCalUID": "{}@google.com".format(ids["vendor-sync"]),
+        "sequence": 0,
+        # The organizer is a guest of an event that has guests.
+        "attendees": [
+            {"email": _MORGAN, "organizer": True, "self": True, "responseStatus": "accepted"},
+            {"email": "priya@northwind.example", "displayName": "Priya Shah", "responseStatus": "accepted"},
+            {"email": _THOMAS, "displayName": "Thomas Baird", "responseStatus": "tentative"},
+        ],
+        "reminders": {"useDefault": True},
+        "eventType": "default",
+    }
+    assert listed[ids["vendor-sync"]] == event
+    # Ids are lowercase base32hex, as Calendar's are, and the link names the event on its calendar.
+    assert all(
+        len(event_id) == 26 and set(event_id) <= set("0123456789abcdefghijklmnopqrstuv") for event_id in ids.values()
+    )
+    eid = event["htmlLink"].removeprefix("https://www.google.com/calendar/event?eid=")
+    assert base64.b64decode(eid + "=" * (-len(eid) % 4)).decode() == "{} {}".format(ids["vendor-sync"], _MORGAN)
+    assert event["etag"] == '"{}"'.format(_shifted_ms("2026-03-17T17:00:00+00:00") * 2000)
+    # An all-day event is its days, the end exclusive; it is after the seed's anchor, so it was
+    # created by the time the data ends.
+    assert (offsite["start"], offsite["end"]) == (
+        {"date": _shifted_date("2026-03-26")},
+        {"date": _shifted_date("2026-03-28")},
+    )
+    assert offsite["created"] == _shifted_iso("2026-03-21T00:00:00.000Z")
+    assert "attendees" not in offsite and "location" not in offsite
+
+
+def test_every_calendar_date_is_the_seeds_or_derived_from_it(external_services: RunningExternalServices) -> None:
+    morgan = _calendar(external_services, "calendars/primary/events")
+    thomas = _calendar(external_services, "calendars/primary/events", token=_THOMAS_GOOGLE_TOKEN)
+    calendars = _calendar(external_services, "users/me/calendarList")
+
+    # An event was created at the earlier of its start and the anchor.
+    assert {event["summary"]: event["created"] for event in morgan["items"] + thomas["items"]} == {
+        "Northwind invoice sync": _shifted_iso("2026-03-17T17:00:00.000Z"),
+        "Q1 finance review": _shifted_iso("2026-03-21T00:00:00.000Z"),
+        "Team offsite": _shifted_iso("2026-03-21T00:00:00.000Z"),
+        "Planning block": _shifted_iso("2026-03-18T09:00:00.000Z"),
+    }
+    # A calendar was last changed with its latest event; its account, and so the calendar itself,
+    # dates from the account's earliest record, Morgan's an email.
+    assert (morgan["updated"], thomas["updated"]) == (
+        _shifted_iso("2026-03-21T00:00:00.000Z"),
+        _shifted_iso("2026-03-18T09:00:00.000Z"),
+    )
+    assert calendars["items"][0]["etag"] == '"{}"'.format(_shifted_ms("2026-03-12T06:00:00+00:00") * 2000)
+    _assert_no_date_is_near_the_wall_clock(morgan, thomas)
+
+
+def test_calendar_lists_events_by_time_bounds_order_and_pages(external_services: RunningExternalServices) -> None:
+    shifted = _shifted_iso
+    everything = _calendar(external_services, "calendars/primary/events")
+    # timeMin bounds an event's end and timeMax its start, both exclusively.
+    after_sync = _listed_summaries(external_services, timeMin=shifted("2026-03-17T17:30:00.000Z"))
+    before_review = _listed_summaries(external_services, timeMax=shifted("2026-03-24T21:00:00.000Z"))
+    within = _listed_summaries(
+        external_services, timeMin=shifted("2026-03-20T00:00:00.000Z"), timeMax=shifted("2026-03-27T00:00:00.000Z")
+    )
+    by_start = _listed_summaries(external_services, orderBy="startTime", singleEvents="true")
+    by_update = _listed_summaries(external_services, orderBy="updated")
+    unordered = _calendar_get(external_services, "calendars/primary/events", orderBy="startTime")
+    empty_range = _calendar_get(
+        external_services,
+        "calendars/primary/events",
+        timeMin=shifted("2026-03-20T00:00:00.000Z"),
+        timeMax=shifted("2026-03-20T00:00:00.000Z"),
+    )
+    no_offset = _calendar_get(external_services, "calendars/primary/events", timeMin="2036-03-20T00:00:00")
+
+    assert set(everything) == {
+        "kind",
+        "etag",
+        "summary",
+        "updated",
+        "timeZone",
+        "accessRole",
+        "defaultReminders",
+        "items",
+    }
+    assert (everything["kind"], everything["summary"], everything["timeZone"], everything["accessRole"]) == (
+        "calendar#events",
+        _MORGAN,
+        "Etc/GMT+7",
+        "owner",
+    )
+    assert after_sync == ["Q1 finance review", "Team offsite"]
+    assert before_review == ["Northwind invoice sync"]
+    assert within == ["Q1 finance review", "Team offsite"]
+    assert by_start == ["Northwind invoice sync", "Q1 finance review", "Team offsite"]
+    # The two events created at the anchor tie on their update, and fall back to their start.
+    assert by_update == ["Northwind invoice sync", "Q1 finance review", "Team offsite"]
+    assert (unordered.status_code, unordered.json()) == (
+        400,
+        _calendar_error(400, "The requested ordering is not available for the particular query.", "badRequest"),
+    )
+    assert (empty_range.status_code, empty_range.json()["error"]["errors"][0]) == (
+        400,
+        {
+            "domain": "calendar",
+            "reason": "timeRangeEmpty",
+            "message": "The specified time range is empty.",
+            "locationType": "parameter",
+            "location": "timeMax",
+        },
+    )
+    assert (no_offset.status_code, no_offset.json()) == (400, _calendar_error(400, "Bad Request", "badRequest"))
+    # Calendar returns an empty list rather than leaving it out.
+    assert (
+        _calendar(external_services, "calendars/primary/events", timeMax=shifted("2026-01-01T00:00:00.000Z"))["items"]
+        == []
+    )
+
+
+def test_calendar_pages_250_events_at_a_time_unless_asked_otherwise(
+    external_services: RunningExternalServices,
+) -> None:
+    many = [
+        {
+            "key": "standup-{}".format(day),
+            "owner": _MORGAN,
+            "summary": "Standup {}".format(day),
+            "start": "2026-02-{:02d}T09:00:00-07:00".format(day),
+            "end": "2026-02-{:02d}T09:15:00-07:00".format(day),
+        }
+        for day in range(1, 13)
+    ]
+    assert _add(external_services, "google", json.dumps({"events": many})).status_code == 200
+
+    whole = _calendar(external_services, "calendars/primary/events")
+    first = _calendar(external_services, "calendars/primary/events", maxResults="5")
+    second = _calendar(external_services, "calendars/primary/events", maxResults="5", pageToken=first["nextPageToken"])
+    last = _calendar(external_services, "calendars/primary/events", maxResults="5", pageToken=second["nextPageToken"])
+    pages = [[event["summary"] for event in page["items"]] for page in (first, second, last)]
+    malformed = _calendar_get(
+        external_services, "calendars/primary/events", pageToken="CiAKGjBpNDd2Nmp2Zml2cXRwYjBpOXA"
+    )
+    none_asked = _calendar_get(external_services, "calendars/primary/events", maxResults="0")
+
+    # The package pages ten at a time; Calendar 250.
+    assert len(whole["items"]) == 15 and "nextPageToken" not in whole
+    assert [len(page) for page in pages] == [5, 5, 5]
+    assert "nextPageToken" not in last
+    assert [summary for page in pages for summary in page] == [event["summary"] for event in whole["items"]]
+    assert (malformed.status_code, malformed.json()["error"]["errors"][0]["location"]) == (400, "pageToken")
+    assert (none_asked.status_code, none_asked.json()["error"]["errors"][0]["location"]) == (400, "maxResults")
+
+
+def test_an_inserted_calendar_event_is_listed_and_a_deleted_one_is_cancelled(
+    external_services: RunningExternalServices,
+) -> None:
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"}
+    events_url = "{}/calendar/v3/calendars/primary/events".format(external_services.google_url)
+    # A day between the finance review and the offsite, as the trial sees them; Los Angeles keeps
+    # daylight time then, as the calendar's own -07:00 does.
+    day = _shifted_date("2026-03-25")
+    inserted = httpx2.post(
+        events_url,
+        headers=headers,
+        json={
+            "summary": "Invoice follow-up",
+            "start": {"dateTime": "{}T09:00:00".format(day), "timeZone": "America/Los_Angeles"},
+            "end": {"dateTime": "{}T16:30:00Z".format(day)},
+            "attendees": [{"email": "priya@northwind.example", "optional": True, "responseStatus": "maybe"}],
+            "recurrence": ["RRULE:FREQ=WEEKLY"],
+        },
+    )
+    assert inserted.status_code == 200, inserted.text
+    event = inserted.json()
+    got = _calendar(external_services, "calendars/primary/events/{}".format(event["id"]))
+    listed = _listed_summaries(external_services, orderBy="startTime", singleEvents="true")
+    sync_id = _event_ids(external_services)["vendor-sync"]
+    deleted = httpx2.delete("{}/{}".format(events_url, sync_id), headers=headers)
+    after_delete = _listed_summaries(external_services)
+    with_deleted = _calendar(external_services, "calendars/primary/events", showDeleted="true")["items"]
+    cancelled = _calendar(external_services, "calendars/primary/events/{}".format(sync_id))
+    deleted_again = httpx2.delete("{}/{}".format(events_url, sync_id), headers=headers)
+    no_end = httpx2.post(events_url, headers=headers, json={"summary": "x", "start": {"date": day}})
+    one_day = {"start": {"date": day}, "end": {"date": _shifted_date("2026-03-26")}}
+    tentative = httpx2.post(events_url, headers=headers, json={"summary": "Maybe", "status": "tentative", **one_day})
+    born_cancelled = httpx2.post(
+        events_url, headers=headers, json={"summary": "Gone", "status": "cancelled", **one_day}
+    )
+
+    assert got == event
+    assert (event["start"], event["end"]) == (
+        {"dateTime": "{}T09:00:00-07:00".format(day), "timeZone": "America/Los_Angeles"},
+        {"dateTime": "{}T09:30:00-07:00".format(day), "timeZone": "Etc/GMT+7"},
+    )
+    assert [(a["email"], a["responseStatus"]) for a in event["attendees"]] == [
+        (_MORGAN, "accepted"),
+        ("priya@northwind.example", "needsAction"),
+    ]
+    assert listed == ["Northwind invoice sync", "Q1 finance review", "Invoice follow-up", "Team offsite"]
+    assert (deleted.status_code, deleted.text) == (204, "")
+    assert "Northwind invoice sync" not in after_delete
+    assert {e["summary"]: e["status"] for e in with_deleted}["Northwind invoice sync"] == "cancelled"
+    assert cancelled["status"] == "cancelled"
+    assert (deleted_again.status_code, deleted_again.json()) == (
+        410,
+        _calendar_error(410, "Resource has been deleted", "deleted"),
+    )
+    assert (no_end.status_code, no_end.json()) == (400, _calendar_error(400, "Missing end time.", "required"))
+    assert (tentative.json()["status"], born_cancelled.json()["status"]) == ("tentative", "confirmed")
+    # The insert's recurrence, a guest's optional flag and unknown response, and a status a new event
+    # cannot have are not kept, and each is counted.
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:calendar:body:recurrence": 1,
+        "google:calendar:body:attendees.optional": 1,
+        "google:calendar:body:attendees.responseStatus": 1,
+        "google:calendar:body:status": 1,
+    }
+
+
+def test_another_accounts_calendar_is_not_found(external_services: RunningExternalServices) -> None:
+    """Calendar answers a calendar the caller has no access to as one that does not exist, with a 404
+    rather than a 403, so the fake does the same for another seeded account's calendar and for an
+    event on it."""
+    thomas_event = _event_ids(external_services)["thomas-planning"]
+    answers = [
+        _calendar_get(external_services, "calendars/{}/events".format(_THOMAS)),
+        _calendar_get(external_services, "calendars/{}".format(_THOMAS)),
+        _calendar_get(external_services, "users/me/calendarList/{}".format(_THOMAS)),
+        _calendar_get(external_services, "calendars/primary/events/{}".format(thomas_event)),
+        _calendar_get(external_services, "calendars/{}/events/{}".format(_THOMAS, thomas_event)),
+    ]
+    anonymous = _calendar_get(external_services, "calendars/primary", token=None)
+
+    for answer in answers:
+        assert (answer.status_code, answer.json()) == (404, _calendar_error(404, "Not Found", "notFound"))
+    assert (anonymous.status_code, anonymous.json()["error"]["errors"][0]["reason"]) == (401, "required")
+    assert _control(external_services, "health")["unsupported_calls"] == {}
+
+
+def test_a_calendar_method_or_parameter_the_fake_lacks_is_googles_not_found_or_served_and_counted(
+    external_services: RunningExternalServices,
+) -> None:
+    headers = {"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"}
+    base = "{}/calendar/v3".format(external_services.google_url)
+    sync_id = _event_ids(external_services)["vendor-sync"]
+    lacking = [
+        httpx2.patch("{}/calendars/primary/events/{}".format(base, sync_id), headers=headers, json={"summary": "x"}),
+        httpx2.post("{}/calendars/primary/events/quickAdd".format(base), headers=headers, params={"text": "x"}),
+        httpx2.get("{}/calendars/primary/events/{}/instances".format(base, sync_id), headers=headers),
+        httpx2.post("{}/freeBusy".format(base), headers=headers, json={}),
+        httpx2.get("{}/colors".format(base), headers=headers),
+        httpx2.get("{}/calendars/primary/acl".format(base), headers=headers),
+    ]
+    with_parameters = [
+        _calendar_get(external_services, "calendars/primary/events", syncToken="CPDAlvWDx70CEPDAlvWDx70CGAU="),
+        _calendar_get(external_services, "calendars/primary/events", iCalUID="x@google.com"),
+        _calendar_get(external_services, "calendars/primary/events", q="invoice", prettyPrint="false"),
+        _calendar_get(external_services, "calendars/primary/events", fields="items(summary)"),
+    ]
+
+    for answer in lacking:
+        assert answer.status_code == 404
+        assert answer.headers["content-type"] == "text/html; charset=UTF-8"
+        assert "<code>{}</code> was not found on this server.".format(answer.request.url.path) in answer.text
+    assert [answer.status_code for answer in with_parameters] == [200] * 4
+    # A search is answered by the words in an event's text, and not counted.
+    assert [event["summary"] for event in with_parameters[2].json()["items"]] == ["Northwind invoice sync"]
+    assert _control(external_services, "health")["unsupported_calls"] == {
+        "google:calendar:PATCH calendars/{calendarId}/events/{eventId}": 1,
+        "google:calendar:POST calendars/{calendarId}/events/quickAdd": 1,
+        "google:calendar:GET calendars/{calendarId}/events/{eventId}/instances": 1,
+        "google:calendar:POST freeBusy": 1,
+        "google:calendar:GET colors": 1,
+        "google:calendar:GET calendars/{calendarId}/acl": 1,
+        "google:calendar:syncToken": 1,
+        "google:calendar:iCalUID": 1,
+        "google:calendar:fields": 1,
+    }
+
+
+def test_a_calendar_update_adds_its_events_with_the_seeds_shift(external_services: RunningExternalServices) -> None:
+    added = _add(
+        external_services, "google", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "google")
+    )
+    calendars = _control(external_services, "state")["google"]["collections"]["google.calendars"]["items"]
+    call = next(
+        event
+        for event in _calendar(external_services, "calendars/primary/events")["items"]
+        if event["summary"] == "Corrected invoice call"
+    )
+
+    assert added.status_code == 200, added.text
+    assert added.json()["added"]["calendar_events"] == 1
+    assert call["start"] == {"dateTime": _shifted_date_time("2026-03-23T09:00:00-07:00"), "timeZone": "Etc/GMT+7"}
+    assert call["id"] == _event_ids(external_services)["corrected-invoice-call"]
+    assert [a["email"] for a in call["attendees"]] == [_MORGAN, "olivia.chen@redwood.example"]
+    # The update's new account has its primary calendar too, in UTC with no event of its own.
+    assert {calendar["google_id"]: calendar["time_zone"] for calendar in calendars}[
+        "olivia.chen@redwood.example"
+    ] == "UTC"
+
+
+def test_a_burst_past_calendars_per_user_quota_is_refused_as_calendar_refuses_it(
+    external_services: RunningExternalServices,
+) -> None:
+    # Every request costs one of a user's 600 a minute: 600 fit, and the 601st does not.
+    with httpx2.Client(
+        headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN), "X-Forwarded-Host": "www.googleapis.com"}
+    ) as client:
+        burst = [
+            client.get("{}/calendar/v3/calendars/primary".format(external_services.google_url)) for _ in range(601)
+        ]
+    # The quota is each user's own and Calendar's own: Thomas, and Morgan's Gmail, are still served.
+    thomas = _calendar_get(external_services, "calendars/primary", token=_THOMAS_GOOGLE_TOKEN)
+    gmail = _gmail_get(external_services, "me/profile")
+
+    assert [answer.status_code for answer in burst[:600]] == [200] * 600
+    refused = burst[600]
+    assert (refused.status_code, refused.json()) == (
+        403,
+        {
+            "error": {
+                "errors": [
+                    {"domain": "usageLimits", "reason": "userRateLimitExceeded", "message": "User Rate Limit Exceeded"}
+                ],
+                "code": 403,
+                "message": "User Rate Limit Exceeded",
+            }
+        },
+    )
+    assert 1 <= int(refused.headers["retry-after"]) <= 60
+    assert not {name for name in burst[0].headers if name.startswith(("x-ratelimit", "retry-after"))}
+    assert (thomas.status_code, gmail.status_code) == (200, 200)
+    assert _control(external_services, "health")["rate_limited"] == {"google:calendar_per_user": 1}

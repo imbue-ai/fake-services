@@ -15,6 +15,13 @@
       "ts": "1774050000.000000",
       "thread_ts": null,
       "text": "Customer note drafted for the latency incident."
+    },
+    {
+      "channel": "eng-oncall",
+      "user": "olivia_chen",
+      "ts": "1774050600.000000",
+      "thread_ts": "1773900000.000000",
+      "text": "Rolled back the route normalization; p99 is recovering."
     }
   ]
 }
