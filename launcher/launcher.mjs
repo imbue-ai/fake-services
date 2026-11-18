@@ -148,8 +148,8 @@ const redacted = (snapshot) => JSON.parse(JSON.stringify(snapshot, (k, v) => (k 
 const collectionsOf = (name) => Object.entries(redacted(services[name].store.snapshot()).collections).map(([collection, { items }]) => [collection, items]);
 const textById = (items) => new Map(items.map((item) => [item.id, JSON.stringify(item)]));
 // The phase the trial is in and the one before it: when each was marked, how long the access log was
-// then, and for the running one every record as text, so a record a later write changes in place is
-// still what the mark found.
+// then, and for the running one every record by id as its JSON text, which is what a record is
+// compared by.
 const spans = [];
 function beginSpan(phase) {
   if (spans.length) delete spans.at(-1).records;
