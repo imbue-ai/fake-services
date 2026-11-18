@@ -22,6 +22,8 @@ export function createAccessLog(path, services) {
   // Without a prototype, so a phase named like one of Object's own keys ("constructor") gets counts
   // of its own.
   const phases = Object.create(null);
+  // When the latest request began, on the process's clock; null until one has.
+  let lastBeganMs = null;
   const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {}, rate_limited: {} });
   phaseCounts(phase);
   function setPhase(name) {
@@ -41,6 +43,7 @@ export function createAccessLog(path, services) {
     return async (req) => {
       const url = new URL(req.url);
       const began = Date.now();
+      lastBeganMs = began;
       // The phase the request began in, as its ts is when it began.
       const requestPhase = phase;
       const bodyText = req.method === "GET" ? "" : await req.clone().text();
@@ -104,5 +107,6 @@ export function createAccessLog(path, services) {
     setPhase,
     phase: () => phase,
     phases,
+    lastBeganMs: () => lastBeganMs,
   };
 }

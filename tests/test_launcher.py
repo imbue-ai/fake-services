@@ -58,6 +58,21 @@ def _add(services: RunningExternalServices, service_name: str, update_text: str)
     return httpx2.post("{}/_control/records/{}".format(services.control_url, service_name), content=update_text)
 
 
+def _add_step(
+    services: RunningExternalServices, service_name: str, step: str, update: dict[str, Any]
+) -> httpx2.Response:
+    """Post one step's update for a service, named as the driver names it."""
+    return httpx2.post(
+        "{}/_control/records/{}".format(services.control_url, service_name),
+        params={"step": step},
+        content=json.dumps(update),
+    )
+
+
+def _instant(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+
 def _issue_titles(services: RunningExternalServices) -> dict[str, str]:
     answer = _linear(services, "{ issues { nodes { identifier title } } }")
     return {issue["identifier"]: issue["title"] for issue in answer.json()["data"]["issues"]["nodes"]}
@@ -675,6 +690,231 @@ def test_search_answers_datalibs_reply_search_query(external_services: RunningEx
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
+def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
+    external_services: RunningExternalServices,
+) -> None:
+    """An update's own instants written as `+HH:MM:SS` land that long after the latest request any fake
+    had served when the update was applied, whatever the shift; a reply's `thread_ts` stays the seed's
+    absolute ts and resolves under the shift to the root the seed placed."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    before = _control(external_services, "health")
+    time.sleep(1.2)
+    update = {
+        "users": [],
+        "channels": [],
+        "messages": [
+            {"channel": "eng-oncall", "user": "morgan.reyes", "ts": "+00:00:01", "text": "Paging the on-call."},
+            {
+                "channel": "eng-oncall",
+                "user": "morgan.reyes",
+                "ts": "+00:00:01.000001",
+                "thread_ts": "1773900000.000000",
+                "text": "Rolled back.",
+            },
+        ],
+    }
+
+    added = _add_step(external_services, "slack", "refresh", update)
+
+    assert added.status_code == 200, added.text
+    health = _control(external_services, "health")
+    assert (before["bases"], before["start_at"]) == ({}, _shifted_iso("2026-03-21T00:00:00.000Z"))
+    # The base is the conversations.list request above, the latest the fake had served; the health
+    # requests in between are control calls and count for nothing.
+    assert health["bases"]["refresh"]["base"] == before["last_request_at"]
+    assert added.json()["base"] == before["last_request_at"]
+    base_seconds = int(_instant(health["bases"]["refresh"]["base"]).timestamp())
+    root_ts, reply_ts = "{}.000000".format(base_seconds + 1), "{}.000001".format(base_seconds + 1)
+    history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
+    assert history[0]["ts"] == root_ts
+    replies = _slack(external_services, "conversations.replies", channel=channel_id, ts=_shifted("1773900000.000000"))
+    assert [message["ts"] for message in replies["messages"]][-1] == reply_ts
+    # A second file of the same step counts from the same base, after more requests have been served.
+    second = _add_step(
+        external_services,
+        "slack",
+        "refresh",
+        {
+            "messages": [
+                {
+                    "channel": "announcements",
+                    "user": "claire",
+                    "ts": "+00:00:01.000002",
+                    "text": "Status page updated.",
+                }
+            ]
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["base"] == before["last_request_at"]
+    announcements = _slack(
+        external_services, "conversations.history", channel=_channel_id(external_services, "announcements")
+    )
+    assert announcements["messages"][0]["ts"] == "{}.000002".format(base_seconds + 1)
+
+
+def test_an_update_whose_instants_are_still_in_the_future_is_refused_with_a_wait(
+    external_services: RunningExternalServices,
+) -> None:
+    before = _control(external_services, "health")["counts"]
+    update = {"messages": [{"channel": "eng-oncall", "user": "morgan.reyes", "ts": "+01:00:00", "text": "Later."}]}
+
+    answer = _add_step(external_services, "slack", "refresh", update)
+
+    assert answer.status_code == 409, answer.text
+    body = answer.json()
+    assert body["ok"] is False and 3590 <= body["retry_after_seconds"] <= 3600
+    health = _control(external_services, "health")
+    assert (health["bases"], health["counts"]) == ({}, before)
+
+
+def test_a_relative_timestamp_may_count_from_an_earlier_steps_base(external_services: RunningExternalServices) -> None:
+    first = _add_step(
+        external_services,
+        "slack",
+        "triage",
+        {
+            "messages": [
+                {"channel": "eng-oncall", "user": "morgan.reyes", "ts": "+00:00:00", "text": "Opening a thread."}
+            ]
+        },
+    )
+    _channel_id(external_services, "eng-oncall")
+    time.sleep(1.1)
+    second = _add_step(
+        external_services,
+        "slack",
+        "followup",
+        {
+            "messages": [
+                {
+                    "channel": "eng-oncall",
+                    "user": "claire",
+                    "ts": "+00:00:01",
+                    "thread_ts": "triage+00:00:00",
+                    "text": "Replying in it.",
+                }
+            ]
+        },
+    )
+    unknown = _add_step(
+        external_services,
+        "slack",
+        "later",
+        {
+            "messages": [
+                {
+                    "channel": "eng-oncall",
+                    "user": "claire",
+                    "ts": "+00:00:00",
+                    "thread_ts": "nosuch+00:00:00",
+                    "text": "?",
+                }
+            ]
+        },
+    )
+
+    assert (first.status_code, second.status_code) == (200, 200), second.text
+    bases = _control(external_services, "health")["bases"]
+    assert _instant(bases["followup"]["base"]) > _instant(bases["triage"]["base"])
+    root_ts = "{}.000000".format(int(_instant(bases["triage"]["base"]).timestamp()))
+    replies = _slack(
+        external_services, "conversations.replies", channel=_channel_id(external_services, "eng-oncall"), ts=root_ts
+    )
+    assert [message["text"] for message in replies["messages"]] == ["Opening a thread.", "Replying in it."]
+    assert unknown.status_code == 400 and "nosuch" in unknown.json()["error"]
+
+
+def test_an_update_edits_a_message_it_names_with_edited_ts_and_refuses_a_bare_repeat(
+    external_services: RunningExternalServices,
+) -> None:
+    channel_id = _channel_id(external_services, "eng-oncall")
+    root = "1773900000.000000"
+    edit = {
+        "messages": [
+            {
+                "channel": "eng-oncall",
+                "user": "claire",
+                "ts": root,
+                "edited_ts": "+00:00:00",
+                "text": "ALERT resolved: gateway p99 back under threshold",
+            }
+        ]
+    }
+
+    added = _add_step(external_services, "slack", "refresh", edit)
+    repeat = _add_step(
+        external_services,
+        "slack",
+        "refresh",
+        {"messages": [{"channel": "eng-oncall", "user": "claire", "ts": root, "text": "again"}]},
+    )
+    unknown = _add_step(
+        external_services,
+        "slack",
+        "refresh",
+        {
+            "messages": [
+                {
+                    "channel": "eng-oncall",
+                    "user": "claire",
+                    "ts": "1700000000.000000",
+                    "edited_ts": "+00:00:00",
+                    "text": "?",
+                }
+            ]
+        },
+    )
+
+    assert added.status_code == 200, added.text
+    assert added.json()["added"] == {"slack_messages": 0, "slack_edits": 1}
+    base_seconds = int(_instant(_control(external_services, "health")["bases"]["refresh"]["base"]).timestamp())
+    history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
+    message = next(m for m in history if m["ts"] == _shifted(root))
+    assert message["text"] == "ALERT resolved: gateway p99 back under threshold"
+    assert message["edited"] == {
+        "user": _user_ids(external_services)["claire"],
+        "ts": "{}.000000".format(base_seconds),
+    }
+    # The edit changed the text and nothing of the thread.
+    assert (message["reply_count"], message["thread_ts"]) == (1, _shifted(root))
+    assert repeat.status_code == 400 and "edited_ts" in repeat.json()["error"]
+    assert unknown.status_code == 400 and "no such message" in unknown.json()["error"]
+    unchanged = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
+    assert next(m for m in unchanged if m["ts"] == _shifted(root))["text"] == message["text"]
+
+
+def test_an_update_edits_an_issue_it_names_with_a_later_updated_at(external_services: RunningExternalServices) -> None:
+    edit = {
+        "issues": [
+            {
+                "identifier": "ENG-2",
+                "team": "ENG",
+                "state": "Done",
+                "title": "Fix route normalization",
+                "updated_at": "+00:00:00",
+            }
+        ]
+    }
+
+    added = _add_step(external_services, "linear", "refresh", edit)
+    repeat = _add_step(
+        external_services, "linear", "refresh", {"issues": [{"identifier": "ENG-2", "team": "ENG", "title": "again"}]}
+    )
+
+    assert added.status_code == 200, added.text
+    assert added.json()["added"] == {"linear_issues": 0, "linear_comments": 0, "linear_edits": 1}
+    base = _control(external_services, "health")["bases"]["refresh"]["base"]
+    issue = _linear(external_services, '{ issue(id: "ENG-2") { title updatedAt completedAt state { name } } }')
+    assert issue.json()["data"]["issue"] == {
+        "title": "Fix route normalization",
+        "updatedAt": base,
+        "completedAt": base,
+        "state": {"name": "Done"},
+    }
+    assert repeat.status_code == 400 and "updated_at" in repeat.json()["error"]
+
+
 def _dms(services: RunningExternalServices) -> dict[str, dict[str, Any]]:
     """The token's dms by kind: its im and its mpim."""
     listed = _slack(services, "conversations.list", types="im,mpim")["channels"]
@@ -1059,12 +1299,12 @@ def test_an_update_lands_on_its_own_service_with_the_seeds_shift(external_servic
         external_services, "linear", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "linear")
     )
 
-    assert (slack_added.status_code, slack_added.json()["added"]) == (200, {"slack_messages": 2})
+    assert (slack_added.status_code, slack_added.json()["added"]) == (200, {"slack_messages": 2, "slack_edits": 0})
     # Each service's update is its own request: Slack's left Linear holding what it was seeded with.
     assert (after_slack["slack"]["messages"], after_slack["linear"]["issues"]) == (9, 2)
     assert (linear_added.status_code, linear_added.json()["added"]) == (
         200,
-        {"linear_issues": 1, "linear_comments": 0},
+        {"linear_issues": 1, "linear_comments": 0, "linear_edits": 0},
     )
     history = _slack(external_services, "conversations.history", channel=_channel_id(external_services, "eng-oncall"))
     assert history["messages"][0]["ts"] == _shifted("1774050000.000000")

@@ -249,6 +249,7 @@ export function create(seed, clock) {
     for (const c of cfg.channels ?? []) statedMembers.set(namedChannel(c.name).channel_id, memberIds(`channel ${c.name}`, c.members ?? []));
     placeDms(dms, newConversations, statedMembers);
     let n = 0;
+    let edits = 0;
     for (const m of cfg.messages ?? []) {
       const ch = conversation(m.channel);
       const uid = user(m.user);
@@ -256,6 +257,17 @@ export function create(seed, clock) {
       if (isDm(ch) && !ch.members.includes(uid)) throw new Error(`slack message ${m.channel}/${m.ts} is from ${m.user}, who is no member of that dm`);
       const channel_id = ch.channel_id;
       const ts = clock.slackTs(m.ts);
+      // A message the fake already holds is edited when the entry says when, and a repeat otherwise.
+      const held = ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === ts);
+      if (held) {
+        if (m.edited_ts == null) throw new Error(`slack message ${m.channel}/${m.ts} repeats a message the fake holds; an edit states edited_ts`);
+        const editedTs = clock.slackTs(m.edited_ts);
+        if (Number(editedTs) <= Number(ts)) throw new Error(`slack message ${m.channel}/${m.ts} is edited at ${m.edited_ts}, no later than it was posted`);
+        ss.messages.update(held.id, { text: m.text, edited: { user: uid, ts: editedTs } });
+        edits++;
+        continue;
+      }
+      if (m.edited_ts != null) throw new Error(`slack message ${m.channel}/${m.ts} states edited_ts, and the fake holds no such message to edit`);
       const thread_ts = clock.slackTs(m.thread_ts) ?? undefined;
       const p = thread_ts && thread_ts !== ts ? ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === thread_ts) ?? null : null;
       if (thread_ts && thread_ts !== ts) {
@@ -275,7 +287,7 @@ export function create(seed, clock) {
       n++;
     }
     settle(newConversations, newUsers, statedMembers);
-    return { slack_messages: n };
+    return { slack_messages: n, slack_edits: edits };
   }
 
   async function params(req) {
