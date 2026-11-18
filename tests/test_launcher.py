@@ -753,6 +753,12 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
     assert history[0]["ts"] == root_ts
     replies = _slack(external_services, "conversations.replies", channel=channel_id, ts=_shifted("1773900000.000000"))
     assert [message["ts"] for message in replies["messages"]][-1] == reply_ts
+    # The seed's root now names the new reply as its latest_reply, in history and as the thread's
+    # parent copy: what a downloader compares to know the thread it holds has grown.
+    seed_root = next(message for message in history if message["ts"] == _shifted("1773900000.000000"))
+    assert (seed_root["reply_count"], seed_root["latest_reply"]) == (2, reply_ts)
+    assert replies["messages"][0]["latest_reply"] == reply_ts
+    assert "latest_reply" not in history[0]
     # A second file following the same step counts from the same end, after more requests have been served.
     second = _add_after(
         external_services,
@@ -906,7 +912,11 @@ def test_an_update_edits_a_message_it_names_with_edited_ts_and_refuses_a_bare_re
         "ts": "{}.000000".format(int(_instant(ended).timestamp())),
     }
     # The edit changed the text and nothing of the thread.
-    assert (message["reply_count"], message["thread_ts"]) == (1, _shifted(root))
+    assert (message["reply_count"], message["thread_ts"], message["latest_reply"]) == (
+        1,
+        _shifted(root),
+        _shifted("1773900600.000000"),
+    )
     assert repeat.status_code == 400 and "edited_ts" in repeat.json()["error"]
     assert unknown.status_code == 400 and "no such message" in unknown.json()["error"]
     unchanged = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
