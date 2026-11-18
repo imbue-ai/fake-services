@@ -34,13 +34,12 @@
 //     (start - anchor) rounded down to whole days on load, so the data ends within the day before
 //     the trial's start whenever the trial runs, on the weekdays and at the times of day it was
 //     written for
-//   - an update may write an instant as a relative timestamp, `+HH:MM:SS` with an optional fraction
-//     of up to six digits: that long after the update's base, the moment the latest request any fake
-//     had served before the update began (the start, when none had). So what an update adds reads as
-//     activity between the earlier step's last look and the later step's first, whatever the shift.
-//     `<step>+HH:MM:SS` names the step whose base it counts from, the update's own or an earlier one;
-//     the bare form is shorthand for the update's own. An update whose newest instant is still in
-//     the future is refused with how long to wait
+//   - an update may write an instant as a relative timestamp, `<step>+HH:MM:SS` with an optional
+//     fraction of up to six digits: that long after the last request any fake served while that step
+//     ran (the start, when none was). So what an update adds reads as activity between the earlier
+//     step's last look and the later step's first, whatever the shift; a later update names an
+//     earlier step to refer to a record the update after it added. An update whose newest instant is
+//     still in the future is refused with how long to wait
 //   - no record carries the box's clock: a date the seed does not state is derived from the seed's
 //     own records (each module's settle step)
 //   - only the seed's tokens authenticate, and the stores start empty: the emulators' own default
@@ -57,9 +56,10 @@
 //      bucket's own when unset; for a test that waits a window out>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
-//   GET  /_control/health             {ok, shift_ms, start_at, last_request_at, bases, rate_limits,
+//   GET  /_control/health             {ok, shift_ms, start_at, last_request_at, step_ends, rate_limits,
 //                                     services, counts, unsupported_calls, rate_limited, phase, phases};
-//                                     bases holds {base, applied_at} by step; counts.requests,
+//                                     step_ends holds {last_request_at, recorded_at} per finished step;
+//                                     counts.requests,
 //                                     unsupported_calls and rate_limited are the totals, rate_limited
 //                                     counting refused requests by "<service>:<bucket>";
 //                                     phases[<phase>] holds {requests, unsupported_calls,
@@ -69,10 +69,10 @@
 //   POST /_control/phase              {"name": <phase>}: every request from now on is logged and
 //                                     counted in that phase ("agent" until one is marked); answers
 //                                     {ok, phase, previous}
-//   POST /_control/records/<service>?step=<name>
+//   POST /_control/records/<service>?after=<step>
 //                                     add an update to a served service (its seed's record collections,
-//                                     same time shift; relative timestamps against the step's base, which
-//                                     the step's first update fixes); all of it lands or none does; 409
+//                                     same time shift) that follows the named step, whose end the
+//                                     update's first file records; all of it lands or none does; 409
 //                                     with retry_after_seconds while its newest instant is in the future.
 //                                     The step is "update" when unnamed
 //   GET  /_control/log                the access log so far, as a JSON array
@@ -121,32 +121,29 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const shiftMs = timeShift(first) === "none" ? 0 : Math.floor((startMs - anchorMs) / DAY_MS) * DAY_MS;
 // The process's clock as the trial's present: the start, advanced by the wall clock since.
 const toPresent = (processMs) => startMs + (processMs - launchedAtMs);
-// A relative timestamp: `+HH:MM:SS`, with an optional fraction of up to six digits, counted from the
-// base of the update being applied; `<step>+HH:MM:SS` counts from the base of the update that step
-// applied. Null for anything else, an absolute timestamp included.
-const RELATIVE_RE = /^(?:([a-z0-9][a-z0-9-]*))?\+(\d{1,3}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/;
+// A relative timestamp: `<step>+HH:MM:SS`, with an optional fraction of up to six digits, counted
+// from the last request any fake served while that step ran. Null for anything else, an absolute
+// timestamp included.
+const RELATIVE_RE = /^([a-z0-9][a-z0-9-]*)\+(\d{1,3}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/;
 export function parseRelative(value) {
   const m = typeof value === "string" ? value.match(RELATIVE_RE) : null;
   if (!m) return null;
   const [, step, h, min, s, frac = ""] = m;
-  const fraction = frac.padEnd(6, "0");
-  return { step: step ?? null, seconds: (Number(h) * 60 + Number(min)) * 60 + Number(s), fraction, text: value };
+  return { step, seconds: (Number(h) * 60 + Number(min)) * 60 + Number(s), fraction: frac.padEnd(6, "0"), text: value };
 }
-// Each update step's base, by step name, with when it was applied (both on the trial's present), and
-// the step whose update is being applied now: a bare `+HH:MM:SS` counts from its base, as does one
-// that names it, since its own entry is only made once its first file has landed.
-const bases = {};
-let currentStep = null;
-let currentBaseMs = null;
-function baseMsOf(rel) {
-  if (rel.step && rel.step !== currentStep) {
-    if (!bases[rel.step]) throw new Error(`${rel.text} counts from step ${rel.step}, whose update has not been applied`);
-    return bases[rel.step].baseMs;
-  }
-  if (currentBaseMs === null) throw new Error(`${rel.text} is a relative timestamp, which only an update may carry`);
-  return currentBaseMs;
+// When each finished step's last request was served (on the trial's present), recorded as the next
+// step's update arrives naming it, with when it was recorded; and the step an update under way follows,
+// whose last request is known before its entry is made.
+const stepEnds = {};
+let currentAfter = null;
+let currentEndMs = null;
+function stepEndMsOf(rel) {
+  if (rel.step === currentAfter && currentEndMs !== null) return currentEndMs;
+  if (currentAfter === null) throw new Error(`${rel.text} is a relative timestamp, which only an update may carry`);
+  if (!stepEnds[rel.step]) throw new Error(`${rel.text} counts from the end of step ${rel.step}, which no update has followed`);
+  return stepEnds[rel.step].endMs;
 }
-const relativeMs = (rel) => baseMsOf(rel) + rel.seconds * 1000 + Math.floor(Number(rel.fraction) / 1000);
+const relativeMs = (rel) => stepEndMsOf(rel) + rel.seconds * 1000 + Math.floor(Number(rel.fraction) / 1000);
 const clock = {
   shiftMs,
   // The seed's anchor, shifted: the date of last resort for a record nothing else in a seed dates.
@@ -167,7 +164,7 @@ const clock = {
     const rel = parseRelative(ts);
     // The fraction of a relative ts is kept as written: it is the per-channel sequence counter the
     // seed's own timestamps use, not a time.
-    if (rel) return `${Math.floor(baseMsOf(rel) / 1000) + rel.seconds}.${rel.fraction}`;
+    if (rel) return `${Math.floor(stepEndMsOf(rel) / 1000) + rel.seconds}.${rel.fraction}`;
     const [sec, frac = "000000"] = String(ts).split(".");
     return `${Number(sec) + Math.round(shiftMs / 1000)}.${frac}`;
   },
@@ -204,7 +201,7 @@ const lastRequestMs = () => (log.lastBeganMs() === null ? null : toPresent(log.l
 const timing = () => ({
   start_at: iso(startMs),
   last_request_at: lastRequestMs() === null ? null : iso(lastRequestMs()),
-  bases: Object.fromEntries(Object.entries(bases).map(([step, b]) => [step, { base: iso(b.baseMs), applied_at: iso(b.appliedAtMs) }])),
+  step_ends: Object.fromEntries(Object.entries(stepEnds).map(([step, e]) => [step, { last_request_at: iso(e.endMs), recorded_at: iso(e.recordedAtMs) }])),
 });
 async function control(req) {
   const url = new URL(req.url);
@@ -247,26 +244,26 @@ async function control(req) {
     } catch {
       return Response.json({ ok: false, error: "the update is not JSON" }, { status: 400 });
     }
-    const step = url.searchParams.get("step") ?? "update";
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(step)) return Response.json({ ok: false, error: `the step name ${JSON.stringify(step)} is not a lowercase identifier` }, { status: 400 });
-    // The step's base is fixed by its first update: the latest request any fake had served by then,
-    // else the start. A later file of the same step counts from the same base, so a step's services
-    // agree on when its activity happened.
-    const baseMs = bases[step]?.baseMs ?? lastRequestMs() ?? startMs;
+    const after = url.searchParams.get("after") ?? "update";
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(after)) return Response.json({ ok: false, error: `the step name ${JSON.stringify(after)} is not a lowercase identifier` }, { status: 400 });
+    // The step this update follows ended with the latest request any fake has served, else at the
+    // start; the first file of an update records it, and every later file of the same update reads
+    // it back, so a step's services agree on when its activity happened.
+    const endMs = stepEnds[after]?.endMs ?? lastRequestMs() ?? startMs;
     const nowMs = clock.now();
-    currentStep = step;
-    currentBaseMs = baseMs;
+    currentAfter = after;
+    currentEndMs = endMs;
     let newestMs;
     try {
       newestMs = Math.max(...relativeStampsIn(update).map(relativeMs));
     } catch (e) {
-      currentStep = currentBaseMs = null;
+      currentAfter = currentEndMs = null;
       return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
     }
     if (newestMs > nowMs) {
-      currentStep = currentBaseMs = null;
+      currentAfter = currentEndMs = null;
       const wait = Math.ceil((newestMs - nowMs) / 1000);
-      return Response.json({ ok: false, error: `the update's newest instant is ${wait} s in the future; apply it once the step's wait has passed`, retry_after_seconds: wait, base: iso(baseMs), now: iso(nowMs), newest: iso(newestMs), counts: counts() }, { status: 409 });
+      return Response.json({ ok: false, error: `the update's newest instant is ${wait} s in the future; apply it once the step's wait has passed`, retry_after_seconds: wait, after_last_request_at: iso(endMs), now: iso(nowMs), newest: iso(newestMs), counts: counts() }, { status: 409 });
     }
     // An update lands whole or not at all: a half-applied one would leave the trial on data nobody
     // authored. The snapshot holds the live records, which an update may write to in place, so it is
@@ -274,13 +271,13 @@ async function control(req) {
     const before = JSON.stringify(services[name].store.snapshot());
     try {
       const added = services[name].add(update);
-      bases[step] ??= { baseMs, appliedAtMs: nowMs };
-      return Response.json({ ok: true, step, base: iso(baseMs), added, counts: counts() });
+      stepEnds[after] ??= { endMs, recordedAtMs: nowMs };
+      return Response.json({ ok: true, after, after_last_request_at: iso(endMs), added, counts: counts() });
     } catch (e) {
       services[name].store.restore(JSON.parse(before));
       return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
     } finally {
-      currentStep = currentBaseMs = null;
+      currentAfter = currentEndMs = null;
     }
   }
   return Response.json({ error: "unknown control route" }, { status: 404 });
