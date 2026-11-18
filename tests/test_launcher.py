@@ -2125,6 +2125,66 @@ def _mark_phase(services: RunningExternalServices, body: Any) -> httpx2.Response
     return httpx2.post("{}/_control/phase".format(services.control_url), json=body)
 
 
+def test_changes_are_what_the_running_phase_did_to_the_stores(external_services: RunningExternalServices) -> None:
+    """What a verification flow's press wrote is read from the fakes themselves: the records the
+    stores gained or lost and the ones that differ since the phase was marked, apart from whatever
+    the agent's own phase wrote before it."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    agent_post = _slack_post(
+        external_services, "chat.postMessage", channel=channel_id, text="Posted while the agent worked."
+    )
+    assert _control(external_services, "changes")["previous_phase"] is None
+
+    _mark_phase(external_services, {"name": "verification"})
+
+    quiet = _control(external_services, "changes")
+    assert (quiet["phase"], quiet["changes"], quiet["calls"]) == ("verification", {}, {})
+    _slack_post(external_services, "chat.postMessage", channel=channel_id, text="Posted by a flow.")
+    deleted = _slack_post(external_services, "chat.delete", channel=channel_id, ts=agent_post["ts"])
+    assert deleted["ok"], deleted
+    message_id = _message_keys(external_services)["invoice-question"]
+    modified = httpx2.post(
+        "{}/gmail/v1/users/me/messages/{}/modify".format(external_services.google_url, message_id),
+        headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)},
+        json={"removeLabelIds": ["INBOX"]},
+    )
+    assert modified.status_code == 200, modified.text
+    # A read changes nothing and is not among the calls.
+    _slack(external_services, "auth.test")
+    answer = _control(external_services, "changes")
+
+    assert answer["shift_ms"] == _control(external_services, "health")["shift_ms"]
+    posted = answer["changes"]["slack"]["slack.messages"]
+    assert [message["text"] for message in posted["added"]] == ["Posted by a flow."]
+    assert [message["text"] for message in posted["removed"]] == ["Posted while the agent worked."]
+    assert posted["changed"] == []
+    relabelled = answer["changes"]["google"]["google.messages"]
+    assert (relabelled["added"], relabelled["removed"]) == ([], [])
+    (change,) = relabelled["changed"]
+    assert (change["before"]["seed_key"], change["after"]["seed_key"]) == ("invoice-question", "invoice-question")
+    assert "INBOX" in change["before"]["label_ids"] and "INBOX" not in change["after"]["label_ids"]
+    # A collection no write reached is left out.
+    assert "google.calendar_events" not in answer["changes"]["google"]
+    assert answer["calls"] == {
+        "POST slack.com/api/chat.postMessage": 1,
+        "POST slack.com/api/chat.delete": 1,
+        "POST gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify".format(message_id): 1,
+    }
+    previous = answer["previous_phase"]
+    assert (previous["phase"], previous["calls"]) == ("agent", {"POST slack.com/api/chat.postMessage": 1})
+    # A keyed record is how a check finds what a new one refers to: a seeded thread's id, a dm's channel.
+    keyed = answer["keyed"]
+    assert "invoice-question" in {message["seed_key"] for message in keyed["google"]["google.messages"]}
+    assert {channel["seed_key"] for channel in keyed["slack"]["slack.channels"]} == {"dm-claire", "leads-group"}
+    assert _SLACK_TOKEN not in json.dumps(answer) and _GOOGLE_TOKEN not in json.dumps(answer)
+
+    # A later step's phases start from their own marks.
+    _mark_phase(external_services, {"name": "agent"})
+    later = _control(external_services, "changes")
+    assert (later["phase"], later["changes"], later["calls"]) == ("agent", {}, {})
+    assert later["previous_phase"]["phase"] == "verification"
+
+
 def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     external_services: RunningExternalServices,
 ) -> None:

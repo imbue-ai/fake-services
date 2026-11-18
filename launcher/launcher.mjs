@@ -66,9 +66,18 @@
 //                                     rate_limited} of the requests made in that phase alone
 //   GET  /_control/state              the stores of the served services, tokens redacted, with the
 //                                     health's counts, rate_limited and phases
+//   GET  /_control/changes            what the running phase did to the stores, tokens redacted:
+//                                     {phase, since, shift_ms, changes, calls, keyed, previous_phase}.
+//                                     changes[<service>][<collection>] holds {added, changed, removed}
+//                                     against the stores as the phase's mark found them (a changed
+//                                     record as {before, after}; a collection nothing touched is left
+//                                     out); calls counts the phase's requests other than GET by
+//                                     "<METHOD> <host><path>"; keyed[<service>][<collection>] lists
+//                                     the records a seed or an update gave a key; previous_phase is
+//                                     {phase, since, calls} of the phase before, null in the first
 //   POST /_control/phase              {"name": <phase>}: every request from now on is logged and
-//                                     counted in that phase ("agent" until one is marked); answers
-//                                     {ok, phase, previous}
+//                                     counted in that phase ("agent" until one is marked), and the
+//                                     changes are counted from here; answers {ok, phase, previous}
 //   POST /_control/records/<service>?after=<step>
 //                                     add an update to a served service (its seed's record collections,
 //                                     same time shift) that follows the named step, whose end the
@@ -192,6 +201,56 @@ const log = createAccessLog(env.ACCESS_LOG, Object.values(services));
 const limiter = createRateLimits({ enabled: rateLimitsOf(first) === "real", now: clock.now, windowSeconds: rateLimitWindowSeconds });
 const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name]).map((m) => [m.name, limiter.guard(services[m.name], m.limits)]));
 
+const redacted = (snapshot) => JSON.parse(JSON.stringify(snapshot, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
+const collectionsOf = (name) => Object.entries(redacted(services[name].store.snapshot()).collections).map(([collection, { items }]) => [collection, items]);
+const textById = (items) => new Map(items.map((item) => [item.id, JSON.stringify(item)]));
+// The phase the trial is in and the one before it: when each was marked, how long the access log was
+// then, and for the running one every record by id as its JSON text, which is what a record is
+// compared by.
+const spans = [];
+function beginSpan(phase) {
+  if (spans.length) delete spans.at(-1).records;
+  const records = Object.fromEntries(served.map((name) => [name, Object.fromEntries(collectionsOf(name).map(([collection, items]) => [collection, textById(items)]))]));
+  spans.push({ phase, since: new Date().toISOString(), firstLine: log.lines.length, records });
+  if (spans.length > 2) spans.shift();
+}
+beginSpan(log.phase());
+function callsIn(span, next) {
+  const calls = {};
+  for (const line of log.lines.slice(span.firstLine, next?.firstLine)) {
+    if (line.method === "GET") continue;
+    const key = `${line.method} ${line.url.replace(/^https:\/\//, "").split("?")[0]}`;
+    calls[key] = (calls[key] ?? 0) + 1;
+  }
+  return calls;
+}
+function changesAnswer() {
+  const running = spans.at(-1);
+  const previous = spans.length > 1 ? spans[0] : null;
+  const changes = {};
+  const keyed = {};
+  for (const name of served)
+    for (const [collection, items] of collectionsOf(name)) {
+      const before = running.records[name][collection] ?? new Map();
+      const now = textById(items);
+      const added = items.filter((item) => !before.has(item.id));
+      const changed = items.filter((item) => before.has(item.id) && before.get(item.id) !== now.get(item.id)).map((item) => ({ before: JSON.parse(before.get(item.id)), after: item }));
+      const removed = [...before].filter(([id]) => !now.has(id)).map(([, text]) => JSON.parse(text));
+      if (added.length || changed.length || removed.length) (changes[name] ??= {})[collection] = { added, changed, removed };
+      const withKeys = items.filter((item) => item.seed_key);
+      if (withKeys.length) (keyed[name] ??= {})[collection] = withKeys;
+    }
+  return {
+    phase: running.phase,
+    since: running.since,
+    shift_ms: shiftMs,
+    changes,
+    calls: callsIn(running),
+    keyed,
+    previous_phase: previous ? { phase: previous.phase, since: previous.since, calls: callsIn(previous, running) } : null,
+  };
+}
+
 const counts = () => ({
   ...Object.fromEntries(served.map((name) => [name, services[name].counts()])),
   requests: Object.fromEntries(served.map((name) => [name, log.requestCount(name)])),
@@ -208,8 +267,8 @@ async function control(req) {
   if (url.pathname === "/_control/health")
     return Response.json({ ok: true, shift_ms: shiftMs, ...timing(), rate_limits: rateLimitsOf(first), services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, rate_limited: limiter.rateLimited, phase: log.phase(), phases: log.phases });
   if (url.pathname === "/_control/log") return Response.json(log.lines);
+  if (url.pathname === "/_control/changes") return Response.json(changesAnswer());
   if (url.pathname === "/_control/state") {
-    const redact = (snap) => JSON.parse(JSON.stringify(snap, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
     return Response.json({
       dumped_at: new Date().toISOString(),
       shift_ms: shiftMs,
@@ -220,7 +279,7 @@ async function control(req) {
       rate_limited: limiter.rateLimited,
       phase: log.phase(),
       phases: log.phases,
-      ...Object.fromEntries(served.map((name) => [name, redact(services[name].store.snapshot())])),
+      ...Object.fromEntries(served.map((name) => [name, redacted(services[name].store.snapshot())])),
     });
   }
   if (url.pathname === "/_control/phase" && req.method === "POST") {
@@ -232,7 +291,9 @@ async function control(req) {
     }
     // A phase names a key of the health's phases, so it is kept to a plain identifier.
     if (typeof name !== "string" || !/^[a-z][a-z0-9_]*$/.test(name)) return Response.json({ ok: false, error: `the phase name ${JSON.stringify(name)} is not a lowercase identifier` }, { status: 400 });
-    return Response.json({ ok: true, phase: name, previous: log.setPhase(name) });
+    const previous = log.setPhase(name);
+    beginSpan(name);
+    return Response.json({ ok: true, phase: name, previous });
   }
   const records = url.pathname.match(/^\/_control\/records\/([a-z]+)$/);
   if (records && req.method === "POST") {
