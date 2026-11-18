@@ -378,6 +378,10 @@ export function create(seed, clock) {
     unsupportedOf.set(req, keys);
     const preds = [];
     const words = [];
+    // Several in: filters name alternatives, as Slack reads them: a message in any of the named
+    // conversations passes. datalib's reply search names up to 20 channels in one query.
+    const inChannels = new Set();
+    let hasIn = false;
     const dated = (op, value, test) => {
       const span = spanOf(value);
       if (!span) keys.push(`slack:${method}:${op}`);
@@ -398,7 +402,8 @@ export function create(seed, clock) {
           const who = ss.users.all().find((x) => x.name === target.slice(1))?.user_id;
           ch = ss.channels.all().find((c) => c.is_im && c.members.includes(auth.user_id) && c.members.includes(who));
         } else ch = namedChannel(target.replace(/^#/, "")) ?? ss.channels.findOneBy("channel_id", target.replace(/^<#|(\|[^>]*)?>$/g, ""));
-        preds.push((m) => m.channel_id === ch?.channel_id);
+        hasIn = true;
+        if (ch) inChannels.add(ch.channel_id);
       } else if (op?.[1] === "from") {
         const who = term.slice(5).replace(/^[<@]+|>$/g, "");
         const u = ss.users.all().find((x) => x.name === who) ?? ss.users.findOneBy("user_id", who);
@@ -417,6 +422,7 @@ export function create(seed, clock) {
         preds.push((m) => m.text.toLowerCase().includes(lower));
       }
     }
+    if (hasIn) preds.push((m) => inChannels.has(m.channel_id));
     const visible = new Map(ss.channels.all().filter((c) => !c.is_private || c.members.includes(auth.user_id)).map((c) => [c.channel_id, c]));
     const scoreOf = (m) => words.reduce((sum, w) => sum + m.text.toLowerCase().split(w).length - 1, 0);
     const dir = p.sort_dir === "asc" ? 1 : -1;

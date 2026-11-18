@@ -682,6 +682,29 @@ def test_search_answers_datalibs_reply_search_query(external_services: RunningEx
     assert (reply["ts"], root["ts"]) == (reply_ts, root_ts)
     assert reply["permalink"].endswith("/p{}?thread_ts={}".format(reply_ts.replace(".", ""), root_ts))
     assert root["permalink"].endswith("/p{}?thread_ts={}".format(root_ts.replace(".", ""), root_ts))
+    # Several in: filters are alternatives, as Slack reads them: datalib names every channel of a
+    # workspace in one query, and a thread in any of them is found.
+    announcements_id = _channel_id(external_services, "announcements")
+    both = _slack(
+        external_services,
+        "search.messages",
+        query="is:thread in:<#{}> in:<#{}> after:{} before:{}".format(
+            channel_id, announcements_id, root_day - timedelta(days=2), root_day + timedelta(days=2)
+        ),
+        sort="timestamp",
+        sort_dir="desc",
+        count="100",
+        page="1",
+    )
+    assert {match["ts"] for match in both["messages"]["matches"]} >= {reply_ts, root_ts}
+    assert {match["channel"]["id"] for match in both["messages"]["matches"]} >= {channel_id}
+    assert _search(external_services, "in:#eng-oncall in:#announcements") == sorted(
+        _search(external_services, "in:#eng-oncall") + _search(external_services, "in:#announcements"),
+        key=float,
+        reverse=True,
+    ) or set(_search(external_services, "in:#eng-oncall in:#announcements")) == set(
+        _search(external_services, "in:#eng-oncall") + _search(external_services, "in:#announcements")
+    )
     # The `<#id|name>` form names the channel as the `#name` form does, and nothing in the query is a
     # gap the fake counts.
     assert _search(external_services, "in:<#{}|eng-oncall>".format(channel_id)) == _search(
