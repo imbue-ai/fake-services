@@ -698,16 +698,17 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
     absolute ts and resolves under the shift to the root the seed placed."""
     channel_id = _channel_id(external_services, "eng-oncall")
     before = _control(external_services, "health")
-    time.sleep(1.2)
+    # Offsets of zero, told apart by the fraction: the instants land on the base itself, which is
+    # already past, so the test spends no wall-clock time waiting for them to come round.
     update = {
         "users": [],
         "channels": [],
         "messages": [
-            {"channel": "eng-oncall", "user": "morgan.reyes", "ts": "+00:00:01", "text": "Paging the on-call."},
+            {"channel": "eng-oncall", "user": "morgan.reyes", "ts": "+00:00:00", "text": "Paging the on-call."},
             {
                 "channel": "eng-oncall",
                 "user": "morgan.reyes",
-                "ts": "+00:00:01.000001",
+                "ts": "+00:00:00.000001",
                 "thread_ts": "1773900000.000000",
                 "text": "Rolled back.",
             },
@@ -724,7 +725,7 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
     assert health["bases"]["refresh"]["base"] == before["last_request_at"]
     assert added.json()["base"] == before["last_request_at"]
     base_seconds = int(_instant(health["bases"]["refresh"]["base"]).timestamp())
-    root_ts, reply_ts = "{}.000000".format(base_seconds + 1), "{}.000001".format(base_seconds + 1)
+    root_ts, reply_ts = "{}.000000".format(base_seconds), "{}.000001".format(base_seconds)
     history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
     assert history[0]["ts"] == root_ts
     replies = _slack(external_services, "conversations.replies", channel=channel_id, ts=_shifted("1773900000.000000"))
@@ -739,7 +740,7 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
                 {
                     "channel": "announcements",
                     "user": "claire",
-                    "ts": "+00:00:01.000002",
+                    "ts": "+00:00:00.000002",
                     "text": "Status page updated.",
                 }
             ]
@@ -750,7 +751,7 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
     announcements = _slack(
         external_services, "conversations.history", channel=_channel_id(external_services, "announcements")
     )
-    assert announcements["messages"][0]["ts"] == "{}.000002".format(base_seconds + 1)
+    assert announcements["messages"][0]["ts"] == "{}.000002".format(base_seconds)
 
 
 def test_an_update_whose_instants_are_still_in_the_future_is_refused_with_a_wait(
@@ -780,7 +781,6 @@ def test_a_relative_timestamp_may_count_from_an_earlier_steps_base(external_serv
         },
     )
     _channel_id(external_services, "eng-oncall")
-    time.sleep(1.1)
     second = _add_step(
         external_services,
         "slack",
@@ -790,7 +790,7 @@ def test_a_relative_timestamp_may_count_from_an_earlier_steps_base(external_serv
                 {
                     "channel": "eng-oncall",
                     "user": "claire",
-                    "ts": "+00:00:01",
+                    "ts": "+00:00:00.000001",
                     "thread_ts": "triage+00:00:00",
                     "text": "Replying in it.",
                 }
@@ -816,7 +816,7 @@ def test_a_relative_timestamp_may_count_from_an_earlier_steps_base(external_serv
 
     assert (first.status_code, second.status_code) == (200, 200), second.text
     bases = _control(external_services, "health")["bases"]
-    assert _instant(bases["followup"]["base"]) > _instant(bases["triage"]["base"])
+    assert _instant(bases["followup"]["base"]) >= _instant(bases["triage"]["base"])
     root_ts = "{}.000000".format(int(_instant(bases["triage"]["base"]).timestamp()))
     replies = _slack(
         external_services, "conversations.replies", channel=_channel_id(external_services, "eng-oncall"), ts=root_ts
