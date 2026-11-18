@@ -730,7 +730,8 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
     assert history[0]["ts"] == root_ts
     replies = _slack(external_services, "conversations.replies", channel=channel_id, ts=_shifted("1773900000.000000"))
     assert [message["ts"] for message in replies["messages"]][-1] == reply_ts
-    # A second file of the same step counts from the same base, after more requests have been served.
+    # A second file of the same step counts from the same base, after more requests have been served;
+    # naming the step is the same as leaving it bare.
     second = _add_step(
         external_services,
         "slack",
@@ -740,7 +741,7 @@ def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
                 {
                     "channel": "announcements",
                     "user": "claire",
-                    "ts": "+00:00:00.000002",
+                    "ts": "refresh+00:00:00.000002",
                     "text": "Status page updated.",
                 }
             ]

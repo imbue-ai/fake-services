@@ -38,8 +38,9 @@
 //     of up to six digits: that long after the update's base, the moment the latest request any fake
 //     had served before the update began (the start, when none had). So what an update adds reads as
 //     activity between the earlier step's last look and the later step's first, whatever the shift.
-//     `<step>+HH:MM:SS` names an earlier update's base instead, for a record that update added. An
-//     update whose newest instant is still in the future is refused with how long to wait
+//     `<step>+HH:MM:SS` names the step whose base it counts from, the update's own or an earlier one;
+//     the bare form is shorthand for the update's own. An update whose newest instant is still in
+//     the future is refused with how long to wait
 //   - no record carries the box's clock: a date the seed does not state is derived from the seed's
 //     own records (each module's settle step)
 //   - only the seed's tokens authenticate, and the stores start empty: the emulators' own default
@@ -131,11 +132,14 @@ export function parseRelative(value) {
   const fraction = frac.padEnd(6, "0");
   return { step: step ?? null, seconds: (Number(h) * 60 + Number(min)) * 60 + Number(s), fraction, text: value };
 }
-// Each update step's base, by step name, with when it was applied (both on the trial's present).
+// Each update step's base, by step name, with when it was applied (both on the trial's present), and
+// the step whose update is being applied now: a bare `+HH:MM:SS` counts from its base, as does one
+// that names it, since its own entry is only made once its first file has landed.
 const bases = {};
+let currentStep = null;
 let currentBaseMs = null;
 function baseMsOf(rel) {
-  if (rel.step) {
+  if (rel.step && rel.step !== currentStep) {
     if (!bases[rel.step]) throw new Error(`${rel.text} counts from step ${rel.step}, whose update has not been applied`);
     return bases[rel.step].baseMs;
   }
@@ -250,16 +254,17 @@ async function control(req) {
     // agree on when its activity happened.
     const baseMs = bases[step]?.baseMs ?? lastRequestMs() ?? startMs;
     const nowMs = clock.now();
+    currentStep = step;
     currentBaseMs = baseMs;
     let newestMs;
     try {
       newestMs = Math.max(...relativeStampsIn(update).map(relativeMs));
     } catch (e) {
-      currentBaseMs = null;
+      currentStep = currentBaseMs = null;
       return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
     }
     if (newestMs > nowMs) {
-      currentBaseMs = null;
+      currentStep = currentBaseMs = null;
       const wait = Math.ceil((newestMs - nowMs) / 1000);
       return Response.json({ ok: false, error: `the update's newest instant is ${wait} s in the future; apply it once the step's wait has passed`, retry_after_seconds: wait, base: iso(baseMs), now: iso(nowMs), newest: iso(newestMs), counts: counts() }, { status: 409 });
     }
@@ -275,7 +280,7 @@ async function control(req) {
       services[name].store.restore(JSON.parse(before));
       return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
     } finally {
-      currentBaseMs = null;
+      currentStep = currentBaseMs = null;
     }
   }
   return Response.json({ error: "unknown control route" }, { status: 404 });
