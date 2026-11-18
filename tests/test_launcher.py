@@ -1823,7 +1823,9 @@ def test_changes_are_what_the_running_phase_did_to_the_stores(external_services:
     stores gained or lost and the ones that differ since the phase was marked, apart from whatever
     the agent's own phase wrote before it."""
     channel_id = _channel_id(external_services, "eng-oncall")
-    _slack_post(external_services, "chat.postMessage", channel=channel_id, text="Posted while the agent worked.")
+    agent_post = _slack_post(
+        external_services, "chat.postMessage", channel=channel_id, text="Posted while the agent worked."
+    )
     assert _control(external_services, "changes")["previous_phase"] is None
 
     _mark_phase(external_services, {"name": "verification"})
@@ -1831,6 +1833,8 @@ def test_changes_are_what_the_running_phase_did_to_the_stores(external_services:
     quiet = _control(external_services, "changes")
     assert (quiet["phase"], quiet["changes"], quiet["calls"]) == ("verification", {}, {})
     _slack_post(external_services, "chat.postMessage", channel=channel_id, text="Posted by a flow.")
+    deleted = _slack_post(external_services, "chat.delete", channel=channel_id, ts=agent_post["ts"])
+    assert deleted["ok"], deleted
     message_id = _message_keys(external_services)["invoice-question"]
     modified = httpx2.post(
         "{}/gmail/v1/users/me/messages/{}/modify".format(external_services.google_url, message_id),
@@ -1845,7 +1849,8 @@ def test_changes_are_what_the_running_phase_did_to_the_stores(external_services:
     assert answer["shift_ms"] == _control(external_services, "health")["shift_ms"]
     posted = answer["changes"]["slack"]["slack.messages"]
     assert [message["text"] for message in posted["added"]] == ["Posted by a flow."]
-    assert (posted["changed"], posted["removed"]) == ([], [])
+    assert [message["text"] for message in posted["removed"]] == ["Posted while the agent worked."]
+    assert posted["changed"] == []
     relabelled = answer["changes"]["google"]["google.messages"]
     assert (relabelled["added"], relabelled["removed"]) == ([], [])
     (change,) = relabelled["changed"]
@@ -1855,6 +1860,7 @@ def test_changes_are_what_the_running_phase_did_to_the_stores(external_services:
     assert "google.calendar_events" not in answer["changes"]["google"]
     assert answer["calls"] == {
         "POST slack.com/api/chat.postMessage": 1,
+        "POST slack.com/api/chat.delete": 1,
         "POST gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify".format(message_id): 1,
     }
     previous = answer["previous_phase"]
