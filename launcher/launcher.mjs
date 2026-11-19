@@ -56,7 +56,9 @@
 // env: SEED_DIR=<directory of <service>.json> CONTROL_PORT=<port> SLACK_PORT=<port> LINEAR_PORT=<port>
 //      GOOGLE_PORT=<port> (0 takes a free port) [ACCESS_LOG=<jsonl path>] [START_MS=<epoch ms; the
 //      process's own clock when unset>] [RATE_LIMIT_WINDOW_SECONDS=<seconds every rate limit bucket's window lasts; each
-//      bucket's own when unset; for a test that waits a window out>]
+//      bucket's own when unset; for a test that waits a window out>] [RATE_LIMIT_BUCKET_LIMITS=<JSON
+//      {"<service>:<bucket>": limit} of served buckets, each holding that limit in place of its own; for a test
+//      that fills one in a few requests>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
 //   GET  /_control/health             {ok, shift_ms, start_at, last_request_at, step_ends, rate_limits,
@@ -94,7 +96,7 @@ import { serve } from "@emulators/core";
 import { createAccessLog } from "./access_log.mjs";
 import * as google from "./google.mjs";
 import * as linear from "./linear.mjs";
-import { createRateLimits } from "./rate_limits.mjs";
+import { bucketName, createRateLimits } from "./rate_limits.mjs";
 import { createFaults, validateFaults } from "./faults.mjs";
 import * as slack from "./slack.mjs";
 
@@ -136,6 +138,18 @@ for (const name of stating)
 const faults = stating.length ? seeds[stating[0]].faults : undefined;
 const rateLimitWindowSeconds = env.RATE_LIMIT_WINDOW_SECONDS ? Number(env.RATE_LIMIT_WINDOW_SECONDS) : undefined;
 if (Number.isNaN(rateLimitWindowSeconds) || rateLimitWindowSeconds <= 0) fail(`RATE_LIMIT_WINDOW_SECONDS ${JSON.stringify(env.RATE_LIMIT_WINDOW_SECONDS)} is not a positive number`);
+let bucketLimits;
+try {
+  bucketLimits = JSON.parse(env.RATE_LIMIT_BUCKET_LIMITS || "{}");
+} catch {
+  fail(`RATE_LIMIT_BUCKET_LIMITS ${JSON.stringify(env.RATE_LIMIT_BUCKET_LIMITS)} is not JSON`);
+}
+if (bucketLimits === null || typeof bucketLimits !== "object" || Array.isArray(bucketLimits)) fail(`RATE_LIMIT_BUCKET_LIMITS ${JSON.stringify(env.RATE_LIMIT_BUCKET_LIMITS)} is not an object`);
+const servedBucketNames = new Set(MODULES.filter((m) => seeds[m.name]).flatMap((m) => Object.keys(m.limits.buckets).map((bucket) => bucketName(m.name, bucket))));
+for (const [name, limit] of Object.entries(bucketLimits)) {
+  if (!servedBucketNames.has(name)) fail(`RATE_LIMIT_BUCKET_LIMITS names ${JSON.stringify(name)}, which is no bucket of a served service`);
+  if (typeof limit !== "number" || limit <= 0) fail(`RATE_LIMIT_BUCKET_LIMITS gives ${name} the limit ${JSON.stringify(limit)}, which is not a positive number`);
+}
 const anchorMs = Date.parse(first.anchor);
 if (Number.isNaN(anchorMs)) fail(`the seed's anchor ${JSON.stringify(first.anchor)} is not a timestamp`);
 const launchedAtMs = Date.now();
@@ -212,7 +226,7 @@ for (const module of MODULES) {
   Object.assign(seeded, service.add(seeds[module.name]));
 }
 const log = createAccessLog(env.ACCESS_LOG, Object.values(services));
-const limiter = createRateLimits({ enabled: rateLimitsOf(first) === "real", now: clock.now, windowSeconds: rateLimitWindowSeconds });
+const limiter = createRateLimits({ enabled: rateLimitsOf(first) === "real", now: clock.now, windowSeconds: rateLimitWindowSeconds, bucketLimits });
 const faulter = createFaults({ config: faults, now: clock.now });
 // A faulted request is answered before the limiter sees it, as the real service's edge answers before
 // its API does, so it draws on no bucket.

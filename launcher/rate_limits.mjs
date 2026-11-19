@@ -23,12 +23,16 @@
 // A refusal that waiting cures carries the standing headers and Retry-After, in whole seconds; one
 // that never fits carries neither, as a vendor refusing a malformed request sends none. A refused
 // request draws on no bucket, so a caller that retries after Retry-After is admitted.
-//
-// createRateLimits({enabled, now, windowSeconds}): `now()` is the launcher's clock in epoch ms;
-// `windowSeconds`, when set, replaces every bucket's window (a test's, so one can be waited out).
-// It returns guard(service, policy), the service with its route limited (unchanged when disabled),
-// and rateLimited, the count of refusals by "<service>:<bucket>".
-export function createRateLimits({ enabled, now, windowSeconds }) {
+
+// A bucket's name outside its service, "<service>:<bucket>".
+export const bucketName = (serviceName, bucket) => `${serviceName}:${bucket}`;
+
+// createRateLimits({enabled, now, windowSeconds, bucketLimits}): `now()` is the launcher's clock in
+// epoch ms; `windowSeconds`, when set, replaces every bucket's window (a test's, so one can be waited
+// out); `bucketLimits` holds, by bucket name, a limit that replaces that bucket's own (a test's, so
+// one fills in a few requests). It returns guard(service, policy), the service with its route
+// limited (unchanged when disabled), and rateLimited, the count of refusals by bucket name.
+export function createRateLimits({ enabled, now, windowSeconds, bucketLimits }) {
   const rateLimited = {};
   // What each scope of each bucket has spent: a list of {at, cost} for a window, {level, at} for a
   // leaky bucket.
@@ -37,7 +41,7 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
   // Where a request leaves one bucket's scope: whether it fits, how long until it would, and the
   // scope's standing both once the request is counted and as it stands without it. `commit` counts it.
   function standingOf(spec, key, cost, t) {
-    const windowMs = (windowSeconds ?? spec.windowSeconds) * 1000;
+    const windowMs = spec.windowSeconds * 1000;
     const fitsEver = cost <= Math.min(spec.limit, spec.maxCost ?? Infinity);
     if (spec.algorithm === "leaky") {
       const rate = spec.limit / windowMs;
@@ -88,11 +92,15 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
     const refusedBy = new WeakMap();
     const rateLimitedBucket = (req) => refusedBy.get(req) ?? null;
     if (!enabled) return { ...service, rateLimitedBucket };
+    // The buckets as this run keeps them: the policy's, with a test's window and limits in their place.
+    const buckets = Object.fromEntries(
+      Object.entries(policy.buckets).map(([bucket, spec]) => [bucket, { ...spec, windowSeconds: windowSeconds ?? spec.windowSeconds, limit: bucketLimits[bucketName(service.name, bucket)] ?? spec.limit }]),
+    );
     async function route(req, url) {
       const draws = await policy.bucketOf(req, url, service);
       if (!draws.length) return service.route(req, url);
       const t = now();
-      const assessed = draws.map((d) => ({ ...d, ...standingOf(policy.buckets[d.bucket], `${d.bucket}\u0000${d.scope}`, d.cost, t) }));
+      const assessed = draws.map((d) => ({ ...d, ...standingOf(buckets[d.bucket], `${d.bucket}\u0000${d.scope}`, d.cost, t) }));
       const refused = assessed.filter((a) => !a.fits);
       const standing = Object.fromEntries(assessed.map((a) => [a.bucket, refused.length ? a.uncounted : a.counted]));
       const headers = policy.headers ? policy.headers(standing) : {};
@@ -100,7 +108,7 @@ export function createRateLimits({ enabled, now, windowSeconds }) {
         // A request that never fits is refused as such; otherwise the longest wait is the one to name.
         const never = refused.find((a) => a.retryMs === null);
         const by = never ?? refused.reduce((a, b) => (b.retryMs > a.retryMs ? b : a));
-        const key = `${service.name}:${by.bucket}`;
+        const key = bucketName(service.name, by.bucket);
         rateLimited[key] = (rateLimited[key] ?? 0) + 1;
         refusedBy.set(req, key);
         const retryAfter = never ? null : Math.max(1, Math.ceil(by.retryMs / 1000));

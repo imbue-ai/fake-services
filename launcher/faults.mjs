@@ -34,7 +34,7 @@ export function validateFaults(config) {
   if (config === undefined) return null;
   if (typeof config !== "object" || config === null || Array.isArray(config)) return "faults must be an object";
   for (const key of Object.keys(config)) if (!KNOWN_KEYS.has(key)) return `faults has an unknown key ${JSON.stringify(key)}; it takes ${[...KNOWN_KEYS].sort().join(", ")}`;
-  for (const [key, value] of Object.entries(config)) if (!Number.isInteger(value) || value < 0) return `faults.${key} must be a whole number of 0 or more, got ${JSON.stringify(value)}`;
+  for (const [key, value] of Object.entries(config)) if (!Number.isInteger(value) || value < 0) return `faults.${key} must be a non-negative integer, got ${JSON.stringify(value)}`;
   if ((config.rate_limit_episode_every ?? 0) > 0 && !(config.rate_limit_episode_seconds > 0)) return "faults.rate_limit_episode_seconds must be positive when rate_limit_episode_every is";
   return null;
 }
