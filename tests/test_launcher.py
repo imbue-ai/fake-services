@@ -5,6 +5,7 @@ import base64
 import email
 import json
 import time
+from collections.abc import Callable
 from collections.abc import Iterator
 from datetime import UTC
 from datetime import date
@@ -2242,7 +2243,12 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
     """The verification flows drive the agent's own app, whose requests look like any other: the
     phase the driver marks is what tells them from the ones the app made while the agent worked."""
     assert _control(external_services, "health")["phases"] == {
-        "agent": {"requests": {"slack": 0, "linear": 0, "google": 0}, "unsupported_calls": {}, "rate_limited": {}}
+        "agent": {
+            "requests": {"slack": 0, "linear": 0, "google": 0},
+            "unsupported_calls": {},
+            "rate_limited": {},
+            "faulted": {},
+        }
     }
     _slack(external_services, "auth.test")
     httpx2.get("{}/api/admin.users.list".format(external_services.slack_url), headers=_SLACK_HEADERS)
@@ -2273,11 +2279,13 @@ def test_a_phase_mark_stamps_every_later_request_and_counts_it_apart(
             "requests": {"slack": 2, "linear": 0, "google": 0},
             "unsupported_calls": {"slack:admin.users.list": 1},
             "rate_limited": {},
+            "faulted": {},
         },
         "verification": {
             "requests": {"slack": 2, "linear": 1, "google": 0},
             "unsupported_calls": {"slack:admin.users.list": 1},
             "rate_limited": {},
+            "faulted": {},
         },
     }
     state = _control(external_services, "state")
@@ -2318,6 +2326,7 @@ def test_a_phase_named_like_an_object_key_is_counted_like_any_other(
         "requests": {"slack": 1, "linear": 0, "google": 0},
         "unsupported_calls": {},
         "rate_limited": {},
+        "faulted": {},
     }
 
 
@@ -2509,98 +2518,137 @@ def test_a_seed_that_asks_for_no_rate_limits_serves_an_unlimited_burst(
     assert (health["rate_limits"], health["rate_limited"]) == ("none", {})
 
 
+def _until_served(get: Callable[[], httpx2.Response], refused_status: int, seconds: int) -> list[httpx2.Response]:
+    """Asks until an answer is served again, as a client waiting out an episode does, and returns the
+    asks the episode refused on the way: at most one per quarter second, so fewer than ten over a
+    two-second episode."""
+    refused: list[httpx2.Response] = []
+
+    def served() -> bool:
+        answer = get()
+        if answer.status_code == refused_status:
+            refused.append(answer)
+            return False
+        return True
+
+    wait_for(served, timeout=seconds + 3, poll_interval=0.25, error_message="the episode never ended")
+    assert all(1 <= int(answer.headers["retry-after"]) <= seconds for answer in refused)
+    return refused
+
+
+def _requests(get: Callable[[], httpx2.Response], first: int, last: int) -> list[httpx2.Response]:
+    """Requests `first` to `last` of a service's count, inclusive."""
+    return [get() for _ in range(first, last + 1)]
+
+
 def test_a_seed_with_faults_is_served_misbehaving_on_its_schedule(
     faulted_external_services: RunningExternalServices,
 ) -> None:
-    """Requests 1 and 2 are spared; request 6 opens a 2 s rate limit episode that request 7 lands in;
-    request 8 fails transiently; request 10 is unreadable; everything else is served, and a faulted
-    post changes nothing."""
+    """Requests 1 and 2 are spared; request 50 fails transiently; request 60 is unreadable; request 70
+    opens a 2 s rate limit episode that request 71 and the asks that wait it out land in; everything
+    else is served, and a faulted post changes nothing."""
     services = faulted_external_services
+    faults = EXTERNAL_SERVICES_TEST_FAULTS
     channel = _channel_id(services, "eng-oncall")
     before = _slack(services, "conversations.history", channel=channel)["messages"]
     with httpx2.Client(headers=_SLACK_HEADERS) as client:
-        get = lambda method: client.get("{}/api/{}".format(services.slack_url, method))  # noqa: E731
-        # Requests 3 to 5 of the Slack count (the two above were conversations.list in _channel_id
-        # and the history read).
-        spared = [get("auth.test"), get("auth.test"), get("auth.test")]
-        episode_opener = get("auth.test")
+        get = lambda: client.get("{}/api/auth.test".format(services.slack_url))  # noqa: E731
+        # Requests 3 onwards of the Slack count: the two above were conversations.list in _channel_id
+        # and the history read.
+        served = _requests(get, 3, faults["transient_error_every"] - 1)
+        transient = get()
+        served += _requests(get, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
+        unreadable = get()
+        served += _requests(get, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
+        episode_opener = get()
         inside_episode = client.post(
             "{}/api/chat.postMessage".format(services.slack_url),
             json={"channel": channel, "text": "lost to the episode"},
         )
-        time.sleep(EXTERNAL_SERVICES_TEST_FAULTS["rate_limit_episode_seconds"] + 0.2)
-        transient = get("auth.test")
-        after_transient = get("auth.test")
-        unreadable = get("auth.test")
+        refused_asks = _until_served(get, 429, faults["rate_limit_episode_seconds"])
 
-    assert [answer.json()["ok"] for answer in spared] == [True, True, True]
-    assert (episode_opener.status_code, episode_opener.json()) == (429, {"ok": False, "error": "ratelimited"})
-    assert int(episode_opener.headers["retry-after"]) == EXTERNAL_SERVICES_TEST_FAULTS["rate_limit_episode_seconds"]
-    assert (inside_episode.status_code, inside_episode.json()["error"]) == (429, "ratelimited")
-    assert (
-        1 <= int(inside_episode.headers["retry-after"]) <= EXTERNAL_SERVICES_TEST_FAULTS["rate_limit_episode_seconds"]
-    )
+    assert [
+        (answer.status_code, answer.text[:80])
+        for answer in served
+        if answer.status_code != 200 or answer.json().get("ok") is not True
+    ] == []
     # Slack answers internal_error with HTTP 200, as it does every API error but a rate limit.
     assert (transient.status_code, transient.json()) == (200, {"ok": False, "error": "internal_error"})
-    assert after_transient.json()["ok"] is True
     assert unreadable.status_code == 503
     assert unreadable.headers["content-type"].startswith("text/html")
     assert "<html>" in unreadable.text
-    # Request 11 is served, and the post the episode refused never reached the store.
+    assert (episode_opener.status_code, episode_opener.json()) == (429, {"ok": False, "error": "ratelimited"})
+    assert int(episode_opener.headers["retry-after"]) == faults["rate_limit_episode_seconds"]
+    assert (inside_episode.status_code, inside_episode.json()["error"]) == (429, "ratelimited")
+    # The post the episode refused never reached the store.
     assert _slack(services, "conversations.history", channel=channel)["messages"] == before
     health = _control(services, "health")
-    assert health["faults"] == EXTERNAL_SERVICES_TEST_FAULTS
-    assert health["faulted"] == {"slack:rate_limit_episode": 2, "slack:transient_error": 1, "slack:unreadable": 1}
+    assert health["faults"] == faults
+    episode_refusals = 2 + len(refused_asks)
+    assert health["faulted"] == {
+        "slack:transient_error": 1,
+        "slack:unreadable": 1,
+        "slack:rate_limit_episode": episode_refusals,
+    }
     assert health["phases"]["agent"]["faulted"] == health["faulted"]
     assert _control(services, "state")["faulted"] == health["faulted"]
     # A faulted request is logged as such and drew on no rate limit.
     faulted_lines = [line for line in _control(services, "log") if line["fault"]]
     assert [(line["status"], line["error"], line["fault"], line["rate_limited"]) for line in faulted_lines] == [
-        (429, "ratelimited", "slack:rate_limit_episode", None),
-        (429, "ratelimited", "slack:rate_limit_episode", None),
         (200, "internal_error", "slack:transient_error", None),
         (503, None, "slack:unreadable", None),
-    ]
+    ] + [(429, "ratelimited", "slack:rate_limit_episode", None)] * episode_refusals
     assert health["rate_limited"] == {}
 
 
 def test_linear_and_google_misbehave_in_their_own_shapes(faulted_external_services: RunningExternalServices) -> None:
     """The one schedule applies to every service, each refusing and failing as its vendor does."""
     services = faulted_external_services
-    seconds = EXTERNAL_SERVICES_TEST_FAULTS["rate_limit_episode_seconds"]
+    faults = EXTERNAL_SERVICES_TEST_FAULTS
+    seconds = faults["rate_limit_episode_seconds"]
     with httpx2.Client(headers={"Authorization": _LINEAR_TOKEN}) as client:
         post = lambda: client.post(services.linear_url + "/graphql", json={"query": "{ viewer { id } }"})  # noqa: E731
-        served = [post() for _ in range(5)]
-        refused = post()
-        time.sleep(seconds + 0.2)
-        served_again = post()
+        served = _requests(post, 1, faults["transient_error_every"] - 1)
         failed = post()
+        served += _requests(post, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
+        unreadable = post()
+        served += _requests(post, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
+        refused = post()
+        linear_refusals = _until_served(post, 429, seconds)
     with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
         profile = lambda: client.get(services.google_url + "/gmail/v1/users/me/profile")  # noqa: E731
-        google_served = [profile() for _ in range(5)]
-        google_refused = profile()
-        time.sleep(seconds + 0.2)
-        google_served_again = profile()
+        google_served = _requests(profile, 1, faults["transient_error_every"] - 1)
         google_failed = profile()
+        google_served += _requests(profile, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
+        google_unreadable = profile()
+        google_served += _requests(profile, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
+        google_refused = profile()
+        google_refusals = _until_served(profile, 403, seconds)
 
-    assert all("errors" not in answer.json() for answer in served)
+    assert [
+        (answer.status_code, answer.text[:80])
+        for answer in served
+        if answer.status_code != 200 or "errors" in answer.json()
+    ] == []
+    assert (failed.status_code, failed.json()["errors"][0]["message"]) == (500, "Internal server error")
+    assert (unreadable.status_code, unreadable.headers["content-type"].split(";")[0]) == (503, "text/html")
     assert refused.status_code == 429
     assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
     assert int(refused.headers["retry-after"]) == seconds
-    assert "errors" not in served_again.json()
-    assert (failed.status_code, failed.json()["errors"][0]["message"]) == (500, "Internal server error")
     assert all(answer.status_code == 200 for answer in google_served)
+    assert (google_failed.status_code, google_failed.json()["error"]["status"]) == (500, "INTERNAL")
+    assert google_unreadable.status_code == 503
     assert google_refused.status_code == 403
     assert google_refused.json()["error"]["errors"][0]["reason"] == "userRateLimitExceeded"
     assert int(google_refused.headers["retry-after"]) == seconds
-    assert google_served_again.status_code == 200
-    assert (google_failed.status_code, google_failed.json()["error"]["status"]) == (500, "INTERNAL")
     faulted = _control(services, "health")["faulted"]
     assert {key: count for key, count in faulted.items() if not key.startswith("slack:")} == {
-        "linear:rate_limit_episode": 1,
         "linear:transient_error": 1,
-        "google:rate_limit_episode": 1,
+        "linear:unreadable": 1,
+        "linear:rate_limit_episode": 1 + len(linear_refusals),
         "google:transient_error": 1,
+        "google:unreadable": 1,
+        "google:rate_limit_episode": 1 + len(google_refusals),
     }
 
 
