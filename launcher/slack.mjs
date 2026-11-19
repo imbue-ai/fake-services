@@ -53,6 +53,14 @@ async function tokenOf(req, url) {
 // See rate_limits.mjs for what a policy holds. One fake is one workspace, so a method's window is
 // shared by every token the seed names. A request with no seeded token is refused by authentication,
 // not counted.
+// How Slack misbehaves (see faults.mjs): a rate limit refusal is a 429 with Retry-After; a transient
+// failure is `internal_error`, which Slack answers with HTTP 200 like any other API error and
+// documents as one to retry.
+export const faults = {
+  rateLimited: (req, url, retryAfterSeconds) => Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } }),
+  transientError: () => Response.json({ ok: false, error: "internal_error" }),
+};
+
 export const limits = {
   buckets: { ...Object.fromEntries(Object.entries(METHOD_TIERS).map(([method, n]) => [method, tier(n)])), other: tier(3) },
   async bucketOf(req, url, service) {

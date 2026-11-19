@@ -24,7 +24,7 @@ export function createAccessLog(path, services) {
   const phases = Object.create(null);
   // When the latest request began, on the process's clock; null until one has.
   let lastBeganMs = null;
-  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {}, rate_limited: {} });
+  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {}, rate_limited: {}, faulted: {} });
   phaseCounts(phase);
   function setPhase(name) {
     const previous = phase;
@@ -68,6 +68,8 @@ export function createAccessLog(path, services) {
       }
       const rateLimited = service.rateLimitedBucket(req);
       if (rateLimited) inPhase.rate_limited[rateLimited] = (inPhase.rate_limited[rateLimited] ?? 0) + 1;
+      const fault = service.faulted ? service.faulted(req) : null;
+      if (fault) inPhase.faulted[fault] = (inPhase.faulted[fault] ?? 0) + 1;
       const outcome = service.outcome(json);
       const rec = {
         ts: new Date(began).toISOString(),
@@ -90,6 +92,8 @@ export function createAccessLog(path, services) {
         unsupported: unsupported[0] ?? null,
         // "<service>:<bucket>" of the rate limit that refused the request, else null.
         rate_limited: rateLimited,
+        // "<service>:<kind>" of the fault the request was answered with instead of being served, else null.
+        fault,
         result_count: outcome.result_count,
         response_bytes: Buffer.byteLength(text),
         duration_ms: Date.now() - began,

@@ -170,6 +170,14 @@ const tooComplex = (cost) =>
     { status: 400 },
   );
 // See rate_limits.mjs for what a policy holds.
+// How Linear misbehaves (see faults.mjs): the hourly refusal with Retry-After, and an internal
+// server error as a GraphQL server answers one, an HTTP 500 whose errors name no code.
+export const faults = {
+  rateLimited: (req, url, retryAfterSeconds) =>
+    Response.json(rateLimited("Rate limit exceeded: too many requests in the last hour."), { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } }),
+  transientError: () => Response.json({ errors: [{ message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } }] }, { status: 500 }),
+};
+
 export const limits = {
   buckets: {
     requests: { limit: 2500, windowSeconds: 3600, algorithm: "leaky" },

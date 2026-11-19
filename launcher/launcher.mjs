@@ -44,6 +44,9 @@
 //     own records (each module's settle step)
 //   - only the seed's tokens authenticate, and the stores start empty: the emulators' own default
 //     workspace is never loaded
+//   - with a `faults` object a service misbehaves on a fixed schedule, as the real one does on a bad
+//     day: a rate limit episode with Retry-After, the service's own transient error, an HTML error
+//     page (faults.mjs); a faulted request reaches no service and is marked `fault` in the access log
 //   - with `"rate_limits": "real"` (the default) each service refuses a caller who outruns the limits
 //     the real service documents, as the real service refuses it, and adds the real service's rate
 //     limit headers to its answers; with `"rate_limits": "none"` nothing is limited
@@ -92,6 +95,7 @@ import { createAccessLog } from "./access_log.mjs";
 import * as google from "./google.mjs";
 import * as linear from "./linear.mjs";
 import { createRateLimits } from "./rate_limits.mjs";
+import { createFaults, validateFaults } from "./faults.mjs";
 import * as slack from "./slack.mjs";
 
 const MODULES = [slack, linear, google];
@@ -120,6 +124,16 @@ for (const name of served)
     fail(`the ${name} seed's anchor, time_shift and rate_limits differ from the ${served[0]} seed's`);
 if (!["to_trial_start", "none"].includes(timeShift(first))) fail(`time_shift ${JSON.stringify(first.time_shift)} is neither "to_trial_start" nor "none"`);
 if (!["real", "none"].includes(rateLimitsOf(first))) fail(`rate_limits ${JSON.stringify(first.rate_limits)} is neither "real" nor "none"`);
+// Faults are a setting of the whole trial, like the rate limits: one seed states them and the rest
+// state the same or none.
+for (const name of served) {
+  const problem = validateFaults(seeds[name].faults);
+  if (problem) fail(`the ${name} seed's ${problem}`);
+}
+const stating = served.filter((name) => seeds[name].faults !== undefined);
+for (const name of stating)
+  if (JSON.stringify(seeds[name].faults) !== JSON.stringify(seeds[stating[0]].faults)) fail(`the ${name} seed's faults differ from the ${stating[0]} seed's`);
+const faults = stating.length ? seeds[stating[0]].faults : undefined;
 const rateLimitWindowSeconds = env.RATE_LIMIT_WINDOW_SECONDS ? Number(env.RATE_LIMIT_WINDOW_SECONDS) : undefined;
 if (Number.isNaN(rateLimitWindowSeconds) || rateLimitWindowSeconds <= 0) fail(`RATE_LIMIT_WINDOW_SECONDS ${JSON.stringify(env.RATE_LIMIT_WINDOW_SECONDS)} is not a positive number`);
 const anchorMs = Date.parse(first.anchor);
@@ -199,7 +213,10 @@ for (const module of MODULES) {
 }
 const log = createAccessLog(env.ACCESS_LOG, Object.values(services));
 const limiter = createRateLimits({ enabled: rateLimitsOf(first) === "real", now: clock.now, windowSeconds: rateLimitWindowSeconds });
-const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name]).map((m) => [m.name, limiter.guard(services[m.name], m.limits)]));
+const faulter = createFaults({ config: faults, now: clock.now });
+// A faulted request is answered before the limiter sees it, as the real service's edge answers before
+// its API does, so it draws on no bucket.
+const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name]).map((m) => [m.name, faulter.guard(limiter.guard(services[m.name], m.limits), m.faults)]));
 
 const redacted = (snapshot) => JSON.parse(JSON.stringify(snapshot, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
 const collectionsOf = (name) => Object.entries(redacted(services[name].store.snapshot()).collections).map(([collection, { items }]) => [collection, items]);
@@ -265,7 +282,7 @@ const timing = () => ({
 async function control(req) {
   const url = new URL(req.url);
   if (url.pathname === "/_control/health")
-    return Response.json({ ok: true, shift_ms: shiftMs, ...timing(), rate_limits: rateLimitsOf(first), services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, rate_limited: limiter.rateLimited, phase: log.phase(), phases: log.phases });
+    return Response.json({ ok: true, shift_ms: shiftMs, ...timing(), rate_limits: rateLimitsOf(first), faults: faults ?? null, faulted: faulter.faults, services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, rate_limited: limiter.rateLimited, phase: log.phase(), phases: log.phases });
   if (url.pathname === "/_control/log") return Response.json(log.lines);
   if (url.pathname === "/_control/changes") return Response.json(changesAnswer());
   if (url.pathname === "/_control/state") {
@@ -274,6 +291,8 @@ async function control(req) {
       shift_ms: shiftMs,
       ...timing(),
       rate_limits: rateLimitsOf(first),
+      faults: faults ?? null,
+      faulted: faulter.faults,
       counts: counts(),
       unsupported_calls: log.unsupportedCalls,
       rate_limited: limiter.rateLimited,
