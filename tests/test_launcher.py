@@ -860,6 +860,56 @@ def test_a_relative_timestamp_may_count_from_the_end_of_an_earlier_step(
     assert unknown.status_code == 400 and "nosuch" in unknown.json()["error"]
 
 
+def test_client_counts_names_each_channels_newest_message_and_its_last_change(
+    external_services: RunningExternalServices,
+) -> None:
+    """The unpublished sidebar method a downloader skips quiet channels by: `latest` is the channel's
+    newest top-level message, `updated` moves with a reply or an edit as well, and the fake serves it
+    rather than counting it as a gap."""
+    channel_id = _channel_id(external_services, "eng-oncall")
+    before = _slack_post(external_services, "client.counts")
+    row = next(entry for entry in before["channels"] if entry["id"] == channel_id)
+    history = _slack(external_services, "conversations.history", channel=channel_id)["messages"]
+    newest_root = max((m["ts"] for m in history), key=float)
+    assert (row["latest"], row["last_read"]) == (newest_root, newest_root)
+    assert float(row["updated"]) >= float(newest_root)
+    # One row per conversation the token's user is in, as the sidebar shows them.
+    mine = _slack(external_services, "users.conversations", types="public_channel,private_channel")["channels"]
+    assert {entry["id"] for entry in before["channels"]} == {channel["id"] for channel in mine} >= {channel_id}
+    assert before["threads"] == {"has_unreads": False, "mention_count": 0}
+
+    # An edit of a seed root moves updated and leaves latest; a new root moves both.
+    edited = _add_after(
+        external_services,
+        "slack",
+        "mirror",
+        {
+            "messages": [
+                {
+                    "channel": "eng-oncall",
+                    "user": "claire",
+                    "ts": "1773900000.000000",
+                    "edited_ts": "mirror+00:00:00",
+                    "text": "ALERT resolved",
+                }
+            ]
+        },
+    )
+    assert edited.status_code == 200, edited.text
+    after_edit = next(e for e in _slack_post(external_services, "client.counts")["channels"] if e["id"] == channel_id)
+    assert after_edit["latest"] == newest_root and float(after_edit["updated"]) > float(row["updated"])
+    added = _add_after(
+        external_services,
+        "slack",
+        "mirror",
+        {"messages": [{"channel": "eng-oncall", "user": "claire", "ts": "mirror+00:00:00.000001", "text": "New"}]},
+    )
+    assert added.status_code == 200, added.text
+    after_root = next(e for e in _slack_post(external_services, "client.counts")["channels"] if e["id"] == channel_id)
+    assert float(after_root["latest"]) > float(newest_root) and after_root["updated"] == after_root["latest"]
+    assert "slack:client.counts" not in _control(external_services, "health")["unsupported_calls"]
+
+
 def test_an_update_edits_a_message_it_names_with_edited_ts_and_refuses_a_bare_repeat(
     external_services: RunningExternalServices,
 ) -> None:

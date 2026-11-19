@@ -531,9 +531,43 @@ export function create(seed, clock) {
     answer.messages = withLatestReply(channel_id, ordered);
     return Response.json(answer, { status: res.status });
   }
+  // client.counts, the unpublished method the Slack client reads its sidebar from: one entry per
+  // conversation the token's user is in, with the newest top-level message (latest), the moment the
+  // conversation last changed in any way (updated: a message, a reply or an edit), and the read mark,
+  // which here is the newest message since the fake's users read everything. A downloader that reads
+  // it skips the conversations with nothing new instead of asking each one.
+  async function clientCounts(req) {
+    const auth = await (await asPost(req, "auth.test", {})).json();
+    if (!auth.ok) return Response.json(auth);
+    const byChannel = new Map();
+    for (const m of ss.messages.all()) {
+      const entry = byChannel.get(m.channel_id) ?? { latest: null, updated: null };
+      if (!m.thread_ts || m.thread_ts === m.ts) entry.latest = newerTs(entry.latest, m.ts);
+      entry.updated = newerTs(entry.updated, m.ts);
+      if (m.edited?.ts) entry.updated = newerTs(entry.updated, m.edited.ts);
+      byChannel.set(m.channel_id, entry);
+    }
+    const row = (ch) => {
+      const entry = byChannel.get(ch.channel_id) ?? { latest: null, updated: null };
+      const latest = entry.latest ?? "0.000000";
+      return { id: ch.channel_id, last_read: latest, latest, updated: entry.updated ?? latest, history_invalid: "0.000000", mention_count: 0, has_unreads: false };
+    };
+    const mine = ss.channels.all().filter((ch) => ch.members.includes(auth.user_id) && !ch.is_archived);
+    return Response.json({
+      ok: true,
+      threads: { has_unreads: false, mention_count: 0 },
+      channels: mine.filter((ch) => !isDm(ch)).map(row),
+      mpims: mine.filter((ch) => ch.is_mpim).map(row),
+      ims: mine.filter((ch) => ch.is_im).map(row),
+      channel_badges: { channels: 0, dms: 0, app_dms: 0, thread_mentions: 0, thread_unreads: 0 },
+      alerts: [],
+      saved: { uncompleted_count: 0, uncompleted_overdue_count: 0 },
+    });
+  }
   async function apiRoute(req, url) {
     const method = url.pathname.slice(5);
     const p = await params(req);
+    if (method === "client.counts") return clientCounts(req);
     if (method === "search.messages" || method === "search.all") return search(req, p, method);
     if (method === "users.conversations") return userConversations(req, p);
     if (method === "conversations.history" && (p.oldest || p.latest)) return history(req, p);
