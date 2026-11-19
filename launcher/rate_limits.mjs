@@ -92,7 +92,7 @@ export function createRateLimits({ enabled, now, windowSeconds, bucketLimits }) 
     const refusedBy = new WeakMap();
     const rateLimitedBucket = (req) => refusedBy.get(req) ?? null;
     if (!enabled) return { ...service, rateLimitedBucket };
-    // The buckets as this run keeps them: each one's own, with a test's window and limit in place of its own.
+    // The buckets as this run keeps them: the policy's, with a test's window and limits in their place.
     const buckets = Object.fromEntries(
       Object.entries(policy.buckets).map(([bucket, spec]) => [bucket, { ...spec, windowSeconds: windowSeconds ?? spec.windowSeconds, limit: bucketLimits[bucketName(service.name, bucket)] ?? spec.limit }]),
     );
