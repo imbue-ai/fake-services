@@ -15,6 +15,7 @@ from typing import Any
 import httpx2
 import pytest
 
+from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_LINEAR_REQUEST_LIMIT
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_RATE_LIMIT_WINDOW_SECONDS
 from imbue.minds_evals.conftest import EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
 from imbue.minds_evals.conftest import RunningExternalServices
@@ -2298,20 +2299,27 @@ def test_linear_refuses_a_user_past_its_hourly_complexity(external_services: Run
     assert _control(external_services, "log")[-1]["rate_limited"] == "linear:complexity"
 
 
-# 2,500 requests take about 6 seconds alone, and longer beside a parallel suite.
-@pytest.mark.timeout(30)
-def test_linear_refuses_a_user_past_its_hourly_requests(external_services: RunningExternalServices) -> None:
-    answers, elapsed_seconds = _linear_until_refused(external_services, "{ viewer { id } }", 3000)
+def test_linear_refuses_a_user_past_its_hourly_requests(
+    external_services_with_a_small_linear_request_bucket: RunningExternalServices,
+) -> None:
+    services = external_services_with_a_small_linear_request_bucket
+    limit = EXTERNAL_SERVICES_TEST_LINEAR_REQUEST_LIMIT
+    answers, elapsed_seconds = _linear_until_refused(services, "{ viewer { id } }", 2 * limit)
     refused = answers[-1]
+    # As Linear's does, the bucket drains its whole limit in an hour, one request at a time.
+    drain_seconds = 60 * 60 / limit
 
-    # 2,500 requests an hour, and one more for each 1.44 seconds the burst took to send.
-    assert 2500 <= len(answers) - 1 <= 2500 + elapsed_seconds / 1.44 + 1
+    # The bucket's limit, and one more for each drain period the burst took to send.
+    assert limit <= len(answers) - 1 <= limit + elapsed_seconds / drain_seconds + 1
     assert refused.status_code == 429
     assert refused.json()["errors"][0]["extensions"]["code"] == "RATELIMITED"
-    assert refused.headers["x-ratelimit-requests-remaining"] == "0"
-    # One request drains away every 1.44 seconds.
-    assert 1 <= int(refused.headers["retry-after"]) <= 2
-    assert _control(external_services, "health")["rate_limited"] == {"linear:requests": 1}
+    assert (refused.headers["x-ratelimit-requests-limit"], refused.headers["x-ratelimit-requests-remaining"]) == (
+        str(limit),
+        "0",
+    )
+    # Room for one more comes one drain period after the burst began.
+    assert drain_seconds - elapsed_seconds <= int(refused.headers["retry-after"]) <= drain_seconds
+    assert _control(services, "health")["rate_limited"] == {"linear:requests": 1}
 
 
 def test_the_google_store_holds_the_seed_and_nothing_of_the_emulators_own(
