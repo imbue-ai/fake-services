@@ -2678,6 +2678,8 @@ def test_linear_and_google_misbehave_in_their_own_shapes(faulted_external_servic
             return client.get(services.google_url + "/gmail/v1/users/me/profile")
 
         google_served, google_failed, google_unreadable, google_refused = _up_to_the_episode(profile)
+        # A product with no limit of its own is refused in an episode all the same.
+        userinfo_refused = _userinfo(services)
         google_refusals = _until_served(profile, 403, seconds)
 
     assert [
@@ -2696,6 +2698,8 @@ def test_linear_and_google_misbehave_in_their_own_shapes(faulted_external_servic
     assert google_refused.status_code == 403
     assert google_refused.json()["error"]["errors"][0]["reason"] == "userRateLimitExceeded"
     assert int(google_refused.headers["retry-after"]) == seconds
+    assert (userinfo_refused.status_code, userinfo_refused.json()["error"]["status"]) == (429, "RESOURCE_EXHAUSTED")
+    assert 1 <= int(userinfo_refused.headers["retry-after"]) <= seconds
     faulted = _control(services, "health")["faulted"]
     assert {key: count for key, count in faulted.items() if not key.startswith("slack:")} == {
         "linear:transient_error": 1,
@@ -2703,7 +2707,7 @@ def test_linear_and_google_misbehave_in_their_own_shapes(faulted_external_servic
         "linear:rate_limit_episode": 1 + len(linear_refusals),
         "google:transient_error": 1,
         "google:unreadable": 1,
-        "google:rate_limit_episode": 1 + len(google_refusals),
+        "google:rate_limit_episode": 2 + len(google_refusals),
     }
 
 
