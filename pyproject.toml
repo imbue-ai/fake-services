@@ -1,0 +1,21 @@
+# The launcher is a Node program; this project holds only its tests, which drive the real launcher
+# over HTTP from pytest. `uv run pytest` runs them once `npm ci` has installed the launcher's packages.
+[project]
+name = "fake-services-tests"
+version = "0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.27",
+    "pytest-timeout>=2.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--timeout=60"]
