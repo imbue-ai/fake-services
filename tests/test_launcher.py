@@ -93,9 +93,7 @@ def _shifted(ts: str) -> str:
 
 def _shifted_iso(stamp: str) -> str:
     """A seed's timestamp as the launcher serves it under the test's shift."""
-    moved = datetime.fromisoformat(stamp.replace("Z", "+00:00")) + timedelta(
-        seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS
-    )
+    moved = _instant(stamp) + timedelta(seconds=EXTERNAL_SERVICES_TEST_SHIFT_SECONDS)
     return moved.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -116,7 +114,7 @@ def _served_dates(answer: Any) -> Iterator[float]:
     if isinstance(answer, dict):
         for key, value in answer.items():
             if key in _DATE_KEYS and isinstance(value, str):
-                yield datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                yield _instant(value).timestamp()
             elif key in _DATE_KEYS and isinstance(value, int):
                 yield float(value)
             else:
