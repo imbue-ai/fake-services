@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install the launcher's packages
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run the tests against the real launcher
+        run: uv run pytest

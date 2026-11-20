@@ -1,7 +1,25 @@
 {
-  "name": "minds-evals-external-services",
-  "private": true,
+  "name": "fake-services",
+  "version": "0.1.0",
+  "description": "Fake Slack, Linear and Google APIs, seeded from JSON, for testing programs that read the real ones",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imbue-ai/fake-services.git"
+  },
   "type": "module",
+  "bin": {
+    "fake-services": "launcher/launcher.mjs"
+  },
+  "files": [
+    "launcher/",
+    "linear_schema.graphql.gz",
+    "LINEAR_SCHEMA_LICENSE",
+    "curl_shim.sh"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@emulators/core": "0.11.2",
     "@emulators/slack": "0.11.2",
