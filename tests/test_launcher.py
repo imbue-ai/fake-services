@@ -2575,6 +2575,21 @@ def _requests(get: Callable[[], httpx2.Response], first: int, last: int) -> list
     return [get() for _ in range(first, last + 1)]
 
 
+def _up_to_the_episode(
+    get: Callable[[], httpx2.Response], already_made: int = 0
+) -> tuple[list[httpx2.Response], httpx2.Response, httpx2.Response, httpx2.Response]:
+    """Walk EXTERNAL_SERVICES_TEST_FAULTS from request `already_made + 1` of a service's count to the
+    one that opens the rate limit episode: the answers served on the way, then the transient error,
+    the unreadable page and the episode's opener."""
+    faults = EXTERNAL_SERVICES_TEST_FAULTS
+    served = _requests(get, already_made + 1, faults["transient_error_every"] - 1)
+    transient = get()
+    served += _requests(get, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
+    unreadable = get()
+    served += _requests(get, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
+    return served, transient, unreadable, get()
+
+
 def test_a_seed_with_faults_is_served_misbehaving_on_its_schedule(
     faulted_external_services: RunningExternalServices,
 ) -> None:
@@ -2587,14 +2602,8 @@ def test_a_seed_with_faults_is_served_misbehaving_on_its_schedule(
     before = _slack(services, "conversations.history", channel=channel)["messages"]
     with httpx2.Client(headers=_SLACK_HEADERS) as client:
         get = lambda: client.get("{}/api/auth.test".format(services.slack_url))  # noqa: E731
-        # Requests 3 onwards of the Slack count: the two above were conversations.list in _channel_id
-        # and the history read.
-        served = _requests(get, 3, faults["transient_error_every"] - 1)
-        transient = get()
-        served += _requests(get, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
-        unreadable = get()
-        served += _requests(get, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
-        episode_opener = get()
+        # The Slack count stands at 2: conversations.list in _channel_id and the history read.
+        served, transient, unreadable, episode_opener = _up_to_the_episode(get, already_made=2)
         inside_episode = client.post(
             "{}/api/chat.postMessage".format(services.slack_url),
             json={"channel": channel, "text": "lost to the episode"},
@@ -2642,21 +2651,11 @@ def test_linear_and_google_misbehave_in_their_own_shapes(faulted_external_servic
     seconds = faults["rate_limit_episode_seconds"]
     with httpx2.Client(headers={"Authorization": _LINEAR_TOKEN}) as client:
         post = lambda: client.post(services.linear_url + "/graphql", json={"query": "{ viewer { id } }"})  # noqa: E731
-        served = _requests(post, 1, faults["transient_error_every"] - 1)
-        failed = post()
-        served += _requests(post, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
-        unreadable = post()
-        served += _requests(post, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
-        refused = post()
+        served, failed, unreadable, refused = _up_to_the_episode(post)
         linear_refusals = _until_served(post, 429, seconds)
     with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
         profile = lambda: client.get(services.google_url + "/gmail/v1/users/me/profile")  # noqa: E731
-        google_served = _requests(profile, 1, faults["transient_error_every"] - 1)
-        google_failed = profile()
-        google_served += _requests(profile, faults["transient_error_every"] + 1, faults["unreadable_every"] - 1)
-        google_unreadable = profile()
-        google_served += _requests(profile, faults["unreadable_every"] + 1, faults["rate_limit_episode_every"] - 1)
-        google_refused = profile()
+        google_served, google_failed, google_unreadable, google_refused = _up_to_the_episode(profile)
         google_refusals = _until_served(profile, 403, seconds)
 
     assert [
