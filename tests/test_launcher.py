@@ -716,6 +716,42 @@ def test_search_answers_datalibs_reply_search_query(external_services: RunningEx
     assert _control(external_services, "health")["unsupported_calls"] == {}
 
 
+def test_an_update_posted_without_a_step_takes_absolute_timestamps_only(
+    external_services: RunningExternalServices,
+) -> None:
+    """Nothing is taken to follow a step it does not name: a relative timestamp in an update posted
+    without `?after=` is refused, nothing is recorded under step_ends, and the same file posted naming
+    a step is taken."""
+    update = {
+        "users": [],
+        "channels": [],
+        "messages": [{"channel": "eng-oncall", "user": "morgan.reyes", "ts": "mirror+00:00:00", "text": "Paging."}],
+    }
+    before = _control(external_services, "health")["counts"]
+
+    refused = _add(external_services, "slack", json.dumps(update))
+    taken = _add_after(external_services, "slack", "mirror", update)
+
+    assert refused.status_code == 400
+    assert refused.json()["error"] == (
+        "mirror+00:00:00 is a relative timestamp, which counts from the end of the step an update follows; "
+        "this update follows none (POST ...?after=<step>)"
+    )
+    assert _control(external_services, "health")["counts"]["slack"]["messages"] == before["slack"]["messages"] + 1
+    assert taken.json()["after"] == "mirror"
+    assert list(_control(external_services, "health")["step_ends"]) == ["mirror"]
+    # An absolute update posted without a step is taken as before, follows no step and records none.
+    absolute = _add(
+        external_services, "slack", external_services_fixture_text(EXTERNAL_SERVICES_UPDATE_FIXTURE, "slack")
+    )
+    assert (absolute.json()["ok"], absolute.json()["after"], absolute.json()["after_last_request_at"]) == (
+        True,
+        None,
+        None,
+    )
+    assert list(_control(external_services, "health")["step_ends"]) == ["mirror"]
+
+
 def test_a_relative_timestamp_counts_from_the_last_request_the_fake_served(
     external_services: RunningExternalServices,
 ) -> None:

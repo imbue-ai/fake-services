@@ -88,7 +88,8 @@
 //                                     same time shift) that follows the named step, whose end the
 //                                     update's first file records; all of it lands or none does; 409
 //                                     with retry_after_seconds while its newest instant is in the future.
-//                                     The step is "update" when unnamed
+//                                     One posted without ?after= follows no step and takes absolute
+//                                     timestamps only
 //   GET  /_control/log                the access log so far, as a JSON array
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -176,7 +177,7 @@ let currentAfter = null;
 let currentEndMs = null;
 function stepEndMsOf(rel) {
   if (rel.step === currentAfter && currentEndMs !== null) return currentEndMs;
-  if (currentAfter === null) throw new Error(`${rel.text} is a relative timestamp, which only an update may carry`);
+  if (currentAfter === null) throw new Error(`${rel.text} is a relative timestamp, which counts from the end of the step an update follows; this update follows none (POST ...?after=<step>)`);
   if (!stepEnds[rel.step]) throw new Error(`${rel.text} counts from the end of step ${rel.step}, which no update has followed`);
   return stepEnds[rel.step].endMs;
 }
@@ -338,12 +339,12 @@ async function control(req) {
     } catch {
       return Response.json({ ok: false, error: "the update is not JSON" }, { status: 400 });
     }
-    const after = url.searchParams.get("after") ?? "update";
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(after)) return Response.json({ ok: false, error: `the step name ${JSON.stringify(after)} is not a lowercase identifier` }, { status: 400 });
+    const after = url.searchParams.get("after");
+    if (after !== null && !/^[a-z0-9][a-z0-9-]*$/.test(after)) return Response.json({ ok: false, error: `the step name ${JSON.stringify(after)} is not a lowercase identifier` }, { status: 400 });
     // The step this update follows ended with the latest request any fake has served, else at the
     // start; the first file of an update records it, and every later file of the same update reads
     // it back, so a step's services agree on when its activity happened.
-    const endMs = stepEnds[after]?.endMs ?? lastRequestMs() ?? startMs;
+    const endMs = after === null ? null : stepEnds[after]?.endMs ?? lastRequestMs() ?? startMs;
     const nowMs = clock.now();
     currentAfter = after;
     currentEndMs = endMs;
@@ -365,8 +366,8 @@ async function control(req) {
     const before = JSON.stringify(services[name].store.snapshot());
     try {
       const added = services[name].add(update);
-      stepEnds[after] ??= { endMs, recordedAtMs: nowMs };
-      return Response.json({ ok: true, after, after_last_request_at: iso(endMs), added, counts: counts() });
+      if (after !== null) stepEnds[after] ??= { endMs, recordedAtMs: nowMs };
+      return Response.json({ ok: true, after, after_last_request_at: endMs === null ? null : iso(endMs), added, counts: counts() });
     } catch (e) {
       services[name].store.restore(JSON.parse(before));
       return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
