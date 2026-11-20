@@ -701,13 +701,10 @@ def test_search_answers_datalibs_reply_search_query(external_services: RunningEx
     )
     assert {match["ts"] for match in both["messages"]["matches"]} >= {reply_ts, root_ts}
     assert {match["channel"]["id"] for match in both["messages"]["matches"]} >= {channel_id}
-    assert _search(external_services, "in:#eng-oncall in:#announcements") == sorted(
-        _search(external_services, "in:#eng-oncall") + _search(external_services, "in:#announcements"),
-        key=float,
-        reverse=True,
-    ) or set(_search(external_services, "in:#eng-oncall in:#announcements")) == set(
-        _search(external_services, "in:#eng-oncall") + _search(external_services, "in:#announcements")
-    )
+    in_either = _search(external_services, "in:#eng-oncall in:#announcements")
+    in_each = _search(external_services, "in:#eng-oncall") + _search(external_services, "in:#announcements")
+    assert sorted(in_either) == sorted(in_each)
+    assert in_either == sorted(in_either, key=float, reverse=True)
     # The `<#id|name>` form names the channel as the `#name` form does, and nothing in the query is a
     # gap the fake counts.
     assert _search(external_services, "in:<#{}|eng-oncall>".format(channel_id)) == _search(
