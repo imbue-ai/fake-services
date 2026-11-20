@@ -189,6 +189,9 @@ const clock = {
   // The seed's anchor, shifted: the date of last resort for a record nothing else in a seed dates.
   anchor: new Date(anchorMs + shiftMs).toISOString(),
   now: () => toPresent(Date.now()),
+  // Whether a value is written as a relative timestamp, which is what marks a Linear issue entry
+  // naming a held identifier as an edit rather than a repeat.
+  isRelative: (v) => parseRelative(v) !== null,
   iso: (v) => {
     if (!v) return v ?? null;
     const rel = parseRelative(v);

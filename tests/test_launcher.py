@@ -1027,6 +1027,18 @@ def test_an_update_edits_an_issue_it_names_with_a_later_updated_at(external_serv
     repeat = _add_after(
         external_services, "linear", "mirror", {"issues": [{"identifier": "ENG-2", "team": "ENG", "title": "again"}]}
     )
+    # An absolute updated_at is how a seed writes an issue's own instant, so on a held identifier it
+    # is a copied entry and not an edit, as the harness's checks read it.
+    absolute = _add_after(
+        external_services,
+        "linear",
+        "mirror",
+        {
+            "issues": [
+                {"identifier": "ENG-2", "team": "ENG", "title": "again", "updated_at": "2026-03-21T00:00:00.000Z"}
+            ]
+        },
+    )
 
     assert added.status_code == 200, added.text
     assert added.json()["added"] == {"linear_issues": 0, "linear_comments": 0, "linear_edits": 1}
@@ -1039,6 +1051,8 @@ def test_an_update_edits_an_issue_it_names_with_a_later_updated_at(external_serv
         "state": {"name": "Done"},
     }
     assert repeat.status_code == 400 and "updated_at" in repeat.json()["error"]
+    assert absolute.status_code == 400 and absolute.json()["error"] == repeat.json()["error"]
+    assert _issue_titles(external_services)["ENG-2"] == "Fix route normalization"
 
 
 def _dms(services: RunningExternalServices) -> dict[str, dict[str, Any]]:

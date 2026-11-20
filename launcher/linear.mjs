@@ -440,8 +440,10 @@ export function create(seed, clock) {
       if (!team) throw new Error(`linear team not found: ${i.team}`);
       const held = ls.issues.findOneBy("identifier", i.identifier);
       if (held) {
-        // An issue the fake already holds is edited when the entry says when, and a repeat otherwise.
-        if (i.updated_at == null) throw new Error(`duplicate issue ${i.identifier}; an edit states updated_at`);
+        // An issue the fake already holds is edited when the entry says when as a relative timestamp,
+        // and is a repeat otherwise, as the harness's checks read it: an absolute updated_at is how a
+        // seed's own issue is written, so one on a held identifier is a copied entry, not an edit.
+        if (!clock.isRelative(i.updated_at)) throw new Error(`duplicate issue ${i.identifier}; an edit states a relative updated_at`);
         if (held.team_id !== team.linear_id) throw new Error(`issue ${i.identifier} is edited under team ${i.team}, which is not its team`);
         const updated = clock.iso(i.updated_at);
         if (updated <= held.updated_at) throw new Error(`issue ${i.identifier} is edited at ${i.updated_at}, no later than its last update`);
