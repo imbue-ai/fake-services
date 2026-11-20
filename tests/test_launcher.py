@@ -851,6 +851,7 @@ def test_a_relative_timestamp_may_count_from_the_end_of_an_earlier_step(
             ]
         },
     )
+    # One request served between the two updates, so the triage step ends no earlier than mirror did.
     _channel_id(external_services, "eng-oncall")
     second = _add_after(
         external_services,
