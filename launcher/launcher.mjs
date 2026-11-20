@@ -62,15 +62,17 @@
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
 //   GET  /_control/health             {ok, shift_ms, start_at, last_request_at, step_ends, rate_limits,
-//                                     services, counts, unsupported_calls, rate_limited, phase, phases};
+//                                     faults, faulted, services, counts, unsupported_calls, rate_limited,
+//                                     phase, phases};
 //                                     step_ends holds {last_request_at, recorded_at} per finished step;
-//                                     counts.requests,
-//                                     unsupported_calls and rate_limited are the totals, rate_limited
-//                                     counting refused requests by "<service>:<bucket>";
-//                                     phases[<phase>] holds {requests, unsupported_calls,
-//                                     rate_limited} of the requests made in that phase alone
+//                                     faults is the seeds' schedule (null without one); counts.requests,
+//                                     unsupported_calls, rate_limited and faulted are the totals,
+//                                     rate_limited counting refused requests by "<service>:<bucket>" and
+//                                     faulted the requests a fault answered by "<service>:<kind>";
+//                                     phases[<phase>] holds {requests, unsupported_calls, rate_limited,
+//                                     faulted} of the requests made in that phase alone
 //   GET  /_control/state              the stores of the served services, tokens redacted, with the
-//                                     health's counts, rate_limited and phases
+//                                     health's timing, faults, counts, rate_limited, faulted and phases
 //   GET  /_control/changes            what the running phase did to the stores, tokens redacted:
 //                                     {phase, since, shift_ms, changes, calls, keyed, previous_phase}.
 //                                     changes[<service>][<collection>] holds {added, changed, removed}
