@@ -165,7 +165,7 @@ const toPresent = (processMs) => startMs + (processMs - launchedAtMs);
 // from the last request any fake served while that step ran. Null for anything else, an absolute
 // timestamp included.
 const RELATIVE_RE = /^([a-z0-9][a-z0-9-]*)\+(\d{1,3}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/;
-export function parseRelative(value) {
+function parseRelative(value) {
   const m = typeof value === "string" ? value.match(RELATIVE_RE) : null;
   if (!m) return null;
   const [, step, h, min, s, frac = ""] = m;
