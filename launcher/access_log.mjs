@@ -2,7 +2,8 @@
 // not support. Every line carries the phase of the trial it was made in: "agent" until the driver
 // marks another (setPhase), so the requests the verification flows cause are told apart from the
 // ones the agent's app made while the agent worked. See launcher.mjs for the service interface this
-// wraps, and rate_limits.mjs for the rateLimitedBucket(req) its guard adds to every service.
+// wraps, rate_limits.mjs for the rateLimitedBucket(req) its guard adds to every service, and
+// faults.mjs for the faulted(req) its guard adds.
 import crypto from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 
@@ -18,7 +19,8 @@ export function createAccessLog(path, services) {
   const unsupportedCalls = {};
   let phase = "agent";
   // Per phase, in the order the phases were first marked: its requests by service, its calls the
-  // fakes do not support by what was asked, and its rate limit refusals by "<service>:<bucket>".
+  // fakes do not support by what was asked, its rate limit refusals by "<service>:<bucket>" and the
+  // requests a fault answered by "<service>:<kind>".
   // Without a prototype, so a phase named like one of Object's own keys ("constructor") gets counts
   // of its own.
   const phases = Object.create(null);
@@ -68,7 +70,7 @@ export function createAccessLog(path, services) {
       }
       const rateLimited = service.rateLimitedBucket(req);
       if (rateLimited) inPhase.rate_limited[rateLimited] = (inPhase.rate_limited[rateLimited] ?? 0) + 1;
-      const fault = service.faulted ? service.faulted(req) : null;
+      const fault = service.faulted(req);
       if (fault) inPhase.faulted[fault] = (inPhase.faulted[fault] ?? 0) + 1;
       const outcome = service.outcome(json);
       const rec = {
