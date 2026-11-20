@@ -2616,7 +2616,10 @@ def test_a_seed_with_faults_is_served_misbehaving_on_its_schedule(
     channel = _channel_id(services, "eng-oncall")
     before = _slack(services, "conversations.history", channel=channel)["messages"]
     with httpx2.Client(headers=_SLACK_HEADERS) as client:
-        get = lambda: client.get("{}/api/auth.test".format(services.slack_url))  # noqa: E731
+
+        def get() -> httpx2.Response:
+            return client.get("{}/api/auth.test".format(services.slack_url))
+
         # The Slack count stands at 2: conversations.list in _channel_id and the history read.
         served, transient, unreadable, episode_opener = _up_to_the_episode(get, already_made=2)
         inside_episode = client.post(
@@ -2665,11 +2668,17 @@ def test_linear_and_google_misbehave_in_their_own_shapes(faulted_external_servic
     faults = EXTERNAL_SERVICES_TEST_FAULTS
     seconds = faults["rate_limit_episode_seconds"]
     with httpx2.Client(headers={"Authorization": _LINEAR_TOKEN}) as client:
-        post = lambda: client.post(services.linear_url + "/graphql", json={"query": "{ viewer { id } }"})  # noqa: E731
+
+        def post() -> httpx2.Response:
+            return client.post(services.linear_url + "/graphql", json={"query": "{ viewer { id } }"})
+
         served, failed, unreadable, refused = _up_to_the_episode(post)
         linear_refusals = _until_served(post, 429, seconds)
     with httpx2.Client(headers={"Authorization": "Bearer {}".format(_GOOGLE_TOKEN)}) as client:
-        profile = lambda: client.get(services.google_url + "/gmail/v1/users/me/profile")  # noqa: E731
+
+        def profile() -> httpx2.Response:
+            return client.get(services.google_url + "/gmail/v1/users/me/profile")
+
         google_served, google_failed, google_unreadable, google_refused = _up_to_the_episode(profile)
         google_refusals = _until_served(profile, 403, seconds)
 
