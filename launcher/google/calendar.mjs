@@ -3,7 +3,7 @@
 // events.get, no organizer, creator or iCalUID on an event, dates from the wall clock) for its
 // routes to be worth wrapping. Each account has one calendar, its primary, whose id is its address;
 // a seed's events are placed on their owner's primary calendar with ids derived from the seed, so
-// they read the same in every trial. See google.mjs for the product interface this module exports.
+// they read the same in every run. See google.mjs for the product interface this module exports.
 import crypto from "node:crypto";
 import { noSuchPath } from "./errors.mjs";
 

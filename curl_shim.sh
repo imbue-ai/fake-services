@@ -1,16 +1,15 @@
 #!/bin/bash
-# The curl a box's latchkey gateway runs: the harness names this file to the Minds app as the
-# gateway's curl before the app starts, on every trial, because the app is started before the trial's
-# task is known. The gateway runs it for every request it proxies, after it has checked the permission
-# and injected the credential against the real URL.
+# A curl that sends requests for the faked hosts to the fakes. A program whose HTTP client is a curl it
+# is told of (latchkey's gateway reads `LATCHKEY_CURL`) is pointed at this file; it runs this for
+# every request, and the request reaches the fake or the real host as the routes say.
 #
 # Two files beside this script say what it does, both read on every request:
-#   curl_router   one line, the path of the curl router the app would have run itself
-#   curl_routes   one faked host a line, as `<shell pattern> <port>`; absent on a trial that fakes
-#                 nothing
-# A request for a faked host is pointed at the fake's loopback port, with the host it was for in a
-# header. Every other argument and every other URL is passed on untouched, and with no routes file
-# this script is the router under another name. Either way the request is made by the app's router.
+#   curl_router   one line, the path of the curl the program would have run itself
+#   curl_routes   one faked host a line, as `<shell pattern> <port>`; absent when nothing is faked
+# A request for a faked host is pointed at the fake's loopback port, with the host it was for in an
+# `X-Forwarded-Host` header, which is how the launcher tells a service's API hosts from its others.
+# Every other argument and every other URL is passed on untouched, and with no routes file this
+# script is the router under another name. Either way the request is made by the named curl.
 #
 # A host is matched whatever its case, over http or https, with or without its default port. The
 # value of an option that takes one (a body, a header) is never read as a URL.

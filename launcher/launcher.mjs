@@ -1,6 +1,7 @@
-// External data services for a minds-evals trial: fake Slack, Linear and Google, each served on a
-// loopback port of its own by one Node process in the eval box. The workspace reaches them through
-// the latchkey gateway, whose curl the driver points at these ports for the real hosts.
+// Fake Slack, Linear and Google, each served on a loopback port of its own by one Node process, for
+// testing a program that reads the real services: it makes its requests to the real URLs, and
+// something in front of it (curl_shim.sh, or whatever the program lets its HTTP client be pointed
+// with) sends them to these ports.
 //
 // A service is served when the seed directory holds its file (slack.json, linear.json, google.json).
 // Each service is a module beside this file (slack.mjs, linear.mjs, google.mjs) that exports:
@@ -13,7 +14,7 @@
 //                     snapshot of it, so one that fails leaves the store as it was
 //     tokenUsers      Map of each token the seed names to the user it belongs to
 //     add(records)    places a seed's or an update's records, throws on one it cannot place, dates
-//                     every record from the seed's own dates (never the box's clock), and returns
+//                     every record from the seed's own dates (never this process's clock), and returns
 //                     what it added
 //     route(req, url) answers a request for one of its API hosts
 //     notFound(url)   what a request for another host is answered with
@@ -28,11 +29,11 @@
 // This file settles the one clock every service keeps, seeds and serves the services, rate-limits
 // them (rate_limits.mjs), logs every request (access_log.mjs) and answers the control endpoints.
 //
-// What a trial gets on top of the @emulators packages:
+// What the fakes add to the @emulators packages:
 //   - a seed's records carry absolute timestamps. With `"time_shift": "none"` (the default) they are
 //     served as written; with `"time_shift": "to_trial_start"` every one is shifted by
 //     (start - anchor) rounded down to whole days on load, so the data ends within the day before
-//     the trial's start whenever the trial runs, on the weekdays and at the times of day it was
+//     the launcher's start whenever it runs, on the weekdays and at the times of day it was
 //     written for
 //   - an update may write an instant as a relative timestamp, `<step>+HH:MM:SS` with an optional
 //     fraction of up to six digits: that long after the last request any fake served while that step
@@ -40,7 +41,7 @@
 //     step's last look and the later step's first, whatever the shift; a later update names an
 //     earlier step to refer to a record the update after it added. An update whose newest instant is
 //     still in the future is refused with how long to wait
-//   - no record carries the box's clock: a date the seed does not state is derived from the seed's
+//   - no record carries this process's clock: a date the seed does not state is derived from the seed's
 //     own records (each module's settle step)
 //   - only the seed's tokens authenticate, and the stores start empty: the emulators' own default
 //     workspace is never loaded
@@ -129,7 +130,7 @@ for (const name of served)
     fail(`the ${name} seed's anchor, time_shift and rate_limits differ from the ${served[0]} seed's`);
 if (!["to_trial_start", "none"].includes(timeShift(first))) fail(`time_shift ${JSON.stringify(first.time_shift)} is neither "to_trial_start" nor "none"`);
 if (!["real", "none"].includes(rateLimitsOf(first))) fail(`rate_limits ${JSON.stringify(first.rate_limits)} is neither "real" nor "none"`);
-// Faults are a setting of the whole trial, like the rate limits: one seed states them and the rest
+// Faults are a setting of the whole launcher, like the rate limits: one seed states them and the rest
 // state the same or none.
 for (const name of served) {
   const problem = validateFaults(seeds[name].faults);
@@ -159,7 +160,7 @@ const launchedAtMs = Date.now();
 const startMs = Number(env.START_MS ?? launchedAtMs);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const shiftMs = timeShift(first) === "none" ? 0 : Math.floor((startMs - anchorMs) / DAY_MS) * DAY_MS;
-// The process's clock as the trial's present: the start, advanced by the wall clock since.
+// The process's clock as the present: the start, advanced by the wall clock since.
 const toPresent = (processMs) => startMs + (processMs - launchedAtMs);
 // A relative timestamp: `<step>+HH:MM:SS`, with an optional fraction of up to six digits, counted
 // from the last request any fake served while that step ran. Null for anything else, an absolute
@@ -171,7 +172,7 @@ function parseRelative(value) {
   const [, step, h, min, s, frac = ""] = m;
   return { step, seconds: (Number(h) * 60 + Number(min)) * 60 + Number(s), fraction: frac.padEnd(6, "0"), text: value };
 }
-// When each finished step's last request was served (on the trial's present), recorded as the next
+// When each finished step's last request was served (on the present), recorded as the next
 // step's update arrives naming it, with when it was recorded; and the step an update under way follows,
 // whose last request is known before its entry is made.
 const stepEnds = {};
@@ -241,7 +242,7 @@ const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name
 const redacted = (snapshot) => JSON.parse(JSON.stringify(snapshot, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
 const collectionsOf = (name) => Object.entries(redacted(services[name].store.snapshot()).collections).map(([collection, { items }]) => [collection, items]);
 const textById = (items) => new Map(items.map((item) => [item.id, JSON.stringify(item)]));
-// The phase the trial is in and the one before it: when each was marked, how long the access log was
+// The phase the launcher is in and the one before it: when each was marked, how long the access log was
 // then, and for the running one every record by id as its JSON text, which is what a record is
 // compared by.
 const spans = [];
@@ -365,7 +366,7 @@ async function control(req) {
       const wait = Math.ceil((newestMs - nowMs) / 1000);
       return Response.json({ ok: false, error: `the update's newest instant is ${wait} s in the future; apply it once the step's wait has passed`, retry_after_seconds: wait, after_last_request_at: iso(endMs), now: iso(nowMs), newest: iso(newestMs), counts: counts() }, { status: 409 });
     }
-    // An update lands whole or not at all: a half-applied one would leave the trial on data nobody
+    // An update lands whole or not at all: a half-applied one would leave the fake on data nobody
     // authored. The snapshot holds the live records, which an update may write to in place, so it is
     // kept as text.
     const before = JSON.stringify(services[name].store.snapshot());

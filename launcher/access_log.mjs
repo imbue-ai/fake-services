@@ -1,7 +1,7 @@
 // The access log: one line per request that reaches a fake, and the count of every call a fake does
-// not support. Every line carries the phase of the trial it was made in: "agent" until the driver
-// marks another (setPhase), so the requests the verification flows cause are told apart from the
-// ones the agent's app made while the agent worked. See launcher.mjs for the service interface this
+// not support. Every line carries the phase it was made in: "agent" until a caller marks another
+// (setPhase), so the requests made while, say, a verification pass drives the program under test are
+// told apart from the ones the program made before. See launcher.mjs for the service interface this
 // wraps, rate_limits.mjs for the rateLimitedBucket(req) its guard adds to every service, and
 // faults.mjs for the faulted(req) its guard adds.
 import crypto from "node:crypto";

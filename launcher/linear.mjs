@@ -18,7 +18,7 @@ export const hosts = new Set(["api.linear.app"]);
 const DOCS = "https://linear.app/developers/graphql";
 
 // Linear's public schema as its SDK publishes it (linear_schema.graphql.gz in the directory above,
-// see templates/environment/external_services/), so a query validates as the real API validates it:
+// see the README), so a query validates as the real API validates it:
 // introspection shows Linear's own types, and a field, argument or type Linear does not have is the
 // caller's mistake, refused with 400 as Linear refuses it. The resolvers in root() serve what the
 // fake holds; fieldResolver answers the rest of the public schema.
@@ -441,7 +441,7 @@ export function create(seed, clock) {
       const held = ls.issues.findOneBy("identifier", i.identifier);
       if (held) {
         // An issue the fake already holds is edited when the entry says when as a relative timestamp,
-        // and is a repeat otherwise, as the harness's checks read it: an absolute updated_at is how a
+        // and is a repeat otherwise: an absolute updated_at is how a
         // seed's own issue is written, so one on a held identifier is a copied entry, not an edit.
         if (!clock.isRelative(i.updated_at)) throw new Error(`duplicate issue ${i.identifier}; an edit states a relative updated_at`);
         if (held.team_id !== team.linear_id) throw new Error(`issue ${i.identifier} is edited under team ${i.team}, which is not its team`);

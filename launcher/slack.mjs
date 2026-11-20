@@ -1,5 +1,5 @@
-// The fake Slack: @emulators/slack's app and store, with what a trial needs on top. Messages, threads,
-// direct messages and ids are inserted straight into the store, so they read the same in every trial;
+// The fake Slack: @emulators/slack's app and store, with what a seeded fake needs on top. Messages, threads,
+// direct messages and ids are inserted straight into the store, so they read the same in every run;
 // channels, direct messages and users are dated, and channels peopled, from the seed's messages
 // (settle()); Slack methods answer GET; conversations.history takes oldest/latest/inclusive;
 // search.messages and search.all read the live store; users.conversations is conversations.list
@@ -72,7 +72,7 @@ export const limits = {
 };
 
 const unknownMethod = (status) => Response.json({ ok: false, error: "unknown_method" }, { status });
-// Stable ids: an id derived from the name survives a re-seed and reads the same in every trial.
+// Stable ids: an id derived from the name survives a re-seed and reads the same in every run.
 const slackId = (prefix, text) => prefix + crypto.createHash("sha1").update(text).digest("hex").slice(0, 10).toUpperCase();
 const isPage = (res) => (res.headers.get("content-type") ?? "").includes("text/html");
 async function answerOf(res) {

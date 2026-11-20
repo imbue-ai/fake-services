@@ -13,7 +13,7 @@
 //   }
 //
 // Every period counts the service's requests in order, so the pattern is fixed for a given request
-// sequence and the same for every trial; 0 or a missing period turns that fault off. A faulted
+// sequence and the same for every run; 0 or a missing period turns that fault off. A faulted
 // request reaches no service: it draws on no rate limit bucket and changes no store. Like the real
 // thing, an episode's refusals name how long to wait and a transient failure passes on retry.
 //
@@ -29,7 +29,7 @@
 const PERIOD_KEYS = { rate_limit_episode: "rate_limit_episode_every", transient_error: "transient_error_every", unreadable: "unreadable_every" };
 const KNOWN_KEYS = new Set(["after_requests", "rate_limit_episode_seconds", ...Object.values(PERIOD_KEYS)]);
 
-// Why a seed's `faults` cannot be served, or null when it can. Mirrored by the harness's parse_faults.
+// Why a seed's `faults` cannot be served, or null when it can.
 export function validateFaults(config) {
   if (config === undefined) return null;
   if (typeof config !== "object" || config === null || Array.isArray(config)) return "faults must be an object";

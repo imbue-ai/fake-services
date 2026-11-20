@@ -67,7 +67,7 @@ export const limits = {
   refuse: (req, retryAfterSeconds, bucket, cost) => PRODUCTS.find((p) => bucket in p.limits.buckets).limits.refuse(req, retryAfterSeconds, bucket, cost),
 };
 
-// A Google account id is a 21-digit number; one derived from the address reads the same in every trial.
+// A Google account id is a 21-digit number; one derived from the address reads the same in every run.
 const accountId = (email) => "1" + BigInt("0x" + crypto.createHash("sha1").update(email).digest("hex").slice(0, 16)).toString().padStart(20, "0").slice(0, 20);
 
 export function create(seed, clock) {

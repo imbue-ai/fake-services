@@ -1,6 +1,6 @@
-// Gmail v1 for the fake Google: @emulators/google's Gmail routes and store, with what a trial needs on
+// Gmail v1 for the fake Google: @emulators/google's Gmail routes and store, with what a seeded fake needs on
 // top. Messages are inserted straight into the store, with ids, threads, Message-IDs and historyIds
-// derived from the seed, so they read the same in every trial; a message keeps the UTC offset its seed
+// derived from the seed, so they read the same in every run; a message keeps the UTC offset its seed
 // states in its Date header, and its labels are derived from who sent it, and a later file may move
 // them;
 // users.getProfile; a search operator the package answers wrongly is counted; a list leaves out an
