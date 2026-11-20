@@ -42,8 +42,6 @@ const hostOf = (req) => (req.headers.get("x-forwarded-host") ?? [...hosts][0]).t
 const productOf = (req, url) => PRODUCTS.findIndex((p) => p.hosts.has(hostOf(req)) && p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
 const tokenOf = (req) => (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
 
-// See rate_limits.mjs for what a policy holds. Each product limits its own requests; a request no
-// product serves, or with no seeded token, draws on nothing.
 // How Google misbehaves (see faults.mjs): the product's own rate limit refusal with Retry-After, and
 // the backend error Google's APIs answer a transient failure with.
 export const faults = {
@@ -57,6 +55,8 @@ export const faults = {
   transientError: () => internalError(),
 };
 
+// See rate_limits.mjs for what a policy holds. Each product limits its own requests; a request no
+// product serves, or with no seeded token, draws on nothing.
 export const limits = {
   buckets: Object.assign({}, ...PRODUCTS.map((p) => p.limits.buckets)),
   bucketOf(req, url, service) {

@@ -169,7 +169,6 @@ const tooComplex = (cost) =>
     { errors: [{ message: "Query too complex", extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: `The query is too complex. Complexity: ${cost}. Maximum allowed complexity: ${MAX_QUERY_COMPLEXITY}.`, http: { status: 400 } } }] },
     { status: 400 },
   );
-// See rate_limits.mjs for what a policy holds.
 // How Linear misbehaves (see faults.mjs): the hourly refusal with Retry-After, and an internal
 // server error as a GraphQL server answers one, an HTTP 500 whose errors name no code.
 export const faults = {
@@ -178,6 +177,7 @@ export const faults = {
   transientError: () => Response.json({ errors: [{ message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } }] }, { status: 500 }),
 };
 
+// See rate_limits.mjs for what a policy holds.
 export const limits = {
   buckets: {
     requests: { limit: 2500, windowSeconds: 3600, algorithm: "leaky" },
