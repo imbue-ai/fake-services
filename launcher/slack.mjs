@@ -50,6 +50,14 @@ async function tokenOf(req, url) {
   if (req.method === "GET" || (req.headers.get("content-type") ?? "").includes("json")) return "";
   return new URLSearchParams(await req.clone().text()).get("token") ?? "";
 }
+// How Slack misbehaves (see faults.mjs): a rate limit refusal is a 429 with Retry-After; a transient
+// failure is `internal_error`, which Slack answers with HTTP 200 like any other API error and
+// documents as one to retry.
+export const faults = {
+  rateLimited: (req, url, retryAfterSeconds) => Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } }),
+  transientError: () => Response.json({ ok: false, error: "internal_error" }),
+};
+
 // See rate_limits.mjs for what a policy holds. One fake is one workspace, so a method's window is
 // shared by every token the seed names. A request with no seeded token is refused by authentication,
 // not counted.
@@ -249,6 +257,7 @@ export function create(seed, clock) {
     for (const c of cfg.channels ?? []) statedMembers.set(namedChannel(c.name).channel_id, memberIds(`channel ${c.name}`, c.members ?? []));
     placeDms(dms, newConversations, statedMembers);
     let n = 0;
+    let edits = 0;
     for (const m of cfg.messages ?? []) {
       const ch = conversation(m.channel);
       const uid = user(m.user);
@@ -256,6 +265,17 @@ export function create(seed, clock) {
       if (isDm(ch) && !ch.members.includes(uid)) throw new Error(`slack message ${m.channel}/${m.ts} is from ${m.user}, who is no member of that dm`);
       const channel_id = ch.channel_id;
       const ts = clock.slackTs(m.ts);
+      // A message the fake already holds is edited when the entry says when, and a repeat otherwise.
+      const held = ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === ts);
+      if (held) {
+        if (m.edited_ts == null) throw new Error(`slack message ${m.channel}/${m.ts} repeats a message the fake holds; an edit states edited_ts`);
+        const editedTs = clock.slackTs(m.edited_ts);
+        if (Number(editedTs) <= Number(ts)) throw new Error(`slack message ${m.channel}/${m.ts} is edited at ${m.edited_ts}, no later than it was posted`);
+        ss.messages.update(held.id, { text: m.text, edited: { user: uid, ts: editedTs } });
+        edits++;
+        continue;
+      }
+      if (m.edited_ts != null) throw new Error(`slack message ${m.channel}/${m.ts} states edited_ts, and the fake holds no such message to edit`);
       const thread_ts = clock.slackTs(m.thread_ts) ?? undefined;
       const p = thread_ts && thread_ts !== ts ? ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === thread_ts) ?? null : null;
       if (thread_ts && thread_ts !== ts) {
@@ -275,7 +295,7 @@ export function create(seed, clock) {
       n++;
     }
     settle(newConversations, newUsers, statedMembers);
-    return { slack_messages: n };
+    return { slack_messages: n, slack_edits: edits };
   }
 
   async function params(req) {
@@ -316,7 +336,22 @@ export function create(seed, clock) {
     const start = p.cursor ? kept.findIndex((m) => m.ts === p.cursor) : 0;
     if (start < 0) return Response.json({ ok: false, error: "invalid_cursor" });
     const more = start + limit < kept.length;
-    return Response.json({ ok: true, messages: kept.slice(start, start + limit), has_more: more, pin_count: 0, response_metadata: { next_cursor: more ? kept[start + limit].ts : "" } });
+    return Response.json({ ok: true, messages: withLatestReply(p.channel, kept.slice(start, start + limit)), has_more: more, pin_count: 0, response_metadata: { next_cursor: more ? kept[start + limit].ts : "" } });
+  }
+  // Slack serves a thread's parent with latest_reply, the ts of its newest reply, which is how a
+  // downloader tells a thread it holds from one that grew; the package serves reply_count alone.
+  function withLatestReply(channel_id, messages) {
+    return messages.map((m) => {
+      if (!(m.reply_count > 0)) return m;
+      const held = ss.messages.all().find((x) => x.channel_id === channel_id && x.ts === m.ts);
+      return held?.latest_reply ? { ...m, latest_reply: held.latest_reply } : m;
+    });
+  }
+  async function withLatestReplies(res, channel_id) {
+    const answer = await answerOf(res);
+    if (!answer?.ok || !Array.isArray(answer.messages)) return res;
+    answer.messages = withLatestReply(channel_id, answer.messages);
+    return Response.json(answer, { status: res.status });
   }
   // A message's permalink as Slack serves it (measured 2026-10-31): on the workspace's own domain, and
   // for any message in a thread, its parent included, naming the thread by `thread_ts`; chat.getPermalink
@@ -366,6 +401,10 @@ export function create(seed, clock) {
     unsupportedOf.set(req, keys);
     const preds = [];
     const words = [];
+    // Several in: filters name alternatives, as Slack reads them: a message in any of the named
+    // conversations passes. datalib's reply search names up to 20 channels in one query.
+    const inChannels = new Set();
+    let hasIn = false;
     const dated = (op, value, test) => {
       const span = spanOf(value);
       if (!span) keys.push(`slack:${method}:${op}`);
@@ -386,7 +425,8 @@ export function create(seed, clock) {
           const who = ss.users.all().find((x) => x.name === target.slice(1))?.user_id;
           ch = ss.channels.all().find((c) => c.is_im && c.members.includes(auth.user_id) && c.members.includes(who));
         } else ch = namedChannel(target.replace(/^#/, "")) ?? ss.channels.findOneBy("channel_id", target.replace(/^<#|(\|[^>]*)?>$/g, ""));
-        preds.push((m) => m.channel_id === ch?.channel_id);
+        hasIn = true;
+        if (ch) inChannels.add(ch.channel_id);
       } else if (op?.[1] === "from") {
         const who = term.slice(5).replace(/^[<@]+|>$/g, "");
         const u = ss.users.all().find((x) => x.name === who) ?? ss.users.findOneBy("user_id", who);
@@ -405,6 +445,7 @@ export function create(seed, clock) {
         preds.push((m) => m.text.toLowerCase().includes(lower));
       }
     }
+    if (hasIn) preds.push((m) => inChannels.has(m.channel_id));
     const visible = new Map(ss.channels.all().filter((c) => !c.is_private || c.members.includes(auth.user_id)).map((c) => [c.channel_id, c]));
     const scoreOf = (m) => words.reduce((sum, w) => sum + m.text.toLowerCase().split(w).length - 1, 0);
     const dir = p.sort_dir === "asc" ? 1 : -1;
@@ -480,7 +521,7 @@ export function create(seed, clock) {
   }
   // A reply posted in the trial makes its parent a thread's parent, which Slack serves with its own
   // ts as thread_ts; the package counts the reply alone. The store keeps its newest reply as
-  // latest_reply, which the package does not serve.
+  // latest_reply, served by withLatestReply.
   async function markThreadParent(res) {
     const answer = await answerOf(res);
     const thread_ts = answer?.ok ? answer.message?.thread_ts : undefined;
@@ -491,22 +532,58 @@ export function create(seed, clock) {
   // Slack serves a thread's parent first, then its replies oldest first. The package orders all of
   // them by ts, and a reply posted in a trial whose seed is shifted past the box's clock is stamped
   // before its parent.
-  async function withParentFirst(res, ts) {
+  async function withParentFirst(res, channel_id, ts) {
     const answer = await answerOf(res);
     if (!answer?.ok) return res;
-    answer.messages = [...answer.messages.filter((m) => m.ts === ts), ...answer.messages.filter((m) => m.ts !== ts)];
+    const ordered = [...answer.messages.filter((m) => m.ts === ts), ...answer.messages.filter((m) => m.ts !== ts)];
+    answer.messages = withLatestReply(channel_id, ordered);
     return Response.json(answer, { status: res.status });
+  }
+  // client.counts, the unpublished method the Slack client reads its sidebar from: one entry per
+  // conversation the token's user is in, with the newest top-level message (latest), the moment the
+  // conversation last changed in any way (updated: a message, a reply or an edit), and the read mark,
+  // which here is the newest message since the fake's users read everything. A downloader that reads
+  // it skips the conversations with nothing new instead of asking each one.
+  async function clientCounts(req) {
+    const auth = await (await asPost(req, "auth.test", {})).json();
+    if (!auth.ok) return Response.json(auth);
+    const byChannel = new Map();
+    for (const m of ss.messages.all()) {
+      const entry = byChannel.get(m.channel_id) ?? { latest: null, updated: null };
+      if (!m.thread_ts || m.thread_ts === m.ts) entry.latest = newerTs(entry.latest, m.ts);
+      entry.updated = newerTs(entry.updated, m.ts);
+      if (m.edited?.ts) entry.updated = newerTs(entry.updated, m.edited.ts);
+      byChannel.set(m.channel_id, entry);
+    }
+    const row = (ch) => {
+      const entry = byChannel.get(ch.channel_id) ?? { latest: null, updated: null };
+      const latest = entry.latest ?? "0.000000";
+      return { id: ch.channel_id, last_read: latest, latest, updated: entry.updated ?? latest, history_invalid: "0.000000", mention_count: 0, has_unreads: false };
+    };
+    const mine = ss.channels.all().filter((ch) => ch.members.includes(auth.user_id) && !ch.is_archived);
+    return Response.json({
+      ok: true,
+      threads: { has_unreads: false, mention_count: 0 },
+      channels: mine.filter((ch) => !isDm(ch)).map(row),
+      mpims: mine.filter((ch) => ch.is_mpim).map(row),
+      ims: mine.filter((ch) => ch.is_im).map(row),
+      channel_badges: { channels: 0, dms: 0, app_dms: 0, thread_mentions: 0, thread_unreads: 0 },
+      alerts: [],
+      saved: { uncompleted_count: 0, uncompleted_overdue_count: 0 },
+    });
   }
   async function apiRoute(req, url) {
     const method = url.pathname.slice(5);
     const p = await params(req);
+    if (method === "client.counts") return clientCounts(req);
     if (method === "search.messages" || method === "search.all") return search(req, p, method);
     if (method === "users.conversations") return userConversations(req, p);
     if (method === "conversations.history" && (p.oldest || p.latest)) return history(req, p);
     const res = await (req.method === "GET" ? asPost(req, method, Object.fromEntries(url.searchParams)) : app.fetch(req));
     if (method in USER_ANSWERS) return withUpdated(res, USER_ANSWERS[method]);
     if (method === "chat.getPermalink") return withPermalink(res, p);
-    if (method === "conversations.replies") return withParentFirst(res, p.ts);
+    if (method === "conversations.history") return withLatestReplies(res, p.channel);
+    if (method === "conversations.replies") return withParentFirst(res, p.channel, p.ts);
     if (method === "chat.postMessage") await markThreadParent(res);
     return res;
   }

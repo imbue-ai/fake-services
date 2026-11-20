@@ -34,10 +34,19 @@
 //     (start - anchor) rounded down to whole days on load, so the data ends within the day before
 //     the trial's start whenever the trial runs, on the weekdays and at the times of day it was
 //     written for
+//   - an update may write an instant as a relative timestamp, `<step>+HH:MM:SS` with an optional
+//     fraction of up to six digits: that long after the last request any fake served while that step
+//     ran (the start, when none was). So what an update adds reads as activity between the earlier
+//     step's last look and the later step's first, whatever the shift; a later update names an
+//     earlier step to refer to a record the update after it added. An update whose newest instant is
+//     still in the future is refused with how long to wait
 //   - no record carries the box's clock: a date the seed does not state is derived from the seed's
 //     own records (each module's settle step)
 //   - only the seed's tokens authenticate, and the stores start empty: the emulators' own default
 //     workspace is never loaded
+//   - with a `faults` object a service misbehaves on a fixed schedule, as the real one does on a bad
+//     day: a rate limit episode with Retry-After, the service's own transient error, an HTML error
+//     page (faults.mjs); a faulted request reaches no service and is marked `fault` in the access log
 //   - with `"rate_limits": "real"` (the default) each service refuses a caller who outruns the limits
 //     the real service documents, as the real service refuses it, and adds the real service's rate
 //     limit headers to its answers; with `"rate_limits": "none"` nothing is limited
@@ -52,14 +61,18 @@
 //      that fills one in a few requests>]
 // stdout: one JSON line once every port listens, naming the ports and what was seeded.
 // control (the control port only, never logged):
-//   GET  /_control/health             {ok, shift_ms, rate_limits, services, counts, unsupported_calls,
-//                                     rate_limited, phase, phases}; counts.requests,
-//                                     unsupported_calls and rate_limited are the totals, rate_limited
-//                                     counting refused requests by "<service>:<bucket>";
-//                                     phases[<phase>] holds {requests, unsupported_calls,
-//                                     rate_limited} of the requests made in that phase alone
+//   GET  /_control/health             {ok, shift_ms, start_at, last_request_at, step_ends, rate_limits,
+//                                     faults, faulted, services, counts, unsupported_calls, rate_limited,
+//                                     phase, phases};
+//                                     step_ends holds {last_request_at, recorded_at} per finished step;
+//                                     faults is the seeds' schedule (null without one); counts.requests,
+//                                     unsupported_calls, rate_limited and faulted are the totals,
+//                                     rate_limited counting refused requests by "<service>:<bucket>" and
+//                                     faulted the requests a fault answered by "<service>:<kind>";
+//                                     phases[<phase>] holds {requests, unsupported_calls, rate_limited,
+//                                     faulted} of the requests made in that phase alone
 //   GET  /_control/state              the stores of the served services, tokens redacted, with the
-//                                     health's counts, rate_limited and phases
+//                                     health's timing, faults, counts, rate_limited, faulted and phases
 //   GET  /_control/changes            what the running phase did to the stores, tokens redacted:
 //                                     {phase, since, shift_ms, changes, calls, keyed, previous_phase}.
 //                                     changes[<service>][<collection>] holds {added, changed, removed}
@@ -72,8 +85,13 @@
 //   POST /_control/phase              {"name": <phase>}: every request from now on is logged and
 //                                     counted in that phase ("agent" until one is marked), and the
 //                                     changes are counted from here; answers {ok, phase, previous}
-//   POST /_control/records/<service>  add an update to a served service (its seed's record collections,
-//                                     same time shift); all of it lands or none does
+//   POST /_control/records/<service>?after=<step>
+//                                     add an update to a served service (its seed's record collections,
+//                                     same time shift) that follows the named step, whose end the
+//                                     update's first file records; all of it lands or none does; 409
+//                                     with retry_after_seconds while its newest instant is in the future.
+//                                     One posted without ?after= follows no step and takes absolute
+//                                     timestamps only
 //   GET  /_control/log                the access log so far, as a JSON array
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -82,6 +100,7 @@ import { createAccessLog } from "./access_log.mjs";
 import * as google from "./google.mjs";
 import * as linear from "./linear.mjs";
 import { bucketName, createRateLimits } from "./rate_limits.mjs";
+import { createFaults, validateFaults } from "./faults.mjs";
 import * as slack from "./slack.mjs";
 
 const MODULES = [slack, linear, google];
@@ -110,6 +129,16 @@ for (const name of served)
     fail(`the ${name} seed's anchor, time_shift and rate_limits differ from the ${served[0]} seed's`);
 if (!["to_trial_start", "none"].includes(timeShift(first))) fail(`time_shift ${JSON.stringify(first.time_shift)} is neither "to_trial_start" nor "none"`);
 if (!["real", "none"].includes(rateLimitsOf(first))) fail(`rate_limits ${JSON.stringify(first.rate_limits)} is neither "real" nor "none"`);
+// Faults are a setting of the whole trial, like the rate limits: one seed states them and the rest
+// state the same or none.
+for (const name of served) {
+  const problem = validateFaults(seeds[name].faults);
+  if (problem) fail(`the ${name} seed's ${problem}`);
+}
+const stating = served.filter((name) => seeds[name].faults !== undefined);
+for (const name of stating)
+  if (JSON.stringify(seeds[name].faults) !== JSON.stringify(seeds[stating[0]].faults)) fail(`the ${name} seed's faults differ from the ${stating[0]} seed's`);
+const faults = stating.length ? seeds[stating[0]].faults : undefined;
 const rateLimitWindowSeconds = env.RATE_LIMIT_WINDOW_SECONDS ? Number(env.RATE_LIMIT_WINDOW_SECONDS) : undefined;
 if (Number.isNaN(rateLimitWindowSeconds) || rateLimitWindowSeconds <= 0) fail(`RATE_LIMIT_WINDOW_SECONDS ${JSON.stringify(env.RATE_LIMIT_WINDOW_SECONDS)} is not a positive number`);
 let bucketLimits;
@@ -130,20 +159,68 @@ const launchedAtMs = Date.now();
 const startMs = Number(env.START_MS ?? launchedAtMs);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const shiftMs = timeShift(first) === "none" ? 0 : Math.floor((startMs - anchorMs) / DAY_MS) * DAY_MS;
+// The process's clock as the trial's present: the start, advanced by the wall clock since.
+const toPresent = (processMs) => startMs + (processMs - launchedAtMs);
+// A relative timestamp: `<step>+HH:MM:SS`, with an optional fraction of up to six digits, counted
+// from the last request any fake served while that step ran. Null for anything else, an absolute
+// timestamp included.
+const RELATIVE_RE = /^([a-z0-9][a-z0-9-]*)\+(\d{1,3}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/;
+function parseRelative(value) {
+  const m = typeof value === "string" ? value.match(RELATIVE_RE) : null;
+  if (!m) return null;
+  const [, step, h, min, s, frac = ""] = m;
+  return { step, seconds: (Number(h) * 60 + Number(min)) * 60 + Number(s), fraction: frac.padEnd(6, "0"), text: value };
+}
+// When each finished step's last request was served (on the trial's present), recorded as the next
+// step's update arrives naming it, with when it was recorded; and the step an update under way follows,
+// whose last request is known before its entry is made.
+const stepEnds = {};
+let currentAfter = null;
+let currentEndMs = null;
+function stepEndMsOf(rel) {
+  if (rel.step === currentAfter && currentEndMs !== null) return currentEndMs;
+  if (currentAfter === null) throw new Error(`${rel.text} is a relative timestamp, which counts from the end of the step an update follows; this update follows none (POST ...?after=<step>)`);
+  if (!stepEnds[rel.step]) throw new Error(`${rel.text} counts from the end of step ${rel.step}, which no update has followed`);
+  return stepEnds[rel.step].endMs;
+}
+const relativeMs = (rel) => stepEndMsOf(rel) + rel.seconds * 1000 + Math.floor(Number(rel.fraction) / 1000);
 const clock = {
   shiftMs,
   // The seed's anchor, shifted: the date of last resort for a record nothing else in a seed dates.
   anchor: new Date(anchorMs + shiftMs).toISOString(),
-  // The trial's present, which "now" means in a query: the start, advanced by the wall clock since.
-  now: () => startMs + (Date.now() - launchedAtMs),
-  iso: (v) => (v ? new Date(Date.parse(v) + shiftMs).toISOString() : v ?? null),
-  date: (v) => (v ? new Date(Date.parse(`${v}T00:00:00Z`) + shiftMs).toISOString().slice(0, 10) : v ?? null),
+  now: () => toPresent(Date.now()),
+  // Whether a value is written as a relative timestamp, which is what marks a Linear issue entry
+  // naming a held identifier as an edit rather than a repeat.
+  isRelative: (v) => parseRelative(v) !== null,
+  iso: (v) => {
+    if (!v) return v ?? null;
+    const rel = parseRelative(v);
+    return new Date(rel ? relativeMs(rel) : Date.parse(v) + shiftMs).toISOString();
+  },
+  date: (v) => {
+    if (!v) return v ?? null;
+    const rel = parseRelative(v);
+    return new Date(rel ? relativeMs(rel) : Date.parse(`${v}T00:00:00Z`) + shiftMs).toISOString().slice(0, 10);
+  },
   slackTs: (ts) => {
     if (!ts) return ts;
+    const rel = parseRelative(ts);
+    // The fraction of a relative ts is kept as written: it is the per-channel sequence counter the
+    // seed's own timestamps use, not a time.
+    if (rel) return `${Math.floor(stepEndMsOf(rel) / 1000) + rel.seconds}.${rel.fraction}`;
     const [sec, frac = "000000"] = String(ts).split(".");
     return `${Number(sec) + Math.round(shiftMs / 1000)}.${frac}`;
   },
 };
+// Every relative timestamp in a document, wherever it sits.
+function relativeStampsIn(value, out = []) {
+  if (typeof value === "string") {
+    const rel = parseRelative(value);
+    if (rel) out.push(rel);
+  } else if (Array.isArray(value)) for (const v of value) relativeStampsIn(v, out);
+  else if (value && typeof value === "object") for (const v of Object.values(value)) relativeStampsIn(v, out);
+  return out;
+}
 
 const t0 = performance.now();
 const services = {};
@@ -156,7 +233,10 @@ for (const module of MODULES) {
 }
 const log = createAccessLog(env.ACCESS_LOG, Object.values(services));
 const limiter = createRateLimits({ enabled: rateLimitsOf(first) === "real", now: clock.now, windowSeconds: rateLimitWindowSeconds, bucketLimits });
-const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name]).map((m) => [m.name, limiter.guard(services[m.name], m.limits)]));
+const faulter = createFaults({ config: faults, now: clock.now });
+// A faulted request is answered before the limiter sees it, as the real service's edge answers before
+// its API does, so it draws on no bucket.
+const limitedServices = Object.fromEntries(MODULES.filter((m) => services[m.name]).map((m) => [m.name, faulter.guard(limiter.guard(services[m.name], m.limits), m.faults)]));
 
 const redacted = (snapshot) => JSON.parse(JSON.stringify(snapshot, (k, v) => (k === "token" || k === "client_secret" || k === "refresh_token" ? "[redacted]" : v)));
 const collectionsOf = (name) => Object.entries(redacted(services[name].store.snapshot()).collections).map(([collection, { items }]) => [collection, items]);
@@ -212,17 +292,27 @@ const counts = () => ({
   ...Object.fromEntries(served.map((name) => [name, services[name].counts()])),
   requests: Object.fromEntries(served.map((name) => [name, log.requestCount(name)])),
 });
+const iso = (ms) => new Date(ms).toISOString();
+const lastRequestMs = () => (log.lastBeganMs() === null ? null : toPresent(log.lastBeganMs()));
+const timing = () => ({
+  start_at: iso(startMs),
+  last_request_at: lastRequestMs() === null ? null : iso(lastRequestMs()),
+  step_ends: Object.fromEntries(Object.entries(stepEnds).map(([step, e]) => [step, { last_request_at: iso(e.endMs), recorded_at: iso(e.recordedAtMs) }])),
+});
 async function control(req) {
   const url = new URL(req.url);
   if (url.pathname === "/_control/health")
-    return Response.json({ ok: true, shift_ms: shiftMs, rate_limits: rateLimitsOf(first), services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, rate_limited: limiter.rateLimited, phase: log.phase(), phases: log.phases });
+    return Response.json({ ok: true, shift_ms: shiftMs, ...timing(), rate_limits: rateLimitsOf(first), faults: faults ?? null, faulted: faulter.faults, services: served, counts: counts(), unsupported_calls: log.unsupportedCalls, rate_limited: limiter.rateLimited, phase: log.phase(), phases: log.phases });
   if (url.pathname === "/_control/log") return Response.json(log.lines);
   if (url.pathname === "/_control/changes") return Response.json(changesAnswer());
   if (url.pathname === "/_control/state") {
     return Response.json({
       dumped_at: new Date().toISOString(),
       shift_ms: shiftMs,
+      ...timing(),
       rate_limits: rateLimitsOf(first),
+      faults: faults ?? null,
+      faulted: faulter.faults,
       counts: counts(),
       unsupported_calls: log.unsupportedCalls,
       rate_limited: limiter.rateLimited,
@@ -254,15 +344,40 @@ async function control(req) {
     } catch {
       return Response.json({ ok: false, error: "the update is not JSON" }, { status: 400 });
     }
+    const after = url.searchParams.get("after");
+    if (after !== null && !/^[a-z0-9][a-z0-9-]*$/.test(after)) return Response.json({ ok: false, error: `the step name ${JSON.stringify(after)} is not a lowercase identifier` }, { status: 400 });
+    // The step this update follows ended with the latest request any fake has served, else at the
+    // start; the first file of an update records it, and every later file of the same update reads
+    // it back, so a step's services agree on when its activity happened.
+    const endMs = after === null ? null : stepEnds[after]?.endMs ?? lastRequestMs() ?? startMs;
+    const nowMs = clock.now();
+    currentAfter = after;
+    currentEndMs = endMs;
+    let newestMs;
+    try {
+      newestMs = Math.max(...relativeStampsIn(update).map(relativeMs));
+    } catch (e) {
+      currentAfter = currentEndMs = null;
+      return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
+    }
+    if (newestMs > nowMs) {
+      currentAfter = currentEndMs = null;
+      const wait = Math.ceil((newestMs - nowMs) / 1000);
+      return Response.json({ ok: false, error: `the update's newest instant is ${wait} s in the future; apply it once the step's wait has passed`, retry_after_seconds: wait, after_last_request_at: iso(endMs), now: iso(nowMs), newest: iso(newestMs), counts: counts() }, { status: 409 });
+    }
     // An update lands whole or not at all: a half-applied one would leave the trial on data nobody
     // authored. The snapshot holds the live records, which an update may write to in place, so it is
     // kept as text.
     const before = JSON.stringify(services[name].store.snapshot());
     try {
-      return Response.json({ ok: true, added: services[name].add(update), counts: counts() });
+      const added = services[name].add(update);
+      if (after !== null) stepEnds[after] ??= { endMs, recordedAtMs: nowMs };
+      return Response.json({ ok: true, after, after_last_request_at: endMs === null ? null : iso(endMs), added, counts: counts() });
     } catch (e) {
       services[name].store.restore(JSON.parse(before));
       return Response.json({ ok: false, error: e.message, counts: counts() }, { status: 400 });
+    } finally {
+      currentAfter = currentEndMs = null;
     }
   }
   return Response.json({ error: "unknown control route" }, { status: 404 });

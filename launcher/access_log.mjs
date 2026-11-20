@@ -2,7 +2,8 @@
 // not support. Every line carries the phase of the trial it was made in: "agent" until the driver
 // marks another (setPhase), so the requests the verification flows cause are told apart from the
 // ones the agent's app made while the agent worked. See launcher.mjs for the service interface this
-// wraps, and rate_limits.mjs for the rateLimitedBucket(req) its guard adds to every service.
+// wraps, rate_limits.mjs for the rateLimitedBucket(req) its guard adds to every service, and
+// faults.mjs for the faulted(req) its guard adds.
 import crypto from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 
@@ -18,11 +19,14 @@ export function createAccessLog(path, services) {
   const unsupportedCalls = {};
   let phase = "agent";
   // Per phase, in the order the phases were first marked: its requests by service, its calls the
-  // fakes do not support by what was asked, and its rate limit refusals by "<service>:<bucket>".
+  // fakes do not support by what was asked, its rate limit refusals by "<service>:<bucket>" and the
+  // requests a fault answered by "<service>:<kind>".
   // Without a prototype, so a phase named like one of Object's own keys ("constructor") gets counts
   // of its own.
   const phases = Object.create(null);
-  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {}, rate_limited: {} });
+  // When the latest request began, on the process's clock; null until one has.
+  let lastBeganMs = null;
+  const phaseCounts = (name) => (phases[name] ??= { requests: Object.fromEntries(services.map((s) => [s.name, 0])), unsupported_calls: {}, rate_limited: {}, faulted: {} });
   phaseCounts(phase);
   function setPhase(name) {
     const previous = phase;
@@ -41,6 +45,7 @@ export function createAccessLog(path, services) {
     return async (req) => {
       const url = new URL(req.url);
       const began = Date.now();
+      lastBeganMs = began;
       // The phase the request began in, as its ts is when it began.
       const requestPhase = phase;
       const bodyText = req.method === "GET" ? "" : await req.clone().text();
@@ -65,6 +70,8 @@ export function createAccessLog(path, services) {
       }
       const rateLimited = service.rateLimitedBucket(req);
       if (rateLimited) inPhase.rate_limited[rateLimited] = (inPhase.rate_limited[rateLimited] ?? 0) + 1;
+      const fault = service.faulted(req);
+      if (fault) inPhase.faulted[fault] = (inPhase.faulted[fault] ?? 0) + 1;
       const outcome = service.outcome(json);
       const rec = {
         ts: new Date(began).toISOString(),
@@ -87,6 +94,8 @@ export function createAccessLog(path, services) {
         unsupported: unsupported[0] ?? null,
         // "<service>:<bucket>" of the rate limit that refused the request, else null.
         rate_limited: rateLimited,
+        // "<service>:<kind>" of the fault the request was answered with instead of being served, else null.
+        fault,
         result_count: outcome.result_count,
         response_bytes: Buffer.byteLength(text),
         duration_ms: Date.now() - began,
@@ -104,5 +113,6 @@ export function createAccessLog(path, services) {
     setPhase,
     phase: () => phase,
     phases,
+    lastBeganMs: () => lastBeganMs,
   };
 }

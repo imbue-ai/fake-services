@@ -5,14 +5,15 @@
 // when its seed gives one; the package names an unnamed account after its address, which Google
 // would not. Google's other userinfo paths (`/oauth2/v2/userinfo`, `/oauth2/v3/userinfo`) are not
 // served. See google.mjs for the product interface this module exports.
-import { noSuchPath } from "./errors.mjs";
+import { googleError, noSuchPath } from "./errors.mjs";
 
 export const hosts = new Set(["openidconnect.googleapis.com"]);
 export const prefixes = ["/v1/userinfo"];
 const PATH = "/v1/userinfo";
 
-// Google documents no limit for userinfo, so it draws on none.
-export const limits = { buckets: {}, bucketOf: () => [], refuse: null };
+// Google documents no limit for userinfo, so it draws on no bucket and the limiter never refuses it;
+// a rate limit episode (faults.mjs) refuses it with Google's generic quota answer.
+export const limits = { buckets: {}, bucketOf: () => [], refuse: () => googleError(429, "Resource has been exhausted (e.g. check quota).", "rateLimitExceeded", "RESOURCE_EXHAUSTED") };
 
 export function create({ gs }) {
   function add(cfg) {

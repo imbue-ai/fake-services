@@ -169,6 +169,14 @@ const tooComplex = (cost) =>
     { errors: [{ message: "Query too complex", extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: `The query is too complex. Complexity: ${cost}. Maximum allowed complexity: ${MAX_QUERY_COMPLEXITY}.`, http: { status: 400 } } }] },
     { status: 400 },
   );
+// How Linear misbehaves (see faults.mjs): the hourly refusal with Retry-After, and an internal
+// server error as a GraphQL server answers one, an HTTP 500 whose errors name no code.
+export const faults = {
+  rateLimited: (req, url, retryAfterSeconds) =>
+    Response.json(rateLimited("Rate limit exceeded: too many requests in the last hour."), { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } }),
+  transientError: () => Response.json({ errors: [{ message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } }] }, { status: 500 }),
+};
+
 // See rate_limits.mjs for what a policy holds.
 export const limits = {
   buckets: {
@@ -426,10 +434,40 @@ export function create(seed, clock) {
       rec.target_date = clock.date(p.target_date);
     }
     let issues = 0;
+    let edits = 0;
     for (const i of cfg.issues ?? []) {
       const team = emulator.resolveTeam(store, i.team);
       if (!team) throw new Error(`linear team not found: ${i.team}`);
-      if (ls.issues.findOneBy("identifier", i.identifier)) throw new Error(`duplicate issue ${i.identifier}`);
+      const held = ls.issues.findOneBy("identifier", i.identifier);
+      if (held) {
+        // An issue the fake already holds is edited when the entry says when as a relative timestamp,
+        // and is a repeat otherwise, as the harness's checks read it: an absolute updated_at is how a
+        // seed's own issue is written, so one on a held identifier is a copied entry, not an edit.
+        if (!clock.isRelative(i.updated_at)) throw new Error(`duplicate issue ${i.identifier}; an edit states a relative updated_at`);
+        if (held.team_id !== team.linear_id) throw new Error(`issue ${i.identifier} is edited under team ${i.team}, which is not its team`);
+        const updated = clock.iso(i.updated_at);
+        if (updated <= held.updated_at) throw new Error(`issue ${i.identifier} is edited at ${i.updated_at}, no later than its last update`);
+        const state = i.state === undefined ? ls.workflowStates.findOneBy("linear_id", held.state_id) : emulator.resolveState(store, i.state, team.linear_id);
+        if (!state) throw new Error(`linear state not found: ${i.state}`);
+        const changes = {
+          state_id: state.linear_id,
+          completed_at: state.type === "completed" ? (held.completed_at ?? updated) : null,
+          started_at: state.type === "started" || state.type === "completed" ? (held.started_at ?? updated) : null,
+        };
+        if (i.title !== undefined) changes.title = i.title;
+        if (i.description !== undefined) changes.description = i.description;
+        if (i.priority !== undefined) changes.priority = i.priority;
+        if (i.estimate !== undefined) changes.estimate = i.estimate;
+        if (i.due_date !== undefined) changes.due_date = clock.date(i.due_date);
+        if (i.assignee !== undefined) changes.assignee_id = need("user", i.assignee, emulator.resolveUser(store, i.assignee));
+        if (i.project !== undefined) changes.project_id = need("project", i.project, emulator.resolveProject(store, i.project));
+        if (i.cycle !== undefined) changes.cycle_id = need("cycle", i.cycle, emulator.resolveCycle(store, i.cycle, team.linear_id));
+        if (i.labels !== undefined) changes.label_ids = i.labels.map((x) => need("label", x, emulator.resolveLabel(store, x, team.linear_id)));
+        ls.issues.update(held.id, changes);
+        ls.issues.findOneBy("identifier", i.identifier).updated_at = updated;
+        edits++;
+        continue;
+      }
       const state = emulator.resolveState(store, i.state, team.linear_id);
       if (!state) throw new Error(`linear state not found: ${i.state}`);
       const number = Number(i.identifier.split("-")[1]);
@@ -495,7 +533,7 @@ export function create(seed, clock) {
       comments++;
     }
     settle(before, stated);
-    return { linear_issues: issues, linear_comments: comments };
+    return { linear_issues: issues, linear_comments: comments, linear_edits: edits };
   }
 
   // The share of issues in a completed state, which is what an issue's completed_at marks.

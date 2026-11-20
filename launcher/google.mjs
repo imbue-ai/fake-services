@@ -42,6 +42,19 @@ const hostOf = (req) => (req.headers.get("x-forwarded-host") ?? [...hosts][0]).t
 const productOf = (req, url) => PRODUCTS.findIndex((p) => p.hosts.has(hostOf(req)) && p.prefixes.some((prefix) => url.pathname.startsWith(prefix)));
 const tokenOf = (req) => (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
 
+// How Google misbehaves (see faults.mjs): the product's own rate limit refusal with Retry-After, and
+// the backend error Google's APIs answer a transient failure with.
+export const faults = {
+  rateLimited(req, url, retryAfterSeconds) {
+    const index = productOf(req, url);
+    const refused = index === -1 ? internalError() : PRODUCTS[index].limits.refuse();
+    const headers = new Headers(refused.headers);
+    headers.set("Retry-After", String(retryAfterSeconds));
+    return new Response(refused.body, { status: refused.status, headers });
+  },
+  transientError: () => internalError(),
+};
+
 // See rate_limits.mjs for what a policy holds. Each product limits its own requests; a request no
 // product serves, or with no seeded token, draws on nothing.
 export const limits = {
